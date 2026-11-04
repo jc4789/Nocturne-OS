@@ -2,6 +2,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "kernel.h"
+#include "hal/hal.h"
 struct pci_reset;
 struct irq;
 struct iommu_guest;
@@ -29,7 +31,7 @@ struct pci_device {
     uint16_t vendor, device;
     uint8_t cls, subcls, progif, irq;
     uint32_t bar[6];
-    uint64_t bar_size[6]; /* memory BARs, measured once during enumeration; 0 for I/O, unused, upper halves */
+    uint64_t bar_size[6]; /* BARs, measured once during enumeration (an I/O BAR's in ports); 0 for unused, upper halves */
     uint8_t pcie_cap;  /* PCI Express capability offset, 0 for conventional PCI */
     uint8_t pcie_type; /* device/port type field of the PCIe capability (valid when pcie_cap != 0) */
     bool pcie_v2;      /* its capability is version 2 or later: the registers past Root Status exist (7.5.3.2) */
@@ -45,7 +47,14 @@ struct pci_device {
        remapped it did not come back from a sleep (pci_resume). */
     struct irq **msi_irqs, **msix_irqs;
     uint8_t msi_count;
-    bool kernel_owned; /* a kernel driver enabled it (pci_enable_busmaster): no app may claim it */
+    bool kernel_owned; /* a kernel driver enabled it (pci_enable_busmaster, hal_enable): no app may claim it */
+    /* Its place in the device tree (hal/hal.h): the function is a HAL device of bus N_BUS_PCI, whose
+       implementation reaches it through pci_device_of. The bus operations are pci_bus_ops. */
+    struct hal_device hal;
+    bool published;     /* hal_publish done (pci_init) */
+    struct irq *intx;   /* its INTx line where hal_irq_enable found no message (pci.c) */
+    bool no_messages;   /* hal_irq_enable gives INTx, not a message: set by whoever has the function in a
+                           claim's domain, whose interrupt table is the claimed function's (dev/iommu.h) */
     const struct iommu_guest *guest; /* that driver's way out of a claim of its group (dev/iommu.h), or NULL */
     bool claimed;      /* an app drives it (dev/pciuser.c) */
     bool iommu_blocked; /* in an ended claim's group: the IOMMU drops what it sends (dev/iommu.c) */
@@ -65,8 +74,17 @@ struct pci_device {
        the device below since its link trained, which takes effect once the link retrains (pci.c) */
     bool retrain;
 };
+/* The PCI function a HAL device of bus N_BUS_PCI is. */
+static inline struct pci_device *pci_device_of(struct hal_device *d) {
+    ASSERT(d->bus == N_BUS_PCI);
+    return (struct pci_device *)((char *)d - offsetof(struct pci_device, hal));
+}
+/* The bus operations of a PCI function, and what the process that claims one calls (dev/pciuser.c). */
+extern const struct hal_bus_ops pci_bus_ops;
+extern const struct hal_claim_ops pci_claim_ops;
+
 void pci_config_init(void); /* the MCFG's windows, before anything may reach another segment (AML) */
-void pci_init(void); /* 列挙して台帳に載せる。実装は結ばない */
+void pci_init(void); /* 列挙して HAL に載せる（hal_publish）。実装は hal_start が結ぶ。hal_init の後に呼ぶ */
 /* Config space access. offsets are 0..4095. Segment 0 below 256: CF8/CFC or ECAM; everything else
    ECAM only (an unreachable register reads as 0xFFFFFFFF and ignores writes). */
 uint32_t pci_read32(struct pci_address a, uint16_t off);

@@ -11,7 +11,7 @@
  * Nocturne's kernel holds the AML interpreter (uACPI, kernel/src/dev/acpi.c); a driver app
  * reaches its claimed function's part of the namespace through the PCI claim: the function's
  * device node and the device nodes under it, and the upstream bridge's node, nothing outside.
- * The evaluation entry (n_pci_acpi_eval) and the notification feed (n_pci_acpi_notify_take) are
+ * The evaluation entry (n_hal_pci_acpi_eval) and the notification feed (n_hal_pci_acpi_notify_take) are
  * part of that claim's ABI. Where the firmware has no such method (or no AML at all), the method
  * answers as the original does then, and RM goes on without it.
  *
@@ -48,7 +48,7 @@ static NV_STATUS acpi_eval(uint32_t node, const char *path, const struct n_acpi_
                            const void *arg_data, size_t arg_data_size, struct acpi_result *out) {
     out->block = malloc(ACPI_RESULT_ROOM);
     if (!out->block) return NV_ERR_NO_MEMORY;
-    n_result r = n_pci_acpi_eval(nvrm_dev.pci, node, path, args, nargs, arg_data, arg_data_size, out->block,
+    n_result r = n_hal_pci_acpi_eval(nvrm_dev.claim, node, path, args, nargs, arg_data, arg_data_size, out->block,
                                  ACPI_RESULT_ROOM);
     if (r < (n_result)sizeof(struct n_acpi_value)) {
         free(out->block);
@@ -211,7 +211,7 @@ static int notify_loop(void *arg) {
     (void)arg;
     nvrm_thread_admin = true;
     while (!atomic_load(&notify_stop)) {
-        n_result value = n_pci_acpi_notify_take(nvrm_dev.pci, n_clock_after(250 * N_NS_PER_MS));
+        n_result value = n_hal_pci_acpi_notify_take(nvrm_dev.claim, n_clock_after(250 * N_NS_PER_MS));
         if (value == -N_ERR_TIMEOUT) continue;
         if (value < 0) break;
         notify_rm(value);
@@ -223,7 +223,7 @@ void nvrm_acpi_notify_start(void) {
     if (notify_running) return;
     /* The first take starts the system's feed, so a Notify sent once this returns is kept (the
        D-notifier's state that rm_request_dnotifier_state asks the firmware for next). */
-    n_result first = n_pci_acpi_notify_take(nvrm_dev.pci, 0);
+    n_result first = n_hal_pci_acpi_notify_take(nvrm_dev.claim, 0);
     if (first < 0 && first != -N_ERR_TIMEOUT) {
         nvrm_log("NVRM: no ACPI notifications for the GPU (%s)", n_result_text(first));
         return; /* no node of its own (or no AML): nothing can come */

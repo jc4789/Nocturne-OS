@@ -10,6 +10,8 @@
 #include "dev/pm.h"
 #include "gui/wm.h"
 #include "sys/clock.h"
+#include "hal/hal.h"
+#include "mm/heap.h"
 #include "vm/hv/vmbus.h"
 #include "net/net.h"
 #include "sys/thread.h"
@@ -60,6 +62,7 @@ enum { ACT_NONE, ACT_SHUTDOWN, ACT_REBOOT, ACT_HIBERNATE };
 static struct spinlock util_lock;
 static int pending_action;
 static struct wait_queue util_wq;
+static bool thread_started; /* the thread that carries out the host's power requests, started by the first service */
 
 static void util_ask(int action) {
     uint64_t f = spin_lock(&util_lock);
@@ -314,21 +317,42 @@ static void util_callback(struct vmbus_channel *ch) {
     }
 }
 
-void hv_util_init(void) {
-    if (!vmbus_ready()) return;
-    char names[96] = "";
-    for (size_t i = 0; i < ARRAY_SIZE(services); i++) {
-        struct vmbus_channel *ch = vmbus_find(&services[i].type, 0);
-        if (!ch) continue;
-        if (vmbus_open(ch, 32 * 1024, 32 * 1024, util_callback, &services[i])) {
-            hal_failed(&ch->hal, "hv_util", -N_ERR_IO);
-            continue;
-        }
-        hal_bound(&ch->hal, "hv_util");
-        if (names[0]) strlcat(names, ", ", sizeof names);
-        strlcat(names, services[i].name, sizeof names);
+/* The channel's own copy of its service's description: the versions it negotiated are its. */
+static int util_attach(struct hal_device *d) {
+    struct vmbus_channel *ch = vmbus_channel_of(d);
+    const struct service *spec = NULL;
+    for (size_t i = 0; i < ARRAY_SIZE(services); i++)
+        if (!memcmp(&services[i].type, &ch->type, sizeof ch->type)) spec = &services[i];
+    if (!spec) return -N_ERR_UNSUPPORTED;
+    struct service *s = kmalloc(sizeof *s);
+    if (!s) return -N_ERR_NO_MEMORY;
+    *s = *spec;
+    d->driver_data = s;
+    if (vmbus_open(ch, 32 * 1024, 32 * 1024, util_callback, s)) {
+        d->driver_data = NULL;
+        kfree(s);
+        return -N_ERR_IO;
     }
-    if (!names[0]) return;
-    kthread_create("hv-util", util_thread, NULL);
-    kprintf("hv-util: %s\n", names);
+    if (!__atomic_exchange_n(&thread_started, true, __ATOMIC_ACQ_REL)) kthread_create("hv-util", util_thread, NULL);
+    kprintf("hv-util: %s\n", s->name);
+    return 0;
 }
+
+static void util_detach(struct hal_device *d) {
+    struct vmbus_channel *ch = vmbus_channel_of(d);
+    vmbus_close(ch); /* no callback runs after this */
+    kfree(d->driver_data);
+    d->driver_data = NULL;
+}
+
+static const struct n_hal_rule util_rules[] = {
+    N_VMBUS_TYPE(services[0].type.b), N_VMBUS_TYPE(services[1].type.b),
+    N_VMBUS_TYPE(services[2].type.b), N_VMBUS_TYPE(services[3].type.b),
+};
+const struct hal_driver hv_util_driver = {
+    .name = "hv_util",
+    .rules = util_rules,
+    .rule_count = ARRAY_SIZE(util_rules),
+    .attach = util_attach,
+    .detach = util_detach,
+};

@@ -287,12 +287,12 @@ static void client_start(n_handle channel) {
     client_end(c);
 }
 
-n_result nvrm_serve(uint32_t pci_target) {
+n_result nvrm_serve(uint32_t device) {
     if (mtx_init(&threads_lock, mtx_plain) != thrd_success) return -N_ERR_NO_MEMORY;
     if (cnd_init(&thread_ended) != thrd_success) { mtx_destroy(&threads_lock); return -N_ERR_NO_MEMORY; }
     __atomic_store_n(&serving_ended, 0, __ATOMIC_RELEASE);
     char name[NVRM_CHANNEL_NAME_BYTES];
-    snprintf(name, sizeof name, NVRM_CHANNEL_FORMAT, (unsigned)pci_target);
+    snprintf(name, sizeof name, NVRM_CHANNEL_FORMAT, (unsigned)device);
     n_handle listener = n_service_listen(name);
     if (listener < 0) { cnd_destroy(&thread_ended); mtx_destroy(&threads_lock); return listener; }
     n_handle events = n_events_create();

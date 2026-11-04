@@ -70,14 +70,12 @@ struct shared_pages {
     struct shared_link derived_link; /* a view's, in its parent's derived */
     struct shared_link claim_link;   /* a device range's, in its claim's ranges */
     struct shared_scope *scope;
-    struct pci_claim *claim;  /* a BAR or DMA root: the claim it was made through */
+    struct hal_claim *claim;  /* a device memory or DMA root: the claim it was made through */
     uint64_t base;            /* a range's first frame */
     struct object *parent;    /* a view's object, a root or a composite; never another view */
     size_t first;             /* a view's first page of it */
     struct shared_part *parts;
     size_t part_count;
-    struct shared_dependency *dependencies;
-    size_t dependency_count;
     size_t resident;          /* a demand object's frames: atomic */
     /* A program segment's demand object: its pages hold source's bytes from source_offset on,
        source_bytes of them starting source_skip bytes into the first page, zeros elsewhere, read

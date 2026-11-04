@@ -23,7 +23,7 @@
    Left out on purpose: calls that end, power off, launch or stop programs, sleep, claim
    hardware, use the network or change the volume the system keeps for the user (SYS_EXIT,
    SYS_POWER, SYS_SLEEP, SYS_THREAD_*, SYS_APP_LAUNCH, SYS_APP_OPEN,
-   SYS_WIN_CREATE, SYS_PCI_CLAIM, 96..127).
+   SYS_WIN_CREATE, SYS_HAL_CLAIM, 96..127).
    Pointers into memory this program owns never reach calls that change mappings. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -144,8 +144,11 @@ static const struct sysinfo_ hinfo[] = {
     {SYS_APP_RESULT, 1}, {SYS_APP_STOP, 1}, {SYS_APP_ID, 1},
     {SYS_EVENTS_WATCH, 1 | 2}, {SYS_EVENTS_UNWATCH, 1}, {SYS_EVENTS_WATCH_ADDRESS, 1}, {SYS_EVENTS_TIMER, 1},
     {SYS_EVENTS_WAIT, 1}, {SYS_AUDIO_DEVICE_STATUS, 1}, {SYS_AUDIO_DEVICE_RUN, 1},
-    {SYS_SHARED_MAP, 1}, {SYS_SHARED_VIEW, 1}, {SYS_PCI_INFO, 1}, {SYS_PCI_CONFIG_READ, 1},
-    {SYS_PCI_CONFIG_WRITE, 1}, {SYS_PCI_BAR, 1}, {SYS_PCI_INTERRUPTS, 1}, {SYS_PCI_INTERRUPT_TAKE, 1},
+    {SYS_SHARED_MAP, 1}, {SYS_SHARED_VIEW, 1}, {SYS_HAL_CLAIM_RESOURCES, 1}, {SYS_HAL_MAP, 1},
+    {SYS_HAL_INTERRUPTS, 1}, {SYS_HAL_INTERRUPT_TAKE, 1}, {SYS_HAL_BUS_CALL, 1}, {SYS_HAL_OFFER, 1},
+    {SYS_HAL_OFFER_WITHDRAW, 1}, {SYS_HAL_POWER_WAIT, 1}, {SYS_HAL_POWER_DONE, 1},
+    {SYS_SCREEN_GIVE, 1}, {SYS_SCREEN_FLIPS, 1}, {SYS_SCREEN_VBLANK, 1}, {SYS_SCREEN_STATE, 1},
+    {SYS_SCREEN_IMAGE, 1 | 4}, {SYS_SCREEN_IMAGE_END, 1}, {SYS_SCREEN_MODES, 1},
     {SYS_DMA_CREATE, 1}, {SYS_DMA_ADDRESSES, 1},
     {SYS_WIN_SURFACE, 1}, {SYS_WIN_ACQUIRE, 1}, {SYS_WIN_PRESENT, 1}, {SYS_WIN_SET_TITLE, 1}, {SYS_WIN_MOVE, 1}, {SYS_WIN_RESIZE, 1},
     {SYS_WIN_STATE, 1}, {SYS_WIN_PRESENTATION, 1}, {SYS_WIN_RECEIVE, 1}, {SYS_WIN_DIRECT, 1}, {SYS_WIN_FRAME, 1},
@@ -161,7 +164,7 @@ static bool skipped(long n) {
     switch (n) {
     case SYS_EXIT: case SYS_SLEEP: case SYS_POWER: case SYS_THREAD_CREATE: case SYS_THREAD_JOIN:
     case SYS_THREAD_EXIT: case SYS_WAIT_ADDRESS: case SYS_WAIT_ADDRESS64:
-    case SYS_APP_LAUNCH: case SYS_APP_OPEN: case SYS_WIN_CREATE: case SYS_PCI_CLAIM:
+    case SYS_APP_LAUNCH: case SYS_APP_OPEN: case SYS_WIN_CREATE: case SYS_HAL_CLAIM:
         return true;
     }
     return n >= SYS_NET_FIRST && n < SYS_NET_LIMIT;
@@ -182,7 +185,7 @@ static bool creates_handle(long n) {
     switch (n) {
     case SYS_DOCUMENT_OPEN: case SYS_SERVICE_CONNECT: case SYS_SERVICE_REGISTER: case SYS_CAP_DERIVE:
     case SYS_SHARED_CREATE: case SYS_SHARED_RESERVE: case SYS_EVENTS_CREATE: case SYS_SYSTEM_LOG_OPEN: case SYS_WIN_SURFACE:
-    case SYS_AUDIO_DEVICE_OPEN: case SYS_PCI_BAR: case SYS_DMA_CREATE: case SYS_SHARED_VIEW: case SYS_AUDIO_DEVICE_WATCH:
+    case SYS_AUDIO_DEVICE_OPEN: case SYS_HAL_MAP: case SYS_DMA_CREATE: case SYS_SHARED_VIEW: case SYS_AUDIO_DEVICE_WATCH:
     case SYS_ENTRY_WATCH:
         return true;
     }
@@ -266,7 +269,9 @@ static void clamp_waits(long num, long a[5]) {
     case SYS_WIN_RECEIVE: a[3] = 0; break;
     case SYS_WIN_ACQUIRE: a[1] = 0; break;
     case SYS_APP_RESULT: a[1] = 0; break;
-    case SYS_PCI_INTERRUPT_TAKE: a[1] = 0; break;
+    case SYS_HAL_INTERRUPT_TAKE: case SYS_HAL_POWER_WAIT: a[1] = 0; break;
+    case SYS_SCREEN_FLIPS: a[3] = 0; break;
+    case SYS_SCREEN_STATE: a[4] = 0; break;
     /* Sizes that make the kernel reserve real memory stay small unless they are absurd
        (those must be refused); a 2 GiB request is a test of the machine, not of the check. */
     case SYS_SHARED_CREATE: case SYS_SHARED_RESERVE: case SYS_MEMORY_RESERVE:

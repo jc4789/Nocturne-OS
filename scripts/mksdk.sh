@@ -43,7 +43,7 @@ rm -rf "$S" "$W"
 mkdir -p "$S/Include" "$S/Lib/tcc/include" "$S/Source/Apps" "$S/Source/wasm2c" "$W/libc" "$W/rt" "$W/wasmrt"
 
 cp user/include/*.h "$S/Include/"
-cp common/abi.h common/authority_abi.h common/services_abi.h common/settings_abi.h common/audio_abi.h common/input_abi.h common/gfx.h common/gpu_abi.h common/display_abi.h "$S/Include/"
+cp common/abi.h common/authority_abi.h common/services_abi.h common/settings_abi.h common/audio_abi.h common/input_abi.h common/gfx.h common/gpu_abi.h common/display_abi.h common/hal_abi.h common/hal_buses.h "$S/Include/"
 cp ports/tcc/include/*.h "$S/Include/"
 cp third_party/bearssl/inc/*.h "$S/Include/"
 cp ports/lexbor/include/*.h "$S/Include/"

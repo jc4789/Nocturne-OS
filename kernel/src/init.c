@@ -6,6 +6,7 @@
 #include "dev/fbcon.h"
 #include "dev/fb.h"
 #include "dev/pci.h"
+#include "hal/hal.h"
 #include "dev/iommu.h"
 #include "dev/pm.h"
 #include "dev/hibernate.h"
@@ -22,6 +23,7 @@
 #include "sys/authority.h"
 
 void acpi_init(void);
+void acpi_devices_publish(void);
 void net_init(void);
 
 #define INIT_PATH N_FOLDER_SYSTEM "\\services"
@@ -33,11 +35,15 @@ void kmain_late(void) {
     pci_config_init();
     acpi_init();
     pm_init(); /* the power thread: every shutdown and restart goes through it */
-    vm_init(); /* only in a VM: its own bus and the devices on it */
+    hal_init();
+    fb_publish();
+    vm_init(); /* only in a VM: its own bus, its fixed ports and the drivers of its devices */
     pci_init();
     iommu_init(); /* before any driver turns an interrupt on: their messages may be remapped */
     net_init();
     audio_init();
+    acpi_devices_publish();
+    hal_start(); /* the drivers bind, each device on a thread of its own */
     store_init();        /* C:, from the disk the system started from (waiting for it to appear) */
     hibernate_restore(); /* returns only when there is no image to go back to */
     store_start();

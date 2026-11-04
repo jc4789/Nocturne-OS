@@ -1,11 +1,11 @@
 /* nvrm: NVIDIA's Resource Manager as a user-space driver app (C:\Nocturne\System\nvrm).
  *
- * サービスの管理者が PCI の機能ごとに起こし、nvrm が N_CAP_PCI_CLAIM で自分の機能を claim する
+ * サービスの管理者が装置ごとに起こし、nvrm が N_CAP_HAL_CLAIM で自分の装置を claim する
  * (docs/nocturne-native-abi.md, section 9). nvrm brings RM up on it the way NVIDIA's kernel
  * interface layer does when a device is probed and first opened, then serves RM's client API
  * (nvrm_serve.c) to other apps:
  *
- *   options (NVRM_REGISTRY_DWORDS) -> rm_init_rm -> n_pci_info / BAR0 -> rm_is_supported_device
+ *   options (NVRM_REGISTRY_DWORDS) -> rm_init_rm -> n_hal_pci_info / BAR0 -> rm_is_supported_device
  *   -> rm_init_private_state -> dynamic power management -> interrupts -> rm_init_adapter
  *   (GSP firmware boots here)
  *   -> ACPI notifications (os_acpi.c) -> rm_get_device_name -> NVKMS (nvkms_os.c) and the
@@ -98,7 +98,7 @@ static int irq_thread(void *unused) {
         bool delivered = false;
         if (!irq_polling) {
             uint64_t bits;
-            n_result r = n_pci_interrupt_take(nvrm_dev.pci, &bits, 1, n_clock_after(IRQ_WAKE_MS * N_NS_PER_MS));
+            n_result r = n_hal_interrupt_take(nvrm_dev.claim, &bits, 1, n_clock_after(IRQ_WAKE_MS * N_NS_PER_MS));
             if (r >= 0) {
                 delivered = true;
                 __atomic_add_fetch(&irq_delivered, 1, __ATOMIC_RELAXED);
@@ -258,7 +258,7 @@ static bool bring_up(void) {
 
     NV_STATUS st = nvrm_pci_attach();
     if (st != NV_OK) {
-        nvrm_log("NVRM: cannot attach to the PCI function: %s (0x%x)", status_text(st), (unsigned)st);
+        nvrm_log("NVRM: cannot attach to the device: %s (0x%x)", status_text(st), (unsigned)st);
         return false;
     }
     sp = d->sp;
@@ -336,6 +336,8 @@ static bool bring_up(void) {
     const char *name = rm_get_device_name(d->info.device, d->info.subsystem_vendor, d->info.subsystem_id);
     snprintf(d->name, sizeof d->name, "%s", name ? name : "(unknown)");
     nvrm_log("NVRM: GPU started: %s", d->name);
+    n_result offered = n_hal_offer(d->claim, N_OFFER_GPU, 0, d->name);
+    if (offered < 0) nvrm_log("NVRM: the GPU is not listed in the ledger: %s", n_result_text(offered));
     nvrm_log_gpu_information();
 
     /* The screen: NVKMS sets the mode and the system draws into a GPU surface (display.c).
@@ -358,6 +360,7 @@ static void tear_down(void) {
        firmware's framebuffer, then NVKMS out, while RM still runs. */
     nvrm_uvm_stop();
     nvrm_display_stop();
+    n_hal_offer_withdraw(d->claim, N_OFFER_GPU, 0);
     nvrm_nvkms_stop();
     nvrm_acpi_notify_stop(); /* before the adapter goes, as nv_stop_device */
     if (d->sp && d->adapter_ready) rm_disable_adapter(d->sp, &d->nv);
@@ -385,16 +388,16 @@ static void tear_down(void) {
 int main(int argc, char **argv) {
     nvrm_log_init();
     nvrm_log("NVRM: Nocturne user-space RM %s", NVRM_FIRMWARE_VERSION);
-    /* 引数は N_PCI_TARGET の 16 進数（services.c の gpu の項目）。claim はこの app の持ち物で、
+    /* 引数は台帳の装置の id の 16 進数（services.c の gpu の項目）。claim はこの app の持ち物で、
        装置の DMA ごとこの app と一緒に終わる。 */
     if (argc < 2) {
-        nvrm_log("NVRM: started without a PCI function");
+        nvrm_log("NVRM: started without a device id");
         return 1;
     }
-    unsigned long target = strtoul(argv[1], NULL, 16);
-    nvrm_dev.pci = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), (uint32_t)target);
-    if (nvrm_dev.pci < 0) {
-        nvrm_log("NVRM: cannot claim %s: %s", argv[1], n_result_text(nvrm_dev.pci));
+    unsigned long device = strtoul(argv[1], NULL, 16);
+    nvrm_dev.claim = n_hal_claim(n_cap_find(N_CAP_HAL_CLAIM), (uint32_t)device);
+    if (nvrm_dev.claim < 0) {
+        nvrm_log("NVRM: cannot claim %s: %s", argv[1], n_result_text(nvrm_dev.claim));
         return 1;
     }
 
@@ -403,7 +406,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     n_service_ready();
-    n_result r = nvrm_serve((uint32_t)target);
+    n_result r = nvrm_serve((uint32_t)device);
     nvrm_log("NVRM: request server ended: %s", n_result_text(r));
     tear_down();
     return 0;

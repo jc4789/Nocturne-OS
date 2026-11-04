@@ -485,51 +485,85 @@ n_result n_system_log(char *buf, size_t cap) { return NC5(SYS_SYSTEM_LOG, buf, c
 n_handle n_system_log_open(void) { return (n_handle)NC5(SYS_SYSTEM_LOG_OPEN, 0, 0, 0, 0, 0); }
 n_handle n_app_open(int64_t id) { return (n_handle)NC5(SYS_APP_OPEN, id, 0, 0, 0, 0); }
 n_result n_app_id(n_handle app) { return NC5(SYS_APP_ID, app, 0, 0, 0, 0); }
-n_handle n_pci_claim(n_handle cap, uint32_t target) { return (n_handle)NC5(SYS_PCI_CLAIM, cap, target, 0, 0, 0); }
-n_result n_pci_info(n_handle pci, struct n_pci_function *out) { return NC5(SYS_PCI_INFO, pci, out, 0, 0, 0); }
-n_result n_pci_config_read(n_handle pci, uint64_t target, uint32_t offset, uint32_t width) {
-    return NC5(SYS_PCI_CONFIG_READ, pci, target, offset, width, 0);
+n_handle n_hal_claim(n_handle cap, uint32_t device) { return (n_handle)NC5(SYS_HAL_CLAIM, cap, device, 0, 0, 0); }
+n_result n_hal_claim_resources(n_handle claim, struct n_hal_resource *out, size_t max) {
+    return NC5(SYS_HAL_CLAIM_RESOURCES, claim, out, max, 0, 0);
 }
-n_result n_pci_config_write(n_handle pci, uint32_t offset, uint32_t width, uint32_t value) {
-    return NC5(SYS_PCI_CONFIG_WRITE, pci, offset, width, value, 0);
+n_handle n_hal_map(n_handle claim, uint32_t slot) { return (n_handle)NC5(SYS_HAL_MAP, claim, slot, 0, 0, 0); }
+n_result n_hal_interrupts(n_handle claim, uint32_t count) { return NC5(SYS_HAL_INTERRUPTS, claim, count, 0, 0, 0); }
+n_result n_hal_interrupt_take(n_handle claim, uint64_t *bits, uint32_t words, uint64_t deadline) {
+    return NC5(SYS_HAL_INTERRUPT_TAKE, claim, deadline, bits, words, 0);
 }
-n_handle n_pci_bar(n_handle pci, uint32_t bar) { return (n_handle)NC5(SYS_PCI_BAR, pci, bar, 0, 0, 0); }
-n_result n_pci_interrupts(n_handle pci, uint32_t count) { return NC5(SYS_PCI_INTERRUPTS, pci, count, 0, 0, 0); }
-n_result n_pci_interrupt_take(n_handle pci, uint64_t *bits, uint32_t words, uint64_t deadline) {
-    return NC5(SYS_PCI_INTERRUPT_TAKE, pci, deadline, bits, words, 0);
+n_result n_hal_bus_call(n_handle claim, uint32_t op, const void *in, size_t in_size, void *out, size_t out_size) {
+    struct n_hal_call call = {.op = op, .in = in, .in_size = in_size, .out = out, .out_size = out_size};
+    return NC5(SYS_HAL_BUS_CALL, claim, &call, 0, 0, 0);
 }
-n_result n_pci_hold_screen(n_handle pci, bool hold) { return NC5(SYS_PCI_HOLD_SCREEN, pci, hold ? 1 : 0, 0, 0, 0); }
-n_result n_pci_give_screen(n_handle pci, uint32_t output, const struct n_screen_buffers *buffers) {
-    return NC5(SYS_PCI_GIVE_SCREEN, pci, output, buffers, 0, 0);
+n_result n_hal_offer(n_handle claim, uint32_t kind, uint32_t instance, const char *label) {
+    return NC5(SYS_HAL_OFFER, claim, kind, instance, label, 0);
 }
-n_result n_pci_screen_flips(n_handle pci, struct n_screen_flip *out, size_t max, uint64_t deadline) {
-    return NC5(SYS_PCI_SCREEN_FLIPS, pci, out, max, deadline, 0);
+n_result n_hal_offer_withdraw(n_handle claim, uint32_t kind, uint32_t instance) {
+    return NC5(SYS_HAL_OFFER_WITHDRAW, claim, kind, instance, 0, 0);
 }
-n_result n_pci_screen_vblank(n_handle pci, const struct n_screen_vblank *vblank) {
-    return NC5(SYS_PCI_SCREEN_VBLANK, pci, vblank, 0, 0, 0);
+n_result n_hal_power_wait(n_handle claim, uint64_t deadline) { return NC5(SYS_HAL_POWER_WAIT, claim, deadline, 0, 0, 0); }
+n_result n_hal_power_done(n_handle claim, bool ok) { return NC5(SYS_HAL_POWER_DONE, claim, ok ? 1 : 0, 0, 0, 0); }
+n_result n_hal_pci_info(n_handle claim, struct n_hal_pci_info *out) {
+    return n_hal_bus_call(claim, N_PCI_CALL_INFO, NULL, 0, out, sizeof *out);
 }
-n_result n_pci_screen_modes(n_handle pci, uint32_t output, const struct n_screen_modes *modes) {
-    return NC5(SYS_PCI_SCREEN_MODES, pci, output, modes, 0, 0);
+n_result n_hal_pci_config_read(n_handle claim, uint64_t target, uint32_t offset, uint32_t width) {
+    struct n_hal_pci_config q = {.target = target, .offset = offset, .width = width};
+    return n_hal_bus_call(claim, N_PCI_CALL_CONFIG_READ, &q, sizeof q, NULL, 0);
 }
-n_result n_pci_screen_state(n_handle pci, uint32_t output, uint64_t seen, struct n_screen_state *out,
-                            uint64_t deadline) {
-    return NC5(SYS_PCI_SCREEN_STATE, pci, output, seen, out, deadline);
+n_result n_hal_pci_config_write(n_handle claim, uint32_t offset, uint32_t width, uint32_t value) {
+    struct n_hal_pci_config q = {.target = N_PCI_SELF, .offset = offset, .width = width, .value = value};
+    return n_hal_bus_call(claim, N_PCI_CALL_CONFIG_WRITE, &q, sizeof q, NULL, 0);
 }
-n_result n_pci_screen_image(n_handle pci, uint32_t output, n_handle surface, const struct n_scanout *desc) {
-    return NC5(SYS_PCI_SCREEN_IMAGE, pci, output, surface, desc, 0);
+n_result n_hal_pci_hold_screen(n_handle claim, bool hold) {
+    uint32_t q = hold ? 1 : 0;
+    return n_hal_bus_call(claim, N_PCI_CALL_HOLD_SCREEN, &q, sizeof q, NULL, 0);
 }
-n_result n_pci_screen_image_end(n_handle pci, n_result image) {
-    return NC5(SYS_PCI_SCREEN_IMAGE_END, pci, image, 0, 0, 0);
+n_result n_hal_pci_acpi_eval(n_handle claim, uint32_t node, const char *name, const struct n_acpi_value *args,
+                             uint32_t nargs, const void *data, size_t data_size, void *out, size_t out_size) {
+    /* 入力は一つの塊：n_hal_pci_acpi、引数の並び、data（hal_buses.h） */
+    size_t name_size = strlen(name);
+    if (name_size != 4) return -N_ERR_INVALID;
+    size_t args_bytes = (size_t)nargs * sizeof *args;
+    size_t total = sizeof(struct n_hal_pci_acpi) + args_bytes + data_size;
+    struct n_hal_pci_acpi *q = malloc(total);
+    if (!q) return -N_ERR_NO_MEMORY;
+    q->node = node;
+    q->nargs = nargs;
+    memcpy(q->name, name, 4);
+    q->data_size = (uint32_t)data_size;
+    memcpy(q + 1, args, args_bytes);
+    memcpy((char *)(q + 1) + args_bytes, data, data_size);
+    n_result r = n_hal_bus_call(claim, N_PCI_CALL_ACPI_EVAL, q, total, out, out_size);
+    free(q);
+    return r;
 }
-n_result n_pci_acpi_eval(n_handle pci, uint32_t node, const char *name, const struct n_acpi_value *args,
-                         uint32_t nargs, const void *data, size_t data_size, void *out, size_t out_size) {
-    struct n_acpi_eval e = {node, nargs, name, args, data, data_size};
-    return NC5(SYS_PCI_ACPI_EVAL, pci, &e, out, out_size, 0);
+n_result n_hal_pci_acpi_notify_take(n_handle claim, uint64_t deadline) {
+    return n_hal_bus_call(claim, N_PCI_CALL_ACPI_NOTIFY_TAKE, &deadline, sizeof deadline, NULL, 0);
 }
-n_result n_pci_acpi_notify_take(n_handle pci, uint64_t deadline) {
-    return NC5(SYS_PCI_ACPI_NOTIFY_TAKE, pci, deadline, 0, 0, 0);
+n_result n_screen_give(n_handle claim, uint32_t output, const struct n_screen_buffers *buffers) {
+    return NC5(SYS_SCREEN_GIVE, claim, output, buffers, 0, 0);
 }
-n_handle n_dma_create(n_handle pci, size_t bytes, uint32_t flags) { return (n_handle)NC5(SYS_DMA_CREATE, pci, bytes, flags, 0, 0); }
+n_result n_screen_flips(n_handle claim, struct n_screen_flip *out, size_t max, uint64_t deadline) {
+    return NC5(SYS_SCREEN_FLIPS, claim, out, max, deadline, 0);
+}
+n_result n_screen_report_vblank(n_handle claim, const struct n_screen_vblank *vblank) {
+    return NC5(SYS_SCREEN_VBLANK, claim, vblank, 0, 0, 0);
+}
+n_result n_screen_offer_modes(n_handle claim, uint32_t output, const struct n_screen_modes *modes) {
+    return NC5(SYS_SCREEN_MODES, claim, output, modes, 0, 0);
+}
+n_result n_screen_read_state(n_handle claim, uint32_t output, uint64_t seen, struct n_screen_state *out,
+                             uint64_t deadline) {
+    return NC5(SYS_SCREEN_STATE, claim, output, seen, out, deadline);
+}
+n_result n_screen_image_add(n_handle claim, uint32_t output, n_handle surface, const struct n_scanout *desc) {
+    return NC5(SYS_SCREEN_IMAGE, claim, output, surface, desc, 0);
+}
+n_result n_screen_image_end(n_handle claim, n_result image) { return NC5(SYS_SCREEN_IMAGE_END, claim, image, 0, 0, 0); }
+n_handle n_dma_create(n_handle claim, size_t bytes, uint32_t flags) { return (n_handle)NC5(SYS_DMA_CREATE, claim, bytes, flags, 0, 0); }
 n_result n_dma_addresses(n_handle shared, size_t first_page, uint64_t *out, size_t count) {
     return NC5(SYS_DMA_ADDRESSES, shared, first_page, out, count, 0);
 }
@@ -622,39 +656,33 @@ n_result n_power_windows(n_handle cap, bool ask_to_close, char *top_title, size_
 }
 n_result n_power_say(n_handle cap, const struct n_power_state *state) { return NC5(SYS_POWER_SAY, cap, state, sizeof *state, 0, 0); }
 n_handle n_power_windows_watch(n_handle cap) { return (n_handle)NC5(SYS_POWER_WINDOWS_WATCH, cap, 0, 0, 0, 0); }
-n_result n_hal_list(struct n_hal_device *out, size_t max) { return SC2(SYS_HAL_LIST, out, max); }
+n_result n_hal_list(void *out, size_t bytes) { return SC2(SYS_HAL_LIST, out, bytes); }
 n_handle n_hal_watch(void) { return (n_handle)SC0(SYS_HAL_WATCH); }
 
-n_result n_hal_snapshot(struct n_hal_device **out) {
-    *out = NULL;
-    size_t capacity = 32;
+n_result n_hal_snapshot(struct n_hal_snapshot *out) {
+    char *records = NULL;
+    size_t capacity = 4096;
     for (;;) {
-        struct n_hal_device *grown = realloc(*out, capacity * sizeof **out);
+        char *grown = realloc(records, capacity);
         if (!grown) {
-            free(*out);
-            *out = NULL;
+            free(records);
             return -N_ERR_NO_MEMORY;
         }
-        *out = grown;
-        n_result total = n_hal_list(*out, capacity);
+        records = grown;
+        n_result total = n_hal_list(records, capacity);
         if (total < 0) {
-            free(*out);
-            *out = NULL;
+            free(records);
+            return total;
         }
-        if (total < 0 || (size_t)total <= capacity) return total;
+        if ((size_t)total <= capacity) {
+            uint32_t count = 0;
+            for (const char *at = records; at < records + total; at += ((const struct n_hal_device *)at)->bytes) count++;
+            out->first = (const struct n_hal_device *)records;
+            out->count = count;
+            return (n_result)count;
+        }
         capacity = (size_t)total;
     }
-}
-
-n_result pcilist(struct n_pciinfo *out, int max) {
-    struct n_hal_device *list;
-    n_result total = n_hal_snapshot(&list);
-    if (total < 0) return total;
-    int n = 0;
-    for (n_result i = 0; i < total && n < max; i++)
-        if (list[i].bus == N_HAL_BUS_PCI) out[n++] = list[i].at.pci;
-    free(list);
-    return n;
 }
 
 static bool is_document(const char *path) {

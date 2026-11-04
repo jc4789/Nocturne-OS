@@ -58,7 +58,7 @@ enum {
     SYS_PROCLIST = 26, SYS_SYSINFO, SYS_YIELD, SYS_POWER,
     SYS_IMAGE_MAP,            /* (読むために開いた文書の handle, struct n_image *out): ドライバーの像を自分へ写す */
     SYS_SYSTEM_LOG = 33,
-    SYS_HAL_LIST,             /* (struct n_hal_device *out, max): 台帳の写し。戻りは台帳の全部の数 */
+    SYS_HAL_LIST,             /* (void *out, bytes): 台帳の写し（hal_abi.h）。戻りは台帳の全部のバイト数。入らなければ何も書かない */
     SYS_HAL_WATCH,            /* (): 台帳が変わると受け取れる見張り */
     SYS_CPU_INFO = 38, SYS_GPU_INFO, SYS_GPU_RENDER,
     SYS_AUDIO_DEVICE_RUN,     /* (device, 0 or 1): 輪の始めから流す、止める（§17） */
@@ -131,14 +131,21 @@ enum {
     /* (bytes, access): N_MEMORY_* access, N_MEMORY_LOW added for pages below 2 GiB */
     SYS_MEMORY_RESERVE, SYS_MEMORY_RELEASE, SYS_MEMORY_PROTECT,
     SYS_SHARED_MAP, /* (shared handle, bytes, N_MEMORY_READ or N_MEMORY_READ_WRITE) */
-    /* Drivers in apps (docs/nocturne-native-abi.md §9): the right to a PCI function, its
-       memory as shared objects and its interrupts. */
-    SYS_PCI_CLAIM, SYS_PCI_INFO, SYS_PCI_CONFIG_READ, SYS_PCI_CONFIG_WRITE, SYS_PCI_BAR,
-    SYS_PCI_INTERRUPTS, SYS_PCI_INTERRUPT_TAKE,
+    /* アプリの中の装置ドライバー（docs/nocturne-native-abi.md §9）：台帳の装置を持つ権利（N_KIND_HAL_CLAIM）、
+       その資源、割り込み、台帳への提供、眠りの知らせ、バスだけの操作。 */
+    SYS_HAL_CLAIM,            /* (N_CAP_HAL_CLAIM の cap, 台帳の装置の id) -> claim */
+    SYS_HAL_CLAIM_RESOURCES,  /* (claim, struct n_hal_resource *out, max): 資源の全部の数 */
+    SYS_HAL_MAP,              /* (claim, メモリーの資源の slot) -> 共有 object */
+    SYS_HAL_INTERRUPTS,       /* (claim, count): 割り込みを count 本まで立てる。立てた数 */
+    SYS_HAL_INTERRUPT_TAKE,   /* (claim, deadline, uint64_t *bits, words): 届いた割り込みの bit。語の数 */
+    SYS_HAL_BUS_CALL,         /* (claim, const struct n_hal_call *): バスだけの操作（hal_buses.h） */
+    SYS_HAL_OFFER,            /* (claim, kind, instance, label): 台帳に提供を見せる */
+    SYS_HAL_OFFER_WITHDRAW,   /* (claim, kind, instance) */
+    SYS_HAL_POWER_WAIT,       /* (claim, deadline): 次の眠りの知らせ N_HAL_POWER_* */
+    SYS_HAL_POWER_DONE,       /* (claim, ok): N_HAL_POWER_SUSPEND への答え */
     SYS_DMA_CREATE, SYS_DMA_ADDRESSES, SYS_SHARED_VIEW,
     SYS_SHARED_REVOKE, SYS_GPU_RENDER_LIST,
     SYS_CHANNEL_RECEIVE_FROM, SYS_SHARED_COMPOSE,
-    SYS_PCI_HOLD_SCREEN, /* (pci, hold): no drawing to the boot screen in the function's BAR */
     SYS_DOCUMENT_COMMIT, /* (document, N_COMMIT_*) */
     SYS_DOCUMENT_INFO,   /* (document, struct n_entry *out, sizeof *out) */
     SYS_ENTRY_REPLACE,   /* (from, to): SYS_ENTRY_MOVE that may replace a document */
@@ -146,27 +153,24 @@ enum {
     SYS_ENTRY_INFO_SIZED,  /* (path, struct n_entry *out, sizeof *out) */
     SYS_FOLDER_LIST_SIZED, /* (path, struct n_entry *out, max, start, sizeof *out): count */
     /* A display driver shows screens (docs/nocturne-native-abi.md §9): its outputs' buffers */
-    SYS_PCI_GIVE_SCREEN,   /* (pci, output, const struct n_screen_buffers *, or 0 to give it back) */
-    SYS_PCI_SCREEN_VBLANK, /* (pci, const struct n_screen_vblank *): a vertical blank of an output */
+    SYS_SCREEN_GIVE,   /* (claim, output, const struct n_screen_buffers *, or 0 to give it back) */
+    SYS_SCREEN_VBLANK, /* (claim, const struct n_screen_vblank *): a vertical blank of an output */
     /* Paged memory and its pager (docs/nocturne-native-abi.md §7) */
     SYS_PAGER_CREATE,      /* (bytes, int32_t *memory_out): the pager handle */
     SYS_PAGER_TAKE,        /* (pager, struct n_pager_fault *out, max, deadline): count */
     SYS_PAGER_SUPPLY,      /* (pager, const struct n_pager_supply *runs, count) */
     SYS_PAGER_REVOKE,      /* (pager, offset, bytes, 0 or N_MEMORY_READ) */
     SYS_PAGER_FAIL,        /* (pager, offset, bytes) */
-    /* A claimed function's part of the ACPI namespace (docs/nocturne-native-abi.md §9) */
-    SYS_PCI_ACPI_EVAL,     /* (pci, const struct n_acpi_eval *, out, out_size): bytes written */
-    SYS_PCI_ACPI_NOTIFY_TAKE, /* (pci, deadline): the next Notify value of the function's node */
     /* A display driver follows a screen: the mode it is to show, and with N_SCANOUT_DIRECT the
        window it shows directly */
-    SYS_PCI_SCREEN_STATE,  /* (pci, output, seen serial, struct n_screen_state *out, deadline) */
+    SYS_SCREEN_STATE,  /* (claim, output, seen serial, struct n_screen_state *out, deadline) */
     /* What such a driver may show in its buffers' place, which the panic screen is drawn into too */
-    SYS_PCI_SCREEN_IMAGE,     /* (pci, output, surface, const struct n_scanout *): the image's number */
-    SYS_PCI_SCREEN_IMAGE_END, /* (pci, number) */
+    SYS_SCREEN_IMAGE,     /* (claim, output, surface, const struct n_scanout *): the image's number */
+    SYS_SCREEN_IMAGE_END, /* (claim, number) */
     /* A display driver's monitor on an output: the modes it can show and the one it shows (the
        system says which it wants in struct n_screen_state) */
-    SYS_PCI_SCREEN_MODES,     /* (pci, output, const struct n_screen_modes *) */
-    SYS_PCI_SCREEN_FLIPS,     /* (pci, struct n_screen_flip *out, max, deadline): count, 0 at the deadline */
+    SYS_SCREEN_MODES,         /* (claim, output, const struct n_screen_modes *) */
+    SYS_SCREEN_FLIPS,         /* (claim, struct n_screen_flip *out, max, deadline): count, 0 at the deadline */
     /* Watches (docs/nocturne-native-abi.md §1): a handle receivable once what it watches has
        changed, until SYS_WATCH_TAKE takes the count. Each call after it gives one. */
     SYS_WATCH_TAKE = 207,     /* (watch): the changes since its last take (0: none) */
@@ -245,7 +249,7 @@ enum {
     X(SYS_SETTINGS_EFFECTIVE) X(SYS_SETTINGS_DESCRIBE) X(SYS_SETTINGS_WATCH)
 
 /* 世代。呼出し、構造体、システムのサービスの文の形を変えたら一つ上げる。溝を末尾へ足すだけなら上げない。 */
-#define N_ABI_GENERATION 3u
+#define N_ABI_GENERATION 4u
 
 /* プログラムの刻印：ELF の PT_NOTE の一つ（user/libc/sys.c が全プログラムに入れる）。カーネルは起こす前に
    読む。世代が違うか、溝がカーネルより多ければ、N_ERR_WRONG_GENERATION で起こさない。 */
@@ -288,7 +292,7 @@ struct n_image {
 #define N_KIND_EVENTS 7
 #define N_KIND_DEVICE 8
 #define N_KIND_CONNECTION 9
-#define N_KIND_PCI 10       /* the right to drive one PCI function */
+#define N_KIND_HAL_CLAIM 10 /* 台帳の装置を一つ持つ権利（SYS_HAL_CLAIM） */
 #define N_KIND_PAGER 11     /* the right to supply one paged memory object; never sent */
 #define N_KIND_WATCH 13     /* a watch (SYS_WATCH_TAKE): receivable once what it watches changed */
 #define N_KIND_CONSOLE 15   /* the console: text goes out, struct n_console_key comes in (n_console_receive) */
@@ -477,44 +481,19 @@ struct n_cpuinfo {
 
 
 
-/* A claimed PCI function (n_pci_info). Addresses are bus addresses, which are physical
-   addresses: where an IOMMU isolates the function (N_PCI_ISOLATED) its domain maps each DMA
-   object at the same address, and nothing else but the firmware's reserved ranges. */
-#define N_PCI_ISOLATED 1u /* n_pci_function.flags: its DMA reaches only the claim's DMA objects */
-#define N_PCI_NEEDS_RECOVERY 2u /* previous driver ended active; native device recovery is required */
-#define N_PCI_HAS_UPSTREAM 4u /* a bridge is above it: n_pci_function.upstream */
-#define N_PCI_BAR_MEMORY 1u
-#define N_PCI_BAR_64BIT 2u
-#define N_PCI_BAR_PREFETCH 4u
-#define N_PCI_BAR_IO 8u
-#define N_PCI_NONE 0xFFFFFFFFu  /* no such BAR or framebuffer */
-/* A function's address in one word: all 32 bits are an address. */
-#define N_PCI_TARGET(segment, bus, dev, func) \
-    ((uint32_t)(segment) << 16 | (uint32_t)(bus) << 8 | (uint32_t)(dev) << 3 | (uint32_t)(func))
-#define N_PCI_TARGET_SEGMENT(target) ((uint16_t)((target) >> 16))
-#define N_PCI_TARGET_BUS(target) ((uint8_t)((target) >> 8))
-#define N_PCI_TARGET_DEV(target) ((uint8_t)((target) >> 3 & 0x1f))
-#define N_PCI_TARGET_FUNC(target) ((uint8_t)((target) & 7))
-#define N_PCI_SELF (UINT64_C(1) << 32) /* n_pci_config_read: the claimed function itself; no N_PCI_TARGET */
-struct n_pci_bar {
-    uint64_t address, size;
-    uint32_t flags, reserved;
+/* SYS_HAL_BUS_CALL の要求（n_hal_bus_call）：バスだけの操作 op（番号は hal_buses.h）、その入力と出力の置き場。
+   戻りは操作の結果で、出力は書いた分だけ out に入る。 */
+struct n_hal_call {
+    uint32_t op, reserved;
+    const void *in;
+    uint64_t in_size;
+    void *out;
+    uint64_t out_size;
 };
-struct n_pci_function {
-    uint16_t segment;
-    uint8_t bus, dev, func, revision;
-    uint16_t vendor, device, subsystem_vendor, subsystem_id;
-    uint8_t cls, subcls, progif, interrupt_pin;
-    uint32_t msi_vectors, msix_vectors; /* what the function offers, 0 without */
-    uint32_t upstream;                  /* with N_PCI_HAS_UPSTREAM: N_PCI_TARGET of the bridge above it */
-    uint32_t flags;                     /* N_PCI_ISOLATED, N_PCI_NEEDS_RECOVERY, N_PCI_HAS_UPSTREAM */
-    struct n_pci_bar bar[6];
-    /* The screen the firmware set up, when its pixels lie in one of this function's BARs
-       (framebuffer_bar, else N_PCI_NONE): drivers must keep that memory as it is. */
-    uint64_t framebuffer_address, framebuffer_size;
-    uint32_t framebuffer_bar, framebuffer_width, framebuffer_height, framebuffer_pitch;
-    uint32_t framebuffer_bpp, reserved2;
-};
+/* SYS_HAL_POWER_WAIT が返す眠りの知らせ。SUSPEND には、装置を止めてから SYS_HAL_POWER_DONE で答える。
+   RESUME は知らせるだけ。 */
+#define N_HAL_POWER_SUSPEND 1u
+#define N_HAL_POWER_RESUME 2u
 /* n_dma_create flags */
 #define N_DMA_CONTIGUOUS 1u  /* one physically contiguous run */
 #define N_DMA_32BIT 2u       /* every page below 4 GiB */
@@ -530,21 +509,21 @@ struct n_pci_function {
 #define N_SCANOUT_XRGB2101010 2u /* 32 bits: x2 r10 g10 b10, blue in the lowest bits */
 #define N_SCANOUT_XBGR8888 3u    /* 32 bits: x8 b8 g8 r8, red in the lowest byte */
 /* A flag in format: the driver can show a window's own images instead of the desktop and draw
-   the pointer itself while it does (n_pci_screen_state says when and where). */
+   the pointer itself while it does (n_screen_read_state says when and where). */
 #define N_SCANOUT_DIRECT 0x100u
 #define N_SCANOUT_FORMAT_MASK 0xffu
-/* n_pci_screen_image: where in a surface the display engine reads an image from: width x height
+/* n_screen_image_add: where in a surface the display engine reads an image from: width x height
    pixels, pitch bytes from one row to the next, the first row offset bytes into the surface. */
 struct n_scanout {
     uint32_t width, height, pitch, format;
     uint64_t offset;
 };
-/* n_pci_give_screen: the buffers an output shows a screen from, all of one mode and format. width
+/* n_screen_give: the buffers an output shows a screen from, all of one mode and format. width
    and height are the mode's (the screen takes that size), pitch the bytes from one row to the
    next, format N_SCANOUT_* (with N_SCANOUT_DIRECT when the driver can show windows directly).
    Each buffer is a surface (a writable shared object made through the claim) and the offset of
    its first row in it; count of them, 1 to N_SCREEN_BUFFERS_MAX. The system draws a frame only
-   into a buffer the output does not show and then asks for it (n_pci_screen_flips); with one
+   into a buffer the output does not show and then asks for it (n_screen_flips); with one
    buffer it has no other and draws into the one shown. */
 #define N_SCREEN_BUFFERS_MAX 4u
 struct n_screen_buffer {
@@ -557,14 +536,14 @@ struct n_screen_buffers {
     uint32_t count, reserved;
     struct n_screen_buffer buffer[N_SCREEN_BUFFERS_MAX];
 };
-/* n_pci_screen_flips: show buffer of output from its next vertical blank on. serial counts the
-   output's flips from 1; the driver says when the flip was shown (n_pci_screen_vblank). A newer
+/* n_screen_flips: show buffer of output from its next vertical blank on. serial counts the
+   output's flips from 1; the driver says when the flip was shown (n_screen_report_vblank). A newer
    flip of the same output replaces one not taken yet. */
 struct n_screen_flip {
     uint32_t output, buffer;
     uint64_t serial;
 };
-/* n_pci_screen_vblank: a vertical blank of output. count is the driver's count of its blanks,
+/* n_screen_report_vblank: a vertical blank of output. count is the driver's count of its blanks,
    time_ns the moment it began on the system's monotonic clock in nanoseconds (struct n_clock,
    n_clock_monotonic: the driver converts the display engine's time to it), buffer the buffer shown from
    it on and flip_serial the last flip that blank shows (0: none yet). A driver reports each blank
@@ -578,7 +557,7 @@ struct n_screen_vblank {
    bits per channel and the pixel format (N_SCANOUT_*) the driver scans out in that mode (0: it does
    not say). N_SCREEN_MODE_PREFERRED marks the monitor's own preferred timing (its EDID's).
    N_SCREEN_MODE_VRR: the monitor shows the mode at a variable refresh, a frame as soon as it is
-   ready, from refresh_mhz down to its n_screen_modes vrr_min_mhz. */
+   ready, from refresh_mhz down to its n_screen_offer_modes vrr_min_mhz. */
 #define N_SCREEN_MODE_PREFERRED 1u
 #define N_SCREEN_MODE_VRR 2u
 struct n_screen_mode {
@@ -588,7 +567,7 @@ struct n_screen_mode {
     uint32_t bits_per_channel;
     uint32_t format;
 };
-/* n_pci_screen_modes: the monitor a display driver drives and what it can show there. The display
+/* n_screen_offer_modes: the monitor a display driver drives and what it can show there. The display
    service chooses the mode (struct n_screen_state's mode); the driver says what it showed, each time
    it acted on one. monitor tells monitors apart (the same text for the same monitor every time:
    the EDID's maker, product and serial number), name is the monitor's for people (may be empty);
@@ -607,12 +586,12 @@ struct n_screen_modes {
     struct n_screen_mode modes[N_SCREEN_MODES_MAX];
 };
 
-/* n_pci_screen_state: what an output's screen should show, for the driver whose buffers the
+/* n_screen_read_state: what an output's screen should show, for the driver whose buffers the
    screen is drawn into or whose monitor's modes the system has. serial changes with every change
    of what follows and is never 0.
    mode is the mode the display service wants the driver to show (one of the modes it gave, all zero
    while it wants none: the driver keeps what is shown); mode_serial changes with every wish, even for the same mode again (a monitor
-   offered anew). The driver shows it at that size (n_pci_give_screen) and gives n_pci_screen_modes
+   offered anew). The driver shows it at that size (n_screen_give) and gives n_screen_offer_modes
    with done = mode_serial and what it shows then.
    For a driver whose buffers have N_SCANOUT_DIRECT: app is the app (n_app_self's number) whose
    fullscreen window the system lets show its own images directly, 0 when the desktop is shown.
@@ -633,7 +612,7 @@ struct n_screen_state {
     uint32_t pointer[N_SCREEN_POINTER_SIZE * N_SCREEN_POINTER_SIZE];
 };
 
-/* n_pci_acpi_eval: an ACPI object, an argument or a result. An integer's value is the number; a
+/* n_hal_pci_acpi_eval (N_PCI_CALL_ACPI_EVAL): an ACPI object, an argument or a result. An integer's value is the number; a
    string's or buffer's is where its bytes start (in the arguments' data, or in the result) and
    length how many (a string's without a terminating zero); a package's value is the index of its
    first element among the result's values and length how many. A reference (to a namespace
@@ -653,16 +632,6 @@ struct n_acpi_value {
 #define N_ACPI_SELF 0xFFFFFFFFu
 #define N_ACPI_UPSTREAM 0xFFFFFFFEu
 #define N_ACPI_CHILD(i) ((uint32_t)(i))
-/* What SYS_PCI_ACPI_EVAL evaluates: name (one name segment, 4 characters, as "_DSM") on node,
-   with nargs arguments (integers, strings or buffers) whose bytes are in data. */
-struct n_acpi_eval {
-    uint32_t node, nargs;
-    const char *name;
-    const struct n_acpi_value *args;
-    const void *data;
-    uint64_t data_size;
-};
-
 /* n_pager_take: a page of paged memory was touched without the access it needs. offset is
    the page's (page aligned) in the memory, access N_MEMORY_READ or N_MEMORY_READ_WRITE (a
    write), app the identifier of the app that touched it first. */
@@ -717,7 +686,7 @@ enum n_power_reason {
     N_POWER_REASON_DEVICE,        /* detail の装置は眠りから戻れない */
     N_POWER_REASON_DEVICE_BUSY,   /* detail の装置が今は眠れない */
     N_POWER_REASON_DEVICE_STUCK,  /* detail の装置が止まらなかった */
-    N_POWER_REASON_APP_DRIVER,    /* アプリが PCI の装置を動かしている */
+    N_POWER_REASON_APP_DRIVER,    /* アプリが装置を動かしている */
     N_POWER_REASON_DISK_FLUSH,    /* ディスクが cache を書き戻さなかった */
     N_POWER_REASON_CPU_STOP,      /* CPU が止まらなかった */
     N_POWER_REASON_FIRMWARE,      /* ファームウェアが眠らなかった */

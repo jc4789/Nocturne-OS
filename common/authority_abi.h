@@ -16,7 +16,7 @@ enum n_cap {
     N_CAP_ROOT = 0,        /* 全部を切り出せる根。 */
     N_CAP_SERVICE_ROOT,    /* サービスの名前の登録を受ける。 */
     N_CAP_IDENTITY_GRANT,  /* 子に別の利用者の身元を与える。 */
-    N_CAP_PCI_CLAIM,
+    N_CAP_HAL_CLAIM,       /* 台帳の装置を持つ（SYS_HAL_CLAIM）。 */
     N_CAP_POWER,
     N_CAP_SCREEN_READ,
     N_CAP_SETTINGS_APPLY,  /* カーネルが持つ領域へ設定を適用する。 */

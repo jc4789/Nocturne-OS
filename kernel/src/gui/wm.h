@@ -33,7 +33,7 @@ int wm_window_count(char *top_title, size_t n);
 int64_t wm_windows_watch(void); /* SYS_POWER_WINDOWS_WATCH */
 void wm_close_windows(void);
 void wm_repaint(void); /* the screens lost what was on them (after sleep, a hold): draw all of them again */
-/* A display driver's screen (dev/pciuser.c), by its number (dev/fb.h): whether its buffers can
+/* A display driver's screen (dev/screen_driver.c), by its number (dev/fb.h): whether its buffers can
    show a window's own images (N_SCANOUT_DIRECT), and what the screen should show: wm_screen_state
    waits until deadline (sys/wait.h) while the state is still numbered seen, then copies it to *out
    (kernel memory). N_ERR_TIMEOUT with *out the unchanged state; N_ERR_STOPPED when the caller is

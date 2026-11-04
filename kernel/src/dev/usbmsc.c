@@ -1,11 +1,12 @@
 /* USB mass storage: the Bulk-Only Transport (USB MSC BOT 1.0) carrying SCSI commands, the set
  * the USB MSC bootability spec says every device answers plus READ CAPACITY(16) and the 16-byte
- * READ/WRITE for large disks. Each logical unit with a medium becomes a block device. Its reads
- * and writes run in the thread that asks for them, one command at a time under the device's
- * lock; the block device outlives an unplug and then fails. */
+ * READ/WRITE for large disks. Each logical unit with a medium becomes a block device whose requests
+ * run one at a time on a thread of its own (blk_serial_start) and one command at a time on the
+ * device under its lock; the block device outlives an unplug and then fails. */
 #include "kernel.h"
 #include "dev/blk.h"
 #include "dev/usb.h"
+#include "hal/hal.h"
 #include "mm/heap.h"
 #include "sys/clock.h"
 #include "sys/wait.h"
@@ -26,10 +27,11 @@
 struct msc {
     struct mutex lock;
     struct usb_device *dev; /* NULL once unplugged */
+    struct usb_interface *node;
     uint8_t intf, in, out;
     uint32_t tag;
     uint8_t sense_key, asc, ascq;
-    uint8_t *bounce; /* for logical blocks larger than the 512-byte sectors */
+    uint8_t *bounce; /* a request whose memory is in several pieces goes through this */
     struct lun *luns; /* its block devices */
 };
 
@@ -42,8 +44,7 @@ struct lun {
     uint64_t blocks;
 };
 
-static unsigned disks;    /* atomic: the names given */
-static unsigned attached; /* atomic: storage devices plugged in now (they do not survive a sleep) */
+static unsigned disks; /* atomic: the names given */
 
 static void put32(uint8_t *p, uint32_t v) {
     for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i));
@@ -52,13 +53,6 @@ static uint32_t get32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 |
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
 static void put_be(uint8_t *p, uint64_t v, int bytes) {
     for (int i = 0; i < bytes; i++) p[i] = (uint8_t)(v >> (8 * (bytes - 1 - i)));
-}
-
-/* Bulk-only, with a command set that speaks SCSI (MSC Overview Table 1): not reported 00h, RBC 01h,
-   MMC-5 02h, SCSI transparent 06h. */
-static bool usbmsc_claims(const struct usb_interface_desc *intf) {
-    bool scsi = intf->subcls == 0x00 || intf->subcls == 0x01 || intf->subcls == 0x02 || intf->subcls == 0x06;
-    return intf->cls == 8 && scsi && intf->protocol == 0x50 && intf->alternate == 0;
 }
 
 static bool gone(const struct usb_device *d) { return !d || __atomic_load_n(&d->removed, __ATOMIC_ACQUIRE); }
@@ -190,8 +184,7 @@ static bool read_capacity(struct msc *m, unsigned lun, uint64_t *blocks, uint32_
 }
 
 /* `n` whole logical blocks from `first`, in one command. */
-static int transfer(void *ctx, bool write, uint64_t first, unsigned n, uint8_t *data) {
-    struct lun *l = ctx;
+static int blocks_io(struct lun *l, bool write, uint64_t first, unsigned n, uint8_t *data) {
     struct msc *m = l->m;
     unsigned bytes = n * l->block;
     uint8_t cdb[16] = {0};
@@ -216,47 +209,53 @@ static int transfer(void *ctx, bool write, uint64_t first, unsigned n, uint8_t *
             if (m->sense_key == 7 || m->sense_key == 5) break; /* write protected, illegal request */
         }
     }
-    return -1;
+    return -N_ERR_IO;
 }
 
-/* 512-byte sectors over the unit's logical blocks: whole blocks straight from and to the caller's
- * memory, the others through the bounce buffer. */
-static int msc_io(struct lun *l, bool write, uint64_t lba, uint32_t count, uint8_t *buf) {
+/* A read or write of the request's sectors: its memory straight when it is one piece, else through the
+   bounce buffer (a request is at most XFER bytes: max_sectors). */
+static int rw(struct lun *l, const struct blk_request *r) {
     struct msc *m = l->m;
-    mutex_lock(&m->lock);
-    int r = m->dev ? blk_by_blocks(&l->blk, write, lba, count, buf, m->bounce, XFER / l->block, true, transfer, l) : -1;
-    mutex_unlock(&m->lock);
-    return r;
-}
-
-static int msc_read(struct blkdev *b, uint64_t lba, uint32_t count, void *buf) {
-    return msc_io(b->priv, false, lba, count, buf);
-}
-
-static int msc_write(struct blkdev *b, uint64_t lba, uint32_t count, const void *buf) {
-    return msc_io(b->priv, true, lba, count, (uint8_t *)buf);
+    bool write = r->op == BLK_WRITE;
+    unsigned per = l->block / 512;
+    uint8_t *data;
+    if (r->segment_count == 1) {
+        data = phys_to_virt(r->segments[0].phys);
+    } else {
+        if (!m->bounce && !(m->bounce = kmalloc(XFER))) return -N_ERR_NO_MEMORY;
+        data = m->bounce;
+        for (uint32_t i = 0, at = 0; write && i < r->segment_count; at += r->segments[i++].bytes)
+            memcpy(data + at, phys_to_virt(r->segments[i].phys), r->segments[i].bytes);
+    }
+    int status = blocks_io(l, write, r->lba / per, r->sectors / per, data);
+    for (uint32_t i = 0, at = 0; !status && !write && r->segment_count > 1 && i < r->segment_count; at += r->segments[i++].bytes)
+        memcpy(phys_to_virt(r->segments[i].phys), data + at, r->segments[i].bytes);
+    return status;
 }
 
 /* SYNCHRONIZE CACHE(10) over the whole unit (SBC). A unit without a write cache may refuse it
    (ILLEGAL REQUEST): then nothing was waiting. */
-static int msc_flush(struct blkdev *b) {
+static int flush(struct lun *l) {
     static const uint8_t cdb[10] = {0x35};
-    struct lun *l = b->priv;
     struct msc *m = l->m;
-    int result = -1;
-    mutex_lock(&m->lock);
     /* a unit attention (a reset, the power) or a moment's trouble is tried again, like a read */
     for (int tries = 0; tries < 3 && m->dev; tries++) {
         int r = scsi(m, l->lun, cdb, 10, NULL, 0, false);
-        if (r >= 0 || (r == BOT_FAILED && m->sense_key == 5)) { /* 5: no cache to flush */
-            result = 0;
-            break;
-        }
+        if (r >= 0 || (r == BOT_FAILED && m->sense_key == 5)) return 0; /* 5: no cache to flush */
         if (r == BOT_FAILED && m->sense_key != 6)
             kprintf("usbmsc: %s flush failed (sense %x/%02x/%02x)\n", l->blk.name, m->sense_key, m->asc, m->ascq);
     }
+    return -N_ERR_IO;
+}
+
+/* Every request of the unit, on its serial thread: one command at a time on the device. */
+static int msc_transfer(struct blkdev *b, const struct blk_request *r) {
+    struct lun *l = b->priv;
+    struct msc *m = l->m;
+    mutex_lock(&m->lock);
+    int status = !m->dev ? -N_ERR_IO : r->op == BLK_PERSIST ? flush(l) : rw(l, r);
     mutex_unlock(&m->lock);
-    return result;
+    return status;
 }
 
 static void probe_lun(struct msc *m, unsigned lun) {
@@ -304,32 +303,33 @@ static void probe_lun(struct msc *m, unsigned lun) {
     ksnprintf(l->blk.name, sizeof l->blk.name, "usb%u", __atomic_fetch_add(&disks, 1, __ATOMIC_RELAXED));
     strlcpy(l->blk.model, model, sizeof l->blk.model);
     l->blk.sectors = blocks * (block / 512);
-    l->blk.read = msc_read;
-    l->blk.write = msc_write;
-    l->blk.persist = msc_flush;
     l->blk.block = block;
+    l->blk.max_sectors = XFER / 512;
+    l->blk.has_cache = true;
     l->blk.priv = l;
     l->next = m->luns;
     m->luns = l;
-    blk_register(&l->blk);
+    blk_serial_start(&l->blk, msc_transfer);
+    blk_register(&m->node->hal, &l->blk);
 }
 
-static int usbmsc_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
-    const struct usb_interface_desc *intf = NULL;
+/* An interface of the mass storage class with a bulk pair: the descriptors from its own to the next
+   interface's. */
+static int msc_attach(struct hal_device *hal) {
+    struct usb_interface *node = usb_interface_of(hal);
+    struct usb_device *d = node->dev;
+    const uint8_t *cfg = d->config;
+    unsigned total = d->config_bytes;
     struct usb_ep_info eps[2], e;
     bool have_in = false, have_out = false;
-    for (unsigned off = 0; off + 2 <= total && cfg[off] >= 2 && off + cfg[off] <= total; off += cfg[off]) {
-        unsigned type = cfg[off + 1];
-        if (type == USB_DESC_INTERFACE && cfg[off] >= 9) {
-            if (intf) break; /* BOT 4: the first bulk IN and OUT of the interface */
-            const struct usb_interface_desc *i = (const void *)(cfg + off);
-            if (usbmsc_claims(i)) intf = i;
-        } else if (intf && usb_endpoint_info(cfg, total, off, &e) && (e.attributes & 3) == 2) {
+    for (unsigned off = node->offset + node->desc->length; off + 2 <= total && cfg[off] >= 2 && off + cfg[off] <= total;
+         off += cfg[off]) {
+        if (cfg[off + 1] == USB_DESC_INTERFACE) break; /* BOT 4: the first bulk IN and OUT of the interface */
+        if (usb_endpoint_info(cfg, total, off, &e) && (e.attributes & 3) == 2) {
             if ((e.address & 0x80) && !have_in) eps[0] = e, have_in = true;
             if (!(e.address & 0x80) && !have_out) eps[1] = e, have_out = true;
         }
     }
-    if (!intf) return USB_NOT_MINE;
     if (!have_in || !have_out) {
         kprintf("usbmsc: slot %u has no usable bulk endpoints\n", d->slot);
         return -N_ERR_UNSUPPORTED;
@@ -337,38 +337,56 @@ static int usbmsc_attach(struct usb_device *d, const uint8_t *cfg, unsigned tota
     struct msc *m = kzalloc(sizeof *m);
     if (!m) return -N_ERR_NO_MEMORY;
     m->dev = d;
-    m->intf = intf->number;
+    m->node = node;
+    m->intf = node->desc->number;
     m->in = eps[0].address;
     m->out = eps[1].address;
-    d->state[USB_DRIVER_MSC] = m;
-    __atomic_fetch_add(&attached, 1, __ATOMIC_RELAXED);
+    hal->driver_data = m;
     /* BOT 3.2: Get Max LUN; a device with one unit may stall it */
     uint8_t max = 0;
     if (usb_control(d, 0xA1, 0xFE, 0, m->intf, &max, 1) < 1) max = 0;
     if (max >= MAX_LUNS) max = MAX_LUNS - 1;
     kprintf("usbmsc: slot %u bulk-only storage, %u unit%s\n", d->slot, max + 1u, max ? "s" : "");
     mutex_lock(&m->lock);
-    for (unsigned lun = 0; lun <= max && m->dev; lun++) probe_lun(m, lun);
+    for (unsigned lun = 0; lun <= max && m->dev && !hal_gone(hal); lun++) probe_lun(m, lun);
     mutex_unlock(&m->lock);
     return 0;
 }
 
 /* The block devices stay registered (a mounted filesystem may still hold them); they fail from
- * now on. The command running ends first: usb_remove ended its transfers. */
-static void usbmsc_detach(struct usb_device *d) {
-    struct msc *m = d->state[USB_DRIVER_MSC];
-    if (!m) return;
+ * now on, and their serial threads end once what they hold is failed. The command running ends
+ * first: usb_remove ended its transfers. Their memory stays, for whoever holds the devices. */
+static void msc_detach(struct hal_device *hal) {
+    struct msc *m = hal->driver_data;
     mutex_lock(&m->lock);
     m->dev = NULL;
     for (struct lun *l = m->luns; l; l = l->next) __atomic_store_n(&l->blk.gone, true, __ATOMIC_RELEASE);
     mutex_unlock(&m->lock);
-    d->state[USB_DRIVER_MSC] = NULL;
-    __atomic_fetch_sub(&attached, 1, __ATOMIC_RELAXED);
+    for (struct lun *l = m->luns; l; l = l->next) blk_serial_stop(&l->blk);
+    hal->driver_data = NULL;
 }
 
-static const char *usbmsc_refuse(void) {
-    return __atomic_load_n(&attached, __ATOMIC_RELAXED) > 0 ? "A USB disk is plugged in" : NULL;
+/* A disk would come back as a new device under a mounted filesystem after a sleep: none while one is plugged in. */
+static const char *msc_refuse(struct hal_device *hal) { return hal->driver_data ? "A USB disk is plugged in" : NULL; }
+
+static bool msc_resume(struct hal_device *hal) {
+    (void)hal;
+    return true; /* only after a sleep that was given up: nothing was changed */
 }
 
-const struct usb_driver usbmsc_driver = {.name = "usbmsc", .claims = usbmsc_claims, .attach = usbmsc_attach,
-                                         .detach = usbmsc_detach, .refuse = usbmsc_refuse};
+/* Bulk-only (protocol 50h) with a command set that speaks SCSI (MSC Overview Table 1): not reported
+   00h, RBC 01h, MMC-5 02h, SCSI transparent 06h. */
+#define MSC_BULK_ONLY(subclass) \
+    N_HAL_RULE(N_HAL_NUMBER(N_HAL_PROP_BUS, N_BUS_USB_INTERFACE), N_HAL_NUMBER(N_PROP_USB_CLASS, N_USB_CLASS_CODE(8, subclass, 0x50)))
+static const struct n_hal_rule msc_rules[] = {MSC_BULK_ONLY(0x00), MSC_BULK_ONLY(0x01), MSC_BULK_ONLY(0x02),
+                                              MSC_BULK_ONLY(0x06)};
+static const struct hal_driver msc_driver = {
+    .name = "usbmsc",
+    .rules = msc_rules,
+    .rule_count = ARRAY_SIZE(msc_rules),
+    .attach = msc_attach,
+    .detach = msc_detach,
+    .resume = msc_resume,
+    .refuse = msc_refuse,
+};
+HAL_DRIVER(msc_driver);

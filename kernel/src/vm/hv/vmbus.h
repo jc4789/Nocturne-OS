@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "arch/spin.h"
-#include "dev/hal.h"
+#include "hal/hal.h"
 
 struct guid {
     uint8_t b[16];
@@ -48,8 +48,8 @@ struct hv_ring {
 struct vmbus_channel;
 typedef void (*vmbus_callback_t)(struct vmbus_channel *ch);
 
-/* rescinded, opened, claimed, callback, priv and on_rescind change only inside vmbus.c (under its
-   channel lock): a driver reads rescinded as a hint and sets on_rescind with vmbus_set_rescind. */
+/* rescinded, opened, claimed, callback, priv, on_rescind and node change only inside vmbus.c (under
+   its channel lock): a driver reads rescinded as a hint and sets on_rescind with vmbus_set_rescind. */
 struct vmbus_channel {
     struct guid type, instance;
     uint16_t chn_flags;
@@ -72,7 +72,13 @@ struct vmbus_channel {
     vmbus_callback_t on_rescind; /* CPU 0's interrupt handler: the host withdrew the channel */
     void *priv;
     bool claimed;  /* a driver owns it: not freed on rescind until vmbus_release() */
-    struct hal_device hal; /* the devices' channels, not the sockets' */
+    /* The channel's node in the device tree (N_BUS_VMBUS), for the devices' channels and not the
+       sockets'. node says where the node is between its offer and its removal (vmbus.c); the
+       others link the channel into the thread that publishes and removes nodes. */
+    struct hal_device hal;
+    uint8_t node;
+    bool node_rescind, node_queued;
+    struct vmbus_channel *node_next;
     struct vmbus_channel *next;
 };
 
@@ -81,13 +87,17 @@ struct vmbus_channel {
 
 extern int vmbus_version_major, vmbus_version_minor;
 
-/* Connect to VMBus and collect the device offers. False if this is not Hyper-V. CPU 0, at boot. */
+/* Connect to VMBus and collect the device offers. False if this is not Hyper-V. CPU 0, at boot.
+   Each offered device's channel becomes a node under the root (bus N_BUS_VMBUS, its type GUID
+   as N_PROP_VMBUS_TYPE), published by a thread of its own because an offer arrives in an
+   interrupt handler; the host's rescind removes the node (hal_remove, which waits for the
+   driver's detach). A driver's rule matches N_VMBUS_TYPE(guid). */
 bool vmbus_init(void);
 bool vmbus_ready(void);
+/* The channel behind a node of bus N_BUS_VMBUS: what attach receives. */
+struct vmbus_channel *vmbus_channel_of(struct hal_device *d);
 /* The rest from tasks on any CPU, unless said otherwise; the callbacks run in CPU 0's interrupt
    handler and never close, release or open a channel, or wait for a request. */
-/* The n-th offered channel of a device type, or NULL. */
-struct vmbus_channel *vmbus_find(const struct guid *type, int n);
 /* Allocate the rings and open the channel. Sizes are rounded up to pages. 0 or -errno. */
 int vmbus_open(struct vmbus_channel *ch, uint32_t out_bytes, uint32_t in_bytes, vmbus_callback_t cb, void *priv);
 /* Close an open channel and free its rings. When it returns, no callback of the channel runs and
@@ -97,8 +107,8 @@ void vmbus_close(struct vmbus_channel *ch);
    False means backing was retained, including on rescind; the channel itself
    is still closed. This does not change the legacy close contract. */
 bool vmbus_close_confirmed(struct vmbus_channel *ch);
-/* Give up a claimed channel: it is freed (and its relid handed back) once the host rescinds it.
-   When it returns, its on_rescind no longer runs. */
+/* Give up a claimed channel: it is freed (and its relid handed back) once the host rescinds it
+   and its node is gone. When it returns, its on_rescind no longer runs. */
 void vmbus_release(struct vmbus_channel *ch);
 /* What runs when the host rescinds the channel (NULL: nothing). */
 void vmbus_set_rescind(struct vmbus_channel *ch, vmbus_callback_t on_rescind);
@@ -127,9 +137,6 @@ bool vmbus_write_ready(struct vmbus_channel *ch, uint32_t packet_len);
 bool vmbus_wait(volatile bool *flag, uint64_t ms);
 void guid_format(const struct guid *g, char *out); /* 37 bytes */
 
-void hv_input_init(void); /* hv_input.c: synthetic keyboard and mouse */
-void storvsc_init(void);  /* storvsc.c: synthetic SCSI disks */
 /* netvsc.c: the address of the synthetic adapter, which the host asks about (hv_util.c). False without one. */
 bool netvsc_ip(uint32_t *ip);
-void hv_util_init(void);  /* hv_util.c: heartbeat, shutdown, time sync */
 void hvsock_init(void);   /* hvsock.c: Hyper-V sockets */

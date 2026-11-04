@@ -1,13 +1,25 @@
 /* ATA hard disks on the legacy IDE ports, PIO mode with polling (interrupts off via nIEN).
    That is all a Hyper-V Generation 1 VM or QEMU's "pc" machine needs. ATAPI (DVD) drives are
-   skipped. A master and its slave share their channel's registers: a command on a channel holds
-   the channel's lock from its setup to its end, whichever CPU gives it. */
+   skipped. The driver of the fixed node "ide-ports" (vm/vm.c publishes it and adds the driver):
+   attach looks at the four places a drive may be, and each drive found is a block device whose
+   requests one thread of its own does one at a time (blk_serial_ops). A master and its slave share
+   their channel's registers: a command on a channel holds the channel's lock from its setup to its
+   end. */
 #include "kernel.h"
-#include "dev/hal.h"
-#include "vm/devices.h"
+#include "dev/blk.h"
+#include "hal/hal.h"
 #include "arch/cpu.h"
+#include "mm/vmm.h"
 #include "sys/wait.h"
 #include "vm/ata.h"
+
+struct ata_disk {
+    struct blkdev blk;
+    uint16_t io, ctl;
+    bool slave, lba48;
+    uint64_t sectors;
+    char model[41];
+};
 
 #define REG_DATA    0
 #define REG_ERROR   1
@@ -96,51 +108,51 @@ static void probe(uint16_t io, uint16_t ctl, bool slave) {
     }
     for (int i = 39; i >= 0 && d.model[i] == ' '; i--) d.model[i] = 0;
     if (!d.sectors) return;
-    d.index = ndisks;
     disks[ndisks++] = d;
     kprintf("ata: %s %s: %s, %lu MiB%s\n", io == 0x1F0 ? "primary" : "secondary", slave ? "slave" : "master",
             d.model, d.sectors / 2048, d.lba48 ? ", LBA48" : "");
 }
 
-static int blk_ata_read(struct blkdev *b, uint64_t lba, uint32_t n, void *buf) { return ata_read(b->priv, lba, n, buf); }
-static int blk_ata_write(struct blkdev *b, uint64_t lba, uint32_t n, const void *buf) {
-    return ata_write(b->priv, lba, n, buf);
-}
-static int blk_ata_persist(struct blkdev *b) { return ata_flush(b->priv); }
+static int transfer(struct blkdev *b, const struct blk_request *r);
 
-/* 台帳の記録は channel に一つ。 */
-static void channel_record(struct hal_device *record, uint16_t io) {
-    bool any = false;
-    for (int i = 0; i < ndisks; i++) any |= disks[i].io == io;
-    if (!any) return;
-    record->info.at.port.base = io;
-    hal_add(record, 0, N_HAL_BUS_PORT);
-    hal_bound(record, "ata");
+static void disk_register(struct hal_device *hal, int i) {
+    struct blkdev *b = &disks[i].blk;
+    ksnprintf(b->name, sizeof b->name, "ata%d", i);
+    strlcpy(b->model, disks[i].model, sizeof b->model);
+    b->sectors = disks[i].sectors;
+    b->max_sectors = 128; /* one READ or WRITE SECTORS command: the count is a byte, 0 meaning 256 (48-bit: 16 bits) */
+    b->has_cache = true;
+    b->priv = &disks[i];
+    blk_serial_start(b, transfer);
+    blk_register(hal, b);
 }
 
-void ata_init(void) {
-    static struct hal_device records[2];
+static int ata_attach(struct hal_device *d) {
+    if (ndisks) return -N_ERR_EXISTS;
     probe(0x1F0, 0x3F6, false);
     probe(0x1F0, 0x3F6, true);
     probe(0x170, 0x376, false);
     probe(0x170, 0x376, true);
-    channel_record(&records[0], 0x1F0);
-    channel_record(&records[1], 0x170);
-    for (int i = 0; i < ndisks; i++) {
-        struct blkdev *b = &disks[i].blk;
-        ksnprintf(b->name, sizeof b->name, "ata%d", i);
-        strlcpy(b->model, disks[i].model, sizeof b->model);
-        b->sectors = disks[i].sectors;
-        b->read = blk_ata_read;
-        b->write = blk_ata_write;
-        b->persist = blk_ata_persist;
-        b->priv = &disks[i];
-        blk_register(b);
-    }
+    if (!ndisks) return HAL_DECLINE;
+    for (int i = 0; i < ndisks; i++) disk_register(d, i);
+    return 0;
 }
 
-int ata_count(void) { return ndisks; }
-struct ata_disk *ata_get(int i) { return i >= 0 && i < ndisks ? &disks[i] : NULL; }
+/* The ports keep what they had across a sleep: nothing is owed to the drives (a request that comes
+   waits for the channel as before). */
+static bool ata_resume(struct hal_device *d) {
+    (void)d;
+    return true;
+}
+
+static const struct n_hal_rule ata_rules[] = {N_FIXED("ide-ports")};
+const struct hal_driver ata_driver = {
+    .name = "ata",
+    .rules = ata_rules,
+    .rule_count = ARRAY_SIZE(ata_rules),
+    .attach = ata_attach,
+    .resume = ata_resume,
+};
 
 static int setup(struct ata_disk *d, uint64_t lba, uint32_t count, bool write) {
     if (lba + count > d->sectors) return -N_ERR_IO;
@@ -172,63 +184,39 @@ static int setup(struct ata_disk *d, uint64_t lba, uint32_t count, bool write) {
     return 0;
 }
 
-/* One READ SECTORS (EXT) of n sectors, the channel's lock held. */
-static int read_command(struct ata_disk *d, uint64_t lba, uint32_t n, uint16_t *p) {
-    int r = setup(d, lba, n, false);
-    if (r < 0) return r;
-    for (uint32_t s = 0; s < n; s++) {
-        if (wait_drq(d) < 0) return -N_ERR_IO;
-        pio_read_sector(d->io + REG_DATA, p); p += 256;
-        delay400(d->ctl);
+/* One READ SECTORS (EXT) of the request, the channel's lock held. Each sector lies within one
+   segment (their bytes are multiples of 512). */
+static int read_command(struct ata_disk *d, const struct blk_request *r) {
+    int s = setup(d, r->lba, r->sectors, false);
+    if (s < 0) return s;
+    for (uint32_t i = 0; i < r->segment_count; i++) {
+        uint16_t *p = phys_to_virt(r->segments[i].phys);
+        for (uint32_t k = 0; k < r->segments[i].bytes / 512; k++, p += 256) {
+            if (wait_drq(d) < 0) return -N_ERR_IO;
+            pio_read_sector(d->io + REG_DATA, p);
+            delay400(d->ctl);
+        }
     }
     return 0;
 }
 
-/* One WRITE SECTORS (EXT) of n sectors, the channel's lock held. */
-static int write_command(struct ata_disk *d, uint64_t lba, uint32_t n, const uint16_t *p) {
-    int r = setup(d, lba, n, true);
-    if (r < 0) return r;
-    for (uint32_t s = 0; s < n; s++) {
-        if (wait_drq(d) < 0) return -N_ERR_IO;
-        pio_write_sector(d->io + REG_DATA, p); p += 256;
-        delay400(d->ctl);
+/* One WRITE SECTORS (EXT) of the request, the channel's lock held. */
+static int write_command(struct ata_disk *d, const struct blk_request *r) {
+    int s = setup(d, r->lba, r->sectors, true);
+    if (s < 0) return s;
+    for (uint32_t i = 0; i < r->segment_count; i++) {
+        const uint16_t *p = phys_to_virt(r->segments[i].phys);
+        for (uint32_t k = 0; k < r->segments[i].bytes / 512; k++, p += 256) {
+            if (wait_drq(d) < 0) return -N_ERR_IO;
+            pio_write_sector(d->io + REG_DATA, p);
+            delay400(d->ctl);
+        }
     }
     return wait_not_busy(d) < 0 ? -N_ERR_IO : 0;
 }
 
-int ata_read(struct ata_disk *d, uint64_t lba, uint32_t count, void *buf) {
-    uint16_t *p = buf;
-    while (count) {
-        uint32_t n = MIN(count, 128u);
-        mutex_lock(channel_of(d));
-        int r = read_command(d, lba, n, p);
-        mutex_unlock(channel_of(d));
-        if (r < 0) return r;
-        p += n * 256;
-        lba += n;
-        count -= n;
-    }
-    return 0;
-}
-
-int ata_write(struct ata_disk *d, uint64_t lba, uint32_t count, const void *buf) {
-    const uint16_t *p = buf;
-    while (count) {
-        uint32_t n = MIN(count, 128u);
-        mutex_lock(channel_of(d));
-        int r = write_command(d, lba, n, p);
-        mutex_unlock(channel_of(d));
-        if (r < 0) return r;
-        p += n * 256;
-        lba += n;
-        count -= n;
-    }
-    return 0;
-}
-
 /* FLUSH CACHE (EXT): the drive's write cache reaches the medium (ATA8-ACS 7.10, 7.11). */
-int ata_flush(struct ata_disk *d) {
-    mutex_lock(channel_of(d));
+static int flush_command(struct ata_disk *d) {
     int s = wait_not_busy(d);
     if (s >= 0) {
         outb(d->io + REG_DRIVE, 0xA0 | (d->slave ? 0x10 : 0));
@@ -240,6 +228,13 @@ int ata_flush(struct ata_disk *d) {
         delay400(d->ctl);
         s = wait_not_busy(d);
     }
-    mutex_unlock(channel_of(d));
     return s < 0 || s & (ST_ERR | ST_DF) ? -N_ERR_IO : 0;
+}
+
+static int transfer(struct blkdev *b, const struct blk_request *r) {
+    struct ata_disk *d = b->priv;
+    mutex_lock(channel_of(d));
+    int s = r->op == BLK_READ ? read_command(d, r) : r->op == BLK_WRITE ? write_command(d, r) : flush_command(d);
+    mutex_unlock(channel_of(d));
+    return s;
 }

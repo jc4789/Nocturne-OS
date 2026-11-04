@@ -22,6 +22,10 @@
 
 struct hal_device;
 struct hal_claim;
+struct hal_claim_ops;
+struct hal_offer_entry;
+struct hal_depend_entry;
+struct hal_dma_block;
 struct irq;
 struct irq_spec;
 
@@ -97,7 +101,8 @@ struct hal_device {
     struct hal_offer_entry *offers;
     struct hal_depend_entry *depends;
     struct hal_dma_block *dma;
-    struct mutex bind; /* attach、detach、claim、hal_remove を一度に一つにする */
+    struct mutex bind; /* attach、detach、claim の始まり、hal_remove を一度に一つにする */
+    uint32_t holds;    /* 記録を読んでいる attach の thread、claim、呼出しの数。hal_remove は 0 を待つ。hal_lock の下 */
     uint32_t offer_count, depend_count;
     bool queued, gone, listed, power_seen, power_down, irqs_on;
 };
@@ -186,16 +191,92 @@ int64_t hal_syscall_list(void *user_out, uint64_t bytes);
 int64_t hal_syscall_watch(void);
 
 /* ---- プロセスの実装（hal/claim.c） ----
-   hal_bind_process は装置を実装の無い状態からプロセスの持ち物にする。動いている実装があれば -N_ERR_BUSY。
-   hal_unbind_process は実装の無い状態へ戻す。hal_remove はこの持ち物を hal_claim_revoke で終わらせる。 */
+   プロセスは n_hal_claim で装置を持ち、実装になる。カーネルの実装と同じ装置の記録に結び（hal_bind_process）、
+   資源の写し、割り込み、DMA、台帳への提供、眠りの知らせは、バスを問わず claim が持つ。バスだけの操作は、バスが
+   struct hal_bus_ops の claim に置く struct hal_claim_ops が受け持つ。claim が NULL のバスの装置は持てない。
+   claim は N_KIND_HAL_CLAIM の object で、最後の handle が閉じると終わる。終わりは hal_remove からも起こる
+   （hal_claim_end_device）：どちらも一度だけ走る。hal_remove は走っている呼出しの終わりを待ち、後の呼出しは
+   N_ERR_CLOSED を返す。バスの call が長く眠るなら、hal_claim_revoked か end で起きること。 */
+struct handle;
+struct hal_claim_ops {
+    /* バスの持ち分を始める。hal_bind_process の後に呼ぶ。眠ってよい。バスの claim ごとの記録を作って *bus に
+       置き、0 を返す。負なら記録も装置への手出しも残さない。 */
+    int (*begin)(struct hal_claim *c, void **bus);
+    /* claim の終わり。写像は外れ、割り込みは止まっている。装置を止め、その DMA が二度とメモリーに届かないと
+       確かめられたら true（DMA のメモリーを返してよい）。眠ってよい。 */
+    bool (*end)(struct hal_claim *c);
+    /* 記録の寿命の終わり：BAR と DMA の object も手放した。記録を返す。NULL は記録が無い。 */
+    void (*release)(struct hal_claim *c);
+    /* バスだけの操作（n_hal_bus_call）。in と out は核の写しで、out_size 以内の *used バイトを書いてよい。戻りは
+       操作の結果（0 以上）か負の N_ERR_*。眠ってよい。NULL は操作が無い。 */
+    int64_t (*call)(struct hal_claim *c, uint32_t op, const void *in, size_t in_size, void *out, size_t out_size,
+                    size_t *used);
+    /* 割り込みの数の上限。NULL は hal_irq_max。 */
+    unsigned (*irq_max)(struct hal_claim *c);
+    /* DMA：装置が届く番地の幅（64：制限なし）と、DMA の頁を装置へ見せる・外す（IOMMU）。dma_bits が NULL なら
+       claim は DMA を作れない。unmap が false なら装置が頁にまだ届くかもしれない。眠ってよい。 */
+    unsigned (*dma_bits)(struct hal_claim *c);
+    bool (*dma_map)(struct hal_claim *c, const uint64_t *frames, uint64_t base, size_t count);
+    bool (*dma_unmap)(struct hal_claim *c, const uint64_t *frames, uint64_t base, size_t count);
+};
+/* 資源とメモリーと割り込みだけで足りるバスの claim の操作。 */
+extern const struct hal_claim_ops hal_claim_plain;
+
+/* 呼ぶ側が持っている handle を受ける。眠ってよい thread から、spinlock を持たずに呼ぶ。 */
+int64_t hal_claim_open(uint32_t device, struct handle **out);
+int64_t hal_claim_resources(struct handle *h, struct n_hal_resource *user_out, size_t max);
+int64_t hal_claim_interrupts(struct handle *h, uint32_t count);
+int64_t hal_claim_interrupt_take(struct handle *h, uint64_t deadline, uint64_t *user_bits, uint32_t words);
+int64_t hal_claim_bus_call(struct handle *h, uint32_t op, const void *in, size_t in_size, void *out, size_t out_size,
+                           size_t *used);
+int64_t hal_claim_offer(struct handle *h, uint32_t kind, uint32_t instance, const char *label);
+int64_t hal_claim_offer_withdraw(struct handle *h, uint32_t kind, uint32_t instance);
+int64_t hal_claim_power_wait(struct handle *h, uint64_t deadline);
+int64_t hal_claim_power_done(struct handle *h, bool ok);
+
+/* claim の記録（mm/shared.c の BAR と DMA の object、dev/screen_driver.c、バス）。
+   hal_claim_of：h が claim の handle ならその記録、でなければ NULL。参照は増やさない。
+   hal_claim_hold：同じで参照を一つ増やす（h が持つ分に足す）。BAR と DMA の object が claim の寿命の間持つ。
+   hal_claim_revoked：claim は終わった（最後の handle が閉じた、または装置が去った）。写像はもう持ち主のものでない。
+   hal_claim_dma_reusable：残っている DMA の頁をメモリーへ返してよい（動いている claim か、装置が届かないと確かめて終わった）。
+   hal_claim_memory：メモリーの資源 slot の番地と大きさ（頁に揃っていること）。
+   hal_claim_device・hal_claim_bus：装置の記録と、バスが begin で置いた記録。
+   hal_claim_on_end：claim の終わりにバスが装置を止めた後、hook の ended を一度呼ぶ（画面を返す、保持を戻す）。終わりが
+   もう始まっていれば false（hook は呼ばれない）。ended は終わりの途中で走り、眠ってよい。 */
+struct hal_claim_end {
+    struct hal_claim_end *next;
+    void (*ended)(struct hal_claim_end *e, struct hal_claim *c);
+};
+struct shared_claim;
+struct hal_claim *hal_claim_of(struct handle *h);
+struct hal_claim *hal_claim_hold(struct handle *h);
+void hal_claim_drop(struct hal_claim *c);
+struct shared_claim *hal_claim_shared(struct hal_claim *c);
+bool hal_claim_revoked(const struct hal_claim *c);
+bool hal_claim_dma_reusable(const struct hal_claim *c);
+unsigned hal_claim_dma_bits(const struct hal_claim *c);
+bool hal_claim_dma_map(struct hal_claim *c, const uint64_t *frames, uint64_t base, size_t count);
+bool hal_claim_dma_unmap(struct hal_claim *c, const uint64_t *frames, uint64_t base, size_t count);
+int64_t hal_claim_memory(struct hal_claim *c, uint32_t slot, uint64_t *address, uint64_t *size, bool *prefetchable);
+struct hal_device *hal_claim_device(const struct hal_claim *c);
+void *hal_claim_bus(const struct hal_claim *c);
+bool hal_claim_on_end(struct hal_claim *c, struct hal_claim_end *e);
+
+/* hal_bind_process は d->bind を持つ者が呼び、装置を実装の無い状態からプロセスの持ち物にする。動いている実装があれば
+   -N_ERR_BUSY。持ち物の間、記録は hold されている。hal_unbind_process は実装の無い状態へ戻し、その hold を放す：
+   呼んだ後、呼ぶ側は記録に触らない。hal_remove は持ち物を hal_claim_end_device で終わらせる。 */
 int hal_bind_process(struct hal_device *d, struct hal_claim *claim, const char *program);
 void hal_unbind_process(struct hal_device *d);
-void hal_claim_revoke(struct hal_claim *claim);
-/* そのプロセスの実装が眠りの知らせを受ける（n_hal_power_wait を呼んだ）。 */
+void hal_claim_end_device(struct hal_device *d);
+
+/* 眠り。n_hal_power_wait を一度でも呼んだ claim は眠りの知らせを受ける（hal_claim_sleeps）。呼ばない claim を
+   持つ装置は眠りを断る（HAL_REFUSAL_PROCESS）。hal_claims_suspend は眠る claim へ N_HAL_POWER_SUSPEND を渡し、
+   n_hal_power_done の答えを期限つきで待つ（thread が動いている間）。答えない、断る claim があればそのプログラムの
+   名を返し、眠りは取りやめになる。取りやめでも、眠った後でも、全部の thread が動いた後に hal_claims_resume を
+   呼ぶ：知らせを渡した claim へ N_HAL_POWER_RESUME を渡す。 */
 bool hal_claim_sleeps(const struct hal_claim *claim);
-/* 全部のプロセスの実装へ「眠る」を知らせ、答えを期限つきで待つ（スレッドが動いている間）。答えない実装があれば
-   その名を返し、眠りは取りやめる。hal_claims_resume は全部のスレッドが動いた後に「戻った」を知らせる。 */
 const char *hal_claims_suspend(void);
 void hal_claims_resume(void);
-/* 番号で引く。眠らない。指す物の寿命は呼ぶ者が hal_remove との間で守る（hal/claim.c の順）。 */
+/* 番号で引き、見つかれば記録を hold する。去っている装置は見つからない。眠らない。hal_put で放す。 */
 struct hal_device *hal_find(uint32_t id);
+void hal_put(struct hal_device *d);

@@ -3,7 +3,12 @@
    SynIC message slot of SINT2 and are handled in CPU 0's interrupt handler; channel interrupts
    arrive as bits (one per channel relid) in SINT2's event flags. Only protocol versions from
    Windows 8 on are supported, so the event flags page is all we need for host-to-guest signalling.
-   The drivers call in from tasks on any CPU. */
+   The drivers call in from tasks on any CPU.
+
+   Each device's channel is a node of the device tree. An offer and a rescind arrive in the
+   interrupt handler, which may not publish or remove a node (both sleep): they queue the channel
+   for the node thread, which publishes it and, once the host rescinds it, removes it again
+   (hal_remove waits for the driver's detach). A channel is freed only after that. */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/spin.h"
@@ -12,6 +17,7 @@
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "sys/clock.h"
+#include "sys/thread.h"
 #include "sys/wait.h"
 
 enum {
@@ -124,6 +130,12 @@ static bool offers_done, connected; /* atomic: set once, read anywhere */
 static bool (*socket_hook)(struct vmbus_channel *ch);
 int vmbus_version_major, vmbus_version_minor;
 
+/* A channel's node (vmbus_channel.node), under chan_lock. The queue and its wait queue are the
+   node thread's: the handler puts a channel on it and wakes it. */
+enum { NODE_NONE, NODE_OFFERED, NODE_PUBLISHING, NODE_LIVE, NODE_REMOVING };
+static struct vmbus_channel *node_first, **node_last = &node_first;
+static struct wait_queue node_wq;
+
 /* One request at a time (request_mutex, held from arming the waiter to taking its reply); the
    handler fills in the reply. waiter's fields under waiter_lock. */
 static struct mutex request_mutex;
@@ -183,6 +195,16 @@ static const char *guid_name(const struct guid *g) {
 
 /* ---- control messages (CPU 0's interrupt handler) ---- */
 
+/* chan_lock held: the node thread looks at the channel. */
+static void node_enqueue(struct vmbus_channel *ch) {
+    if (ch->node_queued) return;
+    ch->node_queued = true;
+    ch->node_next = NULL;
+    *node_last = ch;
+    node_last = &ch->node_next;
+    wq_wake_all(&node_wq);
+}
+
 static void on_offer(const struct msg_offer *o) {
     if (o->relid >= MAX_RELID) return;
     struct vmbus_channel *ch = kzalloc(sizeof *ch);
@@ -203,8 +225,11 @@ static void on_offer(const struct msg_offer *o) {
     channels_tail = &ch->next;
     /* claimed before anyone can release it: the hook hands it to a thread on another CPU */
     if (late && (ch->chn_flags & VMBUS_CHANNEL_SOCKET) && hook) ch->claimed = hook(ch);
+    if (!(ch->chn_flags & VMBUS_CHANNEL_SOCKET)) {
+        ch->node = NODE_OFFERED;
+        node_enqueue(ch);
+    }
     spin_give(&chan_lock);
-    if (!(ch->chn_flags & VMBUS_CHANNEL_SOCKET)) hal_add(&ch->hal, 0, N_HAL_BUS_VMBUS);
     if (late && !(ch->chn_flags & VMBUS_CHANNEL_SOCKET)) {
         char gs[37], is[37];
         guid_format(&ch->type, gs);
@@ -232,6 +257,79 @@ static void channel_free(struct vmbus_channel *ch) {
     kfree(ch);
 }
 
+/* The host rescinded the channel and nothing holds it: not a driver (claimed), not an open ring,
+   not its node. From the handler, or from a task (which first waits for the handlers). */
+static void channel_reap(struct vmbus_channel *ch, bool in_handler) {
+    uint64_t f = spin_lock(&chan_lock);
+    bool unused = !ch->claimed && !ch->opened && ch->node == NODE_NONE;
+    if (unused) channel_unlink(ch);
+    spin_unlock(&chan_lock, f);
+    if (!unused) return;
+    if (!in_handler) isr_quiet();
+    channel_free(ch);
+}
+
+/* ---- nodes (the node thread) ---- */
+
+static void node_publish(struct vmbus_channel *ch) {
+    char location[24];
+    hal_device_init(&ch->hal, N_BUS_VMBUS, NULL);
+    hal_prop_bytes(&ch->hal, N_PROP_VMBUS_TYPE, ch->type.b, sizeof ch->type.b);
+    ksnprintf(location, sizeof location, "VMBus %u", ch->relid);
+    hal_location(&ch->hal, location);
+    hal_publish(NULL, &ch->hal);
+}
+
+/* One queued channel: publish it if that is not done, remove it if the host took it away. */
+static void node_serve(struct vmbus_channel *ch) {
+    uint64_t f = spin_lock(&chan_lock);
+    if (ch->node == NODE_OFFERED) {
+        if (ch->node_rescind) {
+            ch->node = NODE_NONE; /* withdrawn before anyone saw it */
+            spin_unlock(&chan_lock, f);
+            channel_reap(ch, false);
+            return;
+        }
+        ch->node = NODE_PUBLISHING;
+        spin_unlock(&chan_lock, f);
+        node_publish(ch);
+        f = spin_lock(&chan_lock);
+        ch->node = NODE_LIVE;
+    }
+    if (ch->node != NODE_LIVE || !ch->node_rescind) {
+        spin_unlock(&chan_lock, f);
+        return;
+    }
+    ch->node = NODE_REMOVING;
+    spin_unlock(&chan_lock, f);
+    hal_remove(&ch->hal);
+    f = spin_lock(&chan_lock);
+    ch->node = NODE_NONE;
+    spin_unlock(&chan_lock, f);
+    channel_reap(ch, false);
+}
+
+static void node_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        uint64_t f = spin_lock(&chan_lock);
+        while (!node_first) {
+            wq_wait_locked(&node_wq, &chan_lock);
+            spin_take(&chan_lock);
+        }
+        struct vmbus_channel *ch = node_first;
+        node_first = ch->node_next;
+        if (!node_first) node_last = &node_first;
+        ch->node_queued = false;
+        spin_unlock(&chan_lock, f);
+        node_serve(ch);
+    }
+}
+
+struct vmbus_channel *vmbus_channel_of(struct hal_device *d) {
+    return (struct vmbus_channel *)((char *)d - __builtin_offsetof(struct vmbus_channel, hal));
+}
+
 static void handle_message(const uint8_t *p, uint32_t len) {
     uint32_t type = ((const struct msg_header *)p)->type;
     uint32_t key = 0;
@@ -243,17 +341,20 @@ static void handle_message(const uint8_t *p, uint32_t len) {
         spin_take(&chan_lock);
         struct vmbus_channel *ch = relid < MAX_RELID ? by_relid[relid] : NULL;
         vmbus_callback_t rescind = ch ? ch->on_rescind : NULL;
-        if (ch) __atomic_store_n(&ch->rescinded, true, __ATOMIC_RELEASE);
+        bool node = false;
+        if (ch) {
+            __atomic_store_n(&ch->rescinded, true, __ATOMIC_RELEASE);
+            node = ch->node != NODE_NONE;
+            if (node) { /* the node thread removes it; a channel it has not published yet it drops */
+                ch->node_rescind = true;
+                if (ch->node == NODE_LIVE) node_enqueue(ch);
+            }
+        }
         spin_give(&chan_lock);
         if (!ch) return;
-        hal_remove(&ch->hal);
         if (!(ch->chn_flags & VMBUS_CHANNEL_SOCKET)) kprintf("vmbus: channel %u rescinded\n", relid);
         if (rescind) rescind(ch); /* a release waits for this handler before it frees what it uses */
-        spin_take(&chan_lock);
-        bool unused = !ch->claimed && !ch->opened;
-        if (unused) channel_unlink(ch);
-        spin_give(&chan_lock);
-        if (unused) channel_free(ch);
+        if (!node) channel_reap(ch, true);
         return;
     }
     case CHMSG_OPEN_RESULT: key = ((const struct msg_open_result *)p)->relid; break;
@@ -381,6 +482,7 @@ static bool try_version(uint32_t version) {
 
 bool vmbus_init(void) {
     if (!hv_core_init(vmbus_isr)) return false;
+    kthread_create("vmbus", node_thread, NULL);
     /* newest first: 5.3 .. 5.0 (Windows 10 1809+), 4.1, 4.0 (Windows 10), 3.0 (8.1), 2.4 (8) */
     static const uint32_t versions[] = {0x50003, 0x50002, 0x50001, 0x50000, 0x40001, 0x40000, 0x30000, 0x20004};
     bool up = false;
@@ -410,15 +512,6 @@ bool vmbus_init(void) {
 }
 
 bool vmbus_ready(void) { return __atomic_load_n(&connected, __ATOMIC_ACQUIRE); }
-
-struct vmbus_channel *vmbus_find(const struct guid *type, int n) {
-    uint64_t f = spin_lock(&chan_lock);
-    struct vmbus_channel *found = NULL;
-    for (struct vmbus_channel *ch = channels; ch && !found; ch = ch->next)
-        if (!ch->rescinded && !memcmp(&ch->type, type, sizeof *type) && n-- == 0) found = ch;
-    spin_unlock(&chan_lock, f);
-    return found;
-}
 
 uint32_t vmbus_gpadl_create(struct vmbus_channel *ch, uint64_t pa, uint32_t pages) {
     uint8_t buf[HV_MESSAGE_PAYLOAD_BYTES];
@@ -572,7 +665,7 @@ void vmbus_release(struct vmbus_channel *ch) {
     ch->claimed = false;
     ch->callback = NULL;
     ch->on_rescind = NULL;
-    bool gone = ch->rescinded && !ch->opened;
+    bool gone = ch->rescinded && !ch->opened && ch->node == NODE_NONE;
     if (gone) channel_unlink(ch);
     spin_unlock(&chan_lock, f);
     isr_quiet(); /* a rescind under way may still be calling the driver's on_rescind */

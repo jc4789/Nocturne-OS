@@ -26,7 +26,7 @@
 /* ---- 宣言 ---- */
 enum service_scope {
     SCOPE_MACHINE,  /* 機械に一つ。 */
-    SCOPE_FUNCTION, /* 宣言の matches に合う、実装の無い PCI の機能ごとに一つ。引数は N_PCI_TARGET の 16 進数。 */
+    SCOPE_DEVICE,   /* 宣言の rules に合う、実装の無い（N_HAL_UNBOUND）台帳の装置ごとに一つ。引数は装置の id の 16 進数。 */
 };
 /* 失敗したときの扱い。結果 0 で終わるのは失敗ではない。 */
 struct failure_rule {
@@ -49,8 +49,8 @@ struct declared_service {
     const char *const *needs; /* 先に準備が済んでいなければならないサービス。NULL 終わり。 */
     struct failure_rule on_failure;
     int clients_from;         /* この級以上は接続してよい。CLIENTS_NONE は誰も。 */
-    const struct n_pci_match *matches; /* SCOPE_FUNCTION だけ */
-    size_t match_count;
+    const struct n_hal_rule *rules; /* SCOPE_DEVICE だけ */
+    size_t rule_count;
 };
 
 #define CAPS(...) .caps = (const enum n_cap[]){__VA_ARGS__}, \
@@ -60,10 +60,10 @@ struct declared_service {
 static const struct declared_service declared[] = {
     {.name = "systemlog", .program = "systemlog", .cls = N_CLASS_SYSTEM, .at_boot = true,
      .on_failure = {5, 1000, 60000}, .clients_from = CLIENTS_NONE},
-    /* ドライバーは自分の機能だけを claim し、システムの級を持たない。相手は nvrm が申し込む名前で来る。 */
-    {.name = "gpu", .program = "nvrm", .client_image = "nvk", .cls = N_CLASS_USER, .scope = SCOPE_FUNCTION, .at_boot = true, .optional = true,
-     CAPS(N_CAP_PCI_CLAIM), .on_failure = {2, 2000, 60000}, .clients_from = CLIENTS_NONE,
-     .matches = nvrm_gpu_functions, .match_count = sizeof nvrm_gpu_functions / sizeof *nvrm_gpu_functions},
+    /* ドライバーは自分の装置だけを claim し、システムの級を持たない。相手は nvrm が申し込む名前で来る。 */
+    {.name = "gpu", .program = "nvrm", .client_image = "nvk", .cls = N_CLASS_USER, .scope = SCOPE_DEVICE, .at_boot = true, .optional = true,
+     CAPS(N_CAP_HAL_CLAIM), .on_failure = {2, 2000, 60000}, .clients_from = CLIENTS_NONE,
+     .rules = nvrm_gpu_rules, .rule_count = sizeof nvrm_gpu_rules / sizeof *nvrm_gpu_rules},
     {.name = "accounts", .program = "accounts", .cls = N_CLASS_SYSTEM, .at_boot = true,
      CAPS(N_CAP_STORE_PRIVATE), .on_failure = {5, 500, 60000}, .clients_from = N_CLASS_USER},
     {.name = "settings", .program = "settingsd", .cls = N_CLASS_SYSTEM, .at_boot = true,
@@ -77,7 +77,7 @@ static const struct declared_service declared[] = {
      CAPS(N_CAP_STORE_PRIVATE), .on_failure = {3, 500, 60000}, .clients_from = N_CLASS_USER},
     /* 試験の媒体にだけあるプログラム。C:\Nocturne\System の中にあるので、アプリは置けない。 */
     {.name = "tests", .program = "testrun", .cls = N_CLASS_SYSTEM, .at_boot = true, .optional = true,
-     CAPS(N_CAP_POWER, N_CAP_PCI_CLAIM, N_CAP_SCREEN_READ, N_CAP_IDENTITY_GRANT), .needs = NAMES("accounts", "audio"),
+     CAPS(N_CAP_POWER, N_CAP_HAL_CLAIM, N_CAP_SCREEN_READ, N_CAP_IDENTITY_GRANT), .needs = NAMES("accounts", "audio"),
      .clients_from = CLIENTS_NONE},
     {.name = "session", .program = "session", .cls = N_CLASS_SYSTEM, .at_boot = true, .console = true,
      CAPS(N_CAP_IDENTITY_GRANT, N_CAP_SHELL), .needs = NAMES("accounts", "tests", "audio"),
@@ -241,28 +241,28 @@ static struct instance *instance_find(const struct declared_service *d, const ch
 /* ---- 表から実例を作る。解けない項目は壊れた実例になり、理由をログへ書く。 ---- */
 enum { VISIT_NEW, VISIT_OPEN, VISIT_DONE };
 
-static bool function_matches(const struct declared_service *d, const struct n_hal_device *f) {
-    if (f->bus != N_HAL_BUS_PCI || f->state != N_HAL_UNBOUND) return false;
-    for (size_t i = 0; i < d->match_count; i++)
-        if (n_pci_matches(&d->matches[i], &f->at.pci)) return true;
+static bool device_matches(const struct declared_service *d, const struct n_hal_device *f) {
+    if (f->state != N_HAL_UNBOUND) return false;
+    for (size_t i = 0; i < d->rule_count; i++)
+        if (n_hal_device_rule_score(f, &d->rules[i])) return true;
     return false;
 }
 
-static void instances_of(const struct declared_service *d, bool broken, const struct n_hal_device *functions, int function_count) {
+static void instances_of(const struct declared_service *d, bool broken, const struct n_hal_snapshot *ledger) {
     if (d->scope == SCOPE_MACHINE) {
         instance_new(d, NULL, broken);
         return;
     }
-    for (int i = 0; i < function_count; i++) {
-        if (!function_matches(d, &functions[i])) continue;
+    const struct n_hal_device *f = ledger->first;
+    for (uint32_t i = 0; i < ledger->count; i++, f = n_hal_device_next(f)) {
+        if (!device_matches(d, f)) continue;
         char argument[9];
-        const struct n_pciinfo *f = &functions[i].at.pci;
-        snprintf(argument, sizeof argument, "%08x", (unsigned)N_PCI_TARGET(f->segment, f->bus, f->dev, f->func));
+        snprintf(argument, sizeof argument, "%x", (unsigned)f->id);
         instance_new(d, argument, broken);
     }
 }
 
-static bool visit(const struct declared_service *d, unsigned char *marks, const struct n_hal_device *functions, int function_count) {
+static bool visit(const struct declared_service *d, unsigned char *marks, const struct n_hal_snapshot *ledger) {
     size_t i = (size_t)(d - declared);
     if (marks[i] == VISIT_DONE) return true;
     if (marks[i] == VISIT_OPEN) {
@@ -276,22 +276,21 @@ static bool visit(const struct declared_service *d, unsigned char *marks, const 
         if (!other) {
             printf("services: %s needs %s, which is not declared\n", d->name, *need);
             solved = false;
-        } else if (!visit(other, marks, functions, function_count)) {
+        } else if (!visit(other, marks, ledger)) {
             solved = false;
         }
     }
     marks[i] = VISIT_DONE;
-    instances_of(d, !solved, functions, function_count);
+    instances_of(d, !solved, ledger);
     return solved;
 }
 
 static void instances_from_table(void) {
     unsigned char marks[DECLARED] = {VISIT_NEW};
-    struct n_hal_device *functions;
-    n_result function_count = n_hal_snapshot(&functions);
-    if (function_count < 0) function_count = 0;
-    for (size_t i = 0; i < DECLARED; i++) visit(&declared[i], marks, functions, function_count);
-    free(functions);
+    struct n_hal_snapshot ledger = {0};
+    if (n_hal_snapshot(&ledger) < 0) ledger = (struct n_hal_snapshot){0};
+    for (size_t i = 0; i < DECLARED; i++) visit(&declared[i], marks, &ledger);
+    free((void *)ledger.first);
 }
 
 /* ---- 起こす ---- */

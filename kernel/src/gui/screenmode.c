@@ -3,7 +3,7 @@
  * engine can show and offers it here. Which of it a screen shows is the display service's to say
  * (user/apps/display.c, N_CAP_DISPLAY): the kernel chooses none and keeps no one's choice. Until a mode
  * is asked for the screen shows what it shows, at boot the firmware's framebuffer. The driver shows each
- * wish at its size and gives the screen buffers of that size (n_pci_give_screen; the desktop follows
+ * wish at its size and gives the screen buffers of that size (n_screen_give; the desktop follows
  * it), and says what it showed: a wish it could not show is reported as refused, and the service
  * decides what comes next.
  *
@@ -28,7 +28,7 @@
 
 struct choice {
     struct n_screen_modes offered;  /* count 0: no driver offers modes */
-    /* The driver that offered modes last (dev/pciuser.c): none yet, still running (whether or not
+    /* The driver that offered modes last (dev/screen_driver.c): none yet, still running (whether or not
        its modes are still offered), or ended (screen_modes_gone). */
     enum { DRIVER_NONE, DRIVER_RUNNING, DRIVER_ENDED } driver;
     uint64_t offer_serial;          /* moves with each offer that waits for a wish */

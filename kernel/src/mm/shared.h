@@ -10,7 +10,7 @@
 struct handle;
 struct object;
 struct process;
-struct pci_claim;
+struct hal_claim;
 struct n_pager_fault;
 struct n_pager_supply;
 
@@ -38,11 +38,12 @@ int64_t shared_revoke(struct handle *h);
 /* bytes of h's object (its whole size, rounded up; not 0) into the calling app's reservation
    region, N_MEMORY_READ or N_MEMORY_READ_WRITE: the address. */
 int64_t shared_map(struct handle *h, size_t bytes, int access);
-/* A claimed function's memory BAR: device memory, uncached unless a view says otherwise. */
-int64_t shared_bar(struct handle *pci, uint32_t bar, struct handle **out);
-/* Zeroed RAM a claimed function may reach by DMA, within the device's and the IOMMU's address
-   width. A contiguous run is allocated whole. */
-int64_t shared_dma_create(struct handle *pci, size_t bytes, uint32_t flags, struct handle **out);
+/* A claimed device's memory resource slot (hal_claim_memory): device memory, uncached unless a view
+   says otherwise, write-combining only where the resource allows it. */
+int64_t shared_hal_memory(struct handle *claim, uint32_t slot, struct handle **out);
+/* Zeroed RAM a claimed device may reach by DMA, within the device's and its bus's address width
+   (-N_ERR_UNSUPPORTED for a bus without DMA). A contiguous run is allocated whole. */
+int64_t shared_dma_create(struct handle *claim, size_t bytes, uint32_t flags, struct handle **out);
 /* How many pages of a DMA object or device range from page first may be asked of
    shared_dma_frames (count at most), or an error. */
 int64_t shared_dma_pages(struct handle *h, size_t first, size_t count);
@@ -61,7 +62,7 @@ int64_t shared_kernel_handle(struct object *o);
    (object_unref). */
 struct object *shared_kernel_contig(size_t pages, unsigned bits, uint64_t *base);
 
-/* A display driver's surface the screen is drawn into (n_pci_give_screen, dev/pciuser.c): bytes
+/* A display driver's surface the screen is drawn into (n_screen_give, dev/screen_driver.c): bytes
    from offset of a writable shared object made through claim, a BAR's (which the system writes
    write-combined, or uncached without PAT) or a DMA object's (in its one type, which must not be
    write-back), views of them included. Open pins that type over the pages, as a mapping does, and
@@ -73,22 +74,22 @@ struct shared_scanout {
     size_t pages, first_byte;
     uint64_t type;
 };
-int64_t shared_scanout_open(struct handle *surface, const struct pci_claim *claim, uint64_t offset, uint64_t bytes,
+int64_t shared_scanout_open(struct handle *surface, const struct hal_claim *claim, uint64_t offset, uint64_t bytes,
                             struct shared_scanout *out);
 void shared_scanout_close(struct shared_scanout *s);
 
-/* What a PCI claim keeps for the device memory made through it (in struct pci_claim, reached by
-   pci_user_shared): its BAR objects, which its end withdraws. Zeroed memory is an empty one. */
+/* What a claim keeps for the device memory made through it (in struct hal_claim, reached by
+   hal_claim_shared): its memory objects, which its end withdraws. Zeroed memory is an empty one. */
 struct shared_link;
 struct shared_claim {
     struct mutex lock;
     struct shared_link *ranges, *ended;
 };
-/* A PCI claim's last handle closed (dev/pciuser.c, which marked it released first): every process
+/* A claim ended (hal/claim.c, which marked it released first): every process
    loses the device pages of its BAR objects' mappings, shot down before this returns, and a
    mapping still being made fails. The address ranges stay reserved; a touch there reads all-ones,
    as a function gone from the bus does, and writes go nowhere. */
-void shared_revoke_claim(struct pci_claim *c);
+void shared_revoke_claim(struct hal_claim *c);
 
 /* ---- touches ---- */
 

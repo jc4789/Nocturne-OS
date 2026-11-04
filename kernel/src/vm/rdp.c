@@ -19,7 +19,7 @@
    sound's sends the sound at the client's pace (snd_thread). Every time is on the clock
    (sys/clock.h). */
 #include "kernel.h"
-#include "vm/devices.h"
+#include "vm/rdp.h"
 #include "dev/audio.h"
 #include "dev/input.h"
 #include "gui/wm.h"

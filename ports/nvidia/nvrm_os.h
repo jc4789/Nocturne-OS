@@ -31,8 +31,8 @@
  * ---------------------------------------------------------------------------------------- */
 
 struct nvrm_device {
-    n_handle pci;                    /* N_KIND_PCI right; never duplicated */
-    struct n_pci_function info;      /* as n_pci_info returned it */
+    n_handle claim;                  /* N_KIND_HAL_CLAIM handle; never duplicated */
+    struct n_hal_pci_info info;      /* as N_PCI_CALL_INFO returned it */
     nv_state_t nv;                   /* what RM sees */
     nvidia_stack_t *sp;              /* RM's (dummy) altstack; no __use_altstack__ here */
     bool adapter_ready;              /* rm_init_adapter succeeded */
@@ -171,7 +171,7 @@ n_handle nvrm_bar_view(uint64_t phys, uint64_t bytes, uint32_t nv_caching, uint3
  * ---------------------------------------------------------------------------------------- */
 
 /* os_pci.c */
-NV_STATUS nvrm_pci_attach(void);     /* n_pci_info + nv_state_t fields + BAR0 mapping */
+NV_STATUS nvrm_pci_attach(void);     /* n_hal_pci_info + nv_state_t fields + BAR0 mapping */
 void nvrm_pci_detach(void);
 /* Bus mastering on before RM starts the adapter; off only once RM has stopped it again
    (rm_shutdown_adapter, or a failed start, which shuts down on its own). The system takes a
@@ -179,7 +179,7 @@ void nvrm_pci_detach(void);
    crashed driver, and keeps the DMA memory it was given out of use. */
 bool nvrm_pci_bus_master(bool on);
 uint32_t nvrm_interrupt_count(void); /* vectors enabled (0 before nvrm_irq_enable) */
-int nvrm_irq_enable(void);           /* n_pci_interrupts; returns the number of vectors */
+int nvrm_irq_enable(void);           /* n_hal_interrupts; returns the number of vectors */
 /* nv-procfs's GPU "information" and "power" pages as log lines; called once the GPU started. */
 void nvrm_log_gpu_information(void);
 

@@ -1,20 +1,5 @@
-/* ATA PIO disk driver (vm/ata.c). Sectors are 512 bytes. */
+/* ATA PIO disk driver (vm/ata.c): the driver of the fixed node "ide-ports". */
 #pragma once
-#include <stdint.h>
-#include <stdbool.h>
-#include "dev/blk.h"
+#include "hal/hal.h"
 
-struct ata_disk {
-    struct blkdev blk;
-    int index;
-    uint16_t io, ctl;
-    bool slave, lba48;
-    uint64_t sectors;
-    char model[41];
-};
-
-int ata_count(void);
-struct ata_disk *ata_get(int i);
-int ata_read(struct ata_disk *d, uint64_t lba, uint32_t count, void *buf);
-int ata_write(struct ata_disk *d, uint64_t lba, uint32_t count, const void *buf);
-int ata_flush(struct ata_disk *d);
+extern const struct hal_driver ata_driver;

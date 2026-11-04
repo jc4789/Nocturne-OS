@@ -29,7 +29,7 @@
 #include "dev/audio.h"
 #include "dev/entropy.h"
 #include "dev/pci.h"
-#include "dev/pciuser.h"
+#include "hal/hal.h"
 #include "arch/pat.h"
 #include "gui/wm.h"
 #include "gui/screenmode.h"
@@ -227,119 +227,180 @@ static int64_t new_handle(int64_t r,struct handle *h) {
     return r<0?r:handle_install(h);
 }
 
-/* An output's buffers a screen is drawn into, or given back (dev/pciuser.c). */
-static int64_t sys_pci_give_screen(int h,uint32_t output,const struct n_screen_buffers *ub) {
-    struct n_screen_buffers b;
-    if(ub && copy_from_user(&b,ub,sizeof b))return -N_ERR_BAD_ADDRESS;
-    struct handle *pci=handle_get(h);
-    if(!pci)return -N_ERR_NO_HANDLE;
-    int64_t r=pci_user_give_screen(pci,output,ub?&b:NULL);
-    handle_close(pci);
+/* ---- アプリの中の装置ドライバー（hal/claim.c、画面は dev/screen_driver.c） ----
+   どの呼出しも claim の handle を引いて、閉じるまで持つ。 */
+
+static int64_t sys_hal_claim(int cap,uint32_t device) {
+    struct handle *claim=NULL;
+    int64_t r=cap_check(cap,N_CAP_HAL_CLAIM);
+    if(r<0)return r;
+    r=hal_claim_open(device,&claim);
+    return new_handle(r,claim);
+}
+static int64_t sys_hal_resources(int h,struct n_hal_resource *uout,size_t max) {
+    struct handle *claim=handle_get(h);
+    if(!claim)return -N_ERR_NO_HANDLE;
+    int64_t r=hal_claim_resources(claim,uout,max);
+    handle_close(claim);
     return r;
 }
-/* The flips the screens ask of a display driver's outputs (dev/pciuser.c), copied out after. */
+static int64_t sys_hal_map(int h,uint32_t slot) {
+    struct handle *claim=handle_get(h),*range=NULL;
+    if(!claim)return -N_ERR_NO_HANDLE;
+    int64_t r=shared_hal_memory(claim,slot,&range);
+    handle_close(claim);
+    return new_handle(r,range);
+}
+static int64_t sys_hal_interrupts(int h,uint32_t count) {
+    struct handle *claim=handle_get(h);
+    if(!claim)return -N_ERR_NO_HANDLE;
+    int64_t r=hal_claim_interrupts(claim,count);
+    handle_close(claim);
+    return r;
+}
+static int64_t sys_hal_interrupt_take(int h,uint64_t deadline,uint64_t *ubits,uint32_t words) {
+    struct handle *claim=handle_get(h);
+    if(!claim)return -N_ERR_NO_HANDLE;
+    int64_t r=hal_claim_interrupt_take(claim,deadline,ubits,words);
+    handle_close(claim);
+    return r;
+}
+/* A bus's own operation of a claimed device (hal_buses.h): its input and its output go through kernel copies
+   of at most HAL_CALL_IN_MAX and HAL_CALL_OUT_MAX bytes. */
+#define HAL_CALL_IN_MAX (128u*1024)
+#define HAL_CALL_OUT_MAX (1024u*1024)
+static int64_t sys_hal_bus_call(int h,const struct n_hal_call *ucall) {
+    struct n_hal_call call;
+    if(copy_from_user(&call,ucall,sizeof call))return -N_ERR_BAD_ADDRESS;
+    if(call.in_size>HAL_CALL_IN_MAX)return -N_ERR_INVALID;
+    size_t room=(size_t)MIN(call.out_size,(uint64_t)HAL_CALL_OUT_MAX);
+    if(room && !user_ok_w(call.out,room))return -N_ERR_BAD_ADDRESS;
+    struct handle *claim=handle_get(h);
+    if(!claim)return -N_ERR_NO_HANDLE;
+    void *in=call.in_size?kmalloc(call.in_size):NULL,*out=room?kzalloc(room):NULL;
+    int64_t r=(call.in_size && !in) || (room && !out)?-N_ERR_NO_MEMORY:0;
+    if(!r && call.in_size && copy_from_user(in,call.in,call.in_size))r=-N_ERR_BAD_ADDRESS;
+    size_t used=0;
+    if(!r)r=hal_claim_bus_call(claim,call.op,in,call.in_size,out,room,&used);
+    if(r>=0 && used && copy_to_user(call.out,out,used))r=-N_ERR_BAD_ADDRESS;
+    kfree(in);kfree(out);handle_close(claim);
+    return r;
+}
+static int64_t sys_hal_offer(int h,uint32_t kind,uint32_t instance,const char *ulabel) {
+    char label[sizeof((struct n_hal_offer *)0)->label];
+    int n=user_str(label,ulabel,sizeof label);
+    if(n<0)return n;
+    struct handle *claim=handle_get(h);
+    if(!claim)return -N_ERR_NO_HANDLE;
+    int64_t r=hal_claim_offer(claim,kind,instance,label);
+    handle_close(claim);
+    return r;
+}
+static int64_t sys_hal_offer_withdraw(int h,uint32_t kind,uint32_t instance) {
+    struct handle *claim=handle_get(h);
+    if(!claim)return -N_ERR_NO_HANDLE;
+    int64_t r=hal_claim_offer_withdraw(claim,kind,instance);
+    handle_close(claim);
+    return r;
+}
+static int64_t sys_hal_power_wait(int h,uint64_t deadline) {
+    struct handle *claim=handle_get(h);
+    if(!claim)return -N_ERR_NO_HANDLE;
+    int64_t r=hal_claim_power_wait(claim,deadline);
+    handle_close(claim);
+    return r;
+}
+static int64_t sys_hal_power_done(int h,bool ok) {
+    struct handle *claim=handle_get(h);
+    if(!claim)return -N_ERR_NO_HANDLE;
+    int64_t r=hal_claim_power_done(claim,ok);
+    handle_close(claim);
+    return r;
+}
+
+/* An output's buffers a screen is drawn into, or given back. */
+static int64_t sys_screen_give(int h,uint32_t output,const struct n_screen_buffers *ub) {
+    struct n_screen_buffers b;
+    if(ub && copy_from_user(&b,ub,sizeof b))return -N_ERR_BAD_ADDRESS;
+    struct handle *claim=handle_get(h);
+    if(!claim)return -N_ERR_NO_HANDLE;
+    int64_t r=screen_driver_give(claim,output,ub?&b:NULL);
+    handle_close(claim);
+    return r;
+}
+/* The flips the screens ask of a display driver's outputs, copied out after. */
 #define SCREEN_FLIPS_MAX 64u
-static int64_t sys_pci_screen_flips(int h,struct n_screen_flip *uout,size_t max,uint64_t deadline) {
+static int64_t sys_screen_flips(int h,struct n_screen_flip *uout,size_t max,uint64_t deadline) {
     if(!max)return -N_ERR_INVALID;
     max=MIN(max,(size_t)SCREEN_FLIPS_MAX);
     if(!user_ok_w(uout,max*sizeof *uout))return -N_ERR_BAD_ADDRESS;
     struct n_screen_flip flips[SCREEN_FLIPS_MAX];
-    struct handle *pci=handle_get(h);
-    if(!pci)return -N_ERR_NO_HANDLE;
-    int64_t r=pci_user_screen_flips(pci,flips,max,deadline);
-    handle_close(pci);
+    struct handle *claim=handle_get(h);
+    if(!claim)return -N_ERR_NO_HANDLE;
+    int64_t r=screen_driver_flips(claim,flips,max,deadline);
+    handle_close(claim);
     if(r>0 && copy_to_user(uout,flips,(size_t)r*sizeof *flips))r=-N_ERR_BAD_ADDRESS;
     return r;
 }
-/* A vertical blank of a display driver's output (dev/pciuser.c). */
-static int64_t sys_pci_screen_vblank(int h,const struct n_screen_vblank *uv) {
+/* A vertical blank of a display driver's output. */
+static int64_t sys_screen_vblank(int h,const struct n_screen_vblank *uv) {
     struct n_screen_vblank v;
     if(copy_from_user(&v,uv,sizeof v))return -N_ERR_BAD_ADDRESS;
-    struct handle *pci=handle_get(h);
-    if(!pci)return -N_ERR_NO_HANDLE;
-    int64_t r=pci_user_screen_vblank(pci,&v);
-    handle_close(pci);
+    struct handle *claim=handle_get(h);
+    if(!claim)return -N_ERR_NO_HANDLE;
+    int64_t r=screen_driver_vblank(claim,&v);
+    handle_close(claim);
     return r;
 }
 /* A surface a display driver may show in an output's buffers' place, for the panic screen. */
-static int64_t sys_pci_screen_image(int h,uint32_t output,int surface,const struct n_scanout *udesc) {
+static int64_t sys_screen_image(int h,uint32_t output,int surface,const struct n_scanout *udesc) {
     struct n_scanout desc;
     if(copy_from_user(&desc,udesc,sizeof desc))return -N_ERR_BAD_ADDRESS;
-    struct handle *pci=handle_get(h);
-    if(!pci)return -N_ERR_NO_HANDLE;
+    struct handle *claim=handle_get(h);
+    if(!claim)return -N_ERR_NO_HANDLE;
     struct handle *s=handle_get(surface);
-    int64_t r=s?pci_user_screen_image(pci,output,s,&desc):-N_ERR_NO_HANDLE;
-    handle_close(s);handle_close(pci);
+    int64_t r=s?screen_driver_image(claim,output,s,&desc):-N_ERR_NO_HANDLE;
+    handle_close(s);handle_close(claim);
     return r;
 }
-/* What an output's screen should show (dev/pciuser.c, gui/wm.c). The state is copied out even
-   when the time ran out. */
-static int64_t sys_pci_screen_state(int h,uint32_t output,uint64_t seen,struct n_screen_state *uout,uint64_t deadline) {
+static int64_t sys_screen_image_end(int h,int64_t number) {
+    struct handle *claim=handle_get(h);
+    if(!claim)return -N_ERR_NO_HANDLE;
+    int64_t r=screen_driver_image_end(claim,number);
+    handle_close(claim);
+    return r;
+}
+/* What an output's screen should show (gui/wm.c). The state is copied out even when the time ran out. */
+static int64_t sys_screen_state(int h,uint32_t output,uint64_t seen,struct n_screen_state *uout,uint64_t deadline) {
     if(!user_ok_w(uout,sizeof *uout))return -N_ERR_BAD_ADDRESS;
-    struct handle *pci=handle_get(h);
-    if(!pci)return -N_ERR_NO_HANDLE;
+    struct handle *claim=handle_get(h);
+    if(!claim)return -N_ERR_NO_HANDLE;
     struct n_screen_state *st=kmalloc(sizeof *st);
-    int64_t r=st?pci_user_screen_state(pci,output,seen,st,deadline):-N_ERR_NO_MEMORY;
-    handle_close(pci);
+    int64_t r=st?screen_driver_state(claim,output,seen,st,deadline):-N_ERR_NO_MEMORY;
+    handle_close(claim);
     if((r==0||r==-N_ERR_TIMEOUT)&&copy_to_user(uout,st,sizeof *st))r=-N_ERR_BAD_ADDRESS;
     kfree(st);
     return r;
 }
-/* The monitor on a display driver's output and the modes it can show there (dev/pciuser.c,
-   gui/screenmode.c). */
-static int64_t sys_pci_screen_modes(int h,uint32_t output,const struct n_screen_modes *um) {
+/* The monitor on a display driver's output and the modes it can show there (gui/screenmode.c). */
+static int64_t sys_screen_modes(int h,uint32_t output,const struct n_screen_modes *um) {
     struct n_screen_modes *m=kmalloc(sizeof *m);
     if(!m)return -N_ERR_NO_MEMORY;
     int64_t r=copy_from_user(m,um,sizeof *m)?-N_ERR_BAD_ADDRESS:0;
-    struct handle *pci=r?NULL:handle_get(h);
-    if(!r)r=pci?pci_user_screen_modes(pci,output,m):-N_ERR_NO_HANDLE;
-    handle_close(pci);
+    struct handle *claim=r?NULL:handle_get(h);
+    if(!r)r=claim?screen_driver_modes(claim,output,m):-N_ERR_NO_HANDLE;
+    handle_close(claim);
     kfree(m);
-    return r;
-}
-/* An ACPI object of the claimed function's part of the namespace (dev/pciuser.c). The arguments'
-   data and the result go through kernel copies of at most ACPI_DATA_MAX and ACPI_OUT_MAX bytes. */
-#define ACPI_ARGS_MAX 7
-#define ACPI_DATA_MAX (64u*1024)
-#define ACPI_OUT_MAX (1024u*1024)
-static int64_t sys_pci_acpi_eval(int h,const struct n_acpi_eval *ueval,void *uout,uint64_t out_size) {
-    struct n_acpi_eval e;
-    struct n_acpi_value args[ACPI_ARGS_MAX];
-    char name[5];
-    if(copy_from_user(&e,ueval,sizeof e))return -N_ERR_BAD_ADDRESS;
-    if(e.nargs>ACPI_ARGS_MAX || e.data_size>ACPI_DATA_MAX)return -N_ERR_INVALID;
-    int n=user_str(name,e.name,sizeof name);
-    if(n==-N_ERR_BAD_ADDRESS)return n;
-    if(n!=4)return -N_ERR_INVALID;
-    if(e.nargs && copy_from_user(args,e.args,e.nargs*sizeof *args))return -N_ERR_BAD_ADDRESS;
-    size_t room=(size_t)MIN(out_size,(uint64_t)ACPI_OUT_MAX);
-    if(room && !user_ok_w(uout,room))return -N_ERR_BAD_ADDRESS;
-    struct handle *pci=handle_get(h);
-    if(!pci)return -N_ERR_NO_HANDLE;
-    uint8_t *data=e.data_size?kmalloc(e.data_size):NULL,*out=room?kmalloc(room):NULL;
-    int64_t r=(e.data_size && !data) || (room && !out)?-N_ERR_NO_MEMORY:0;
-    if(!r && e.data_size && copy_from_user(data,e.data,e.data_size))r=-N_ERR_BAD_ADDRESS;
-    if(!r)r=pci_user_acpi_eval(pci,e.node,name,args,e.nargs,data,e.data_size,out,room);
-    if(r>0 && copy_to_user(uout,out,(size_t)r))r=-N_ERR_BAD_ADDRESS;
-    kfree(data);kfree(out);handle_close(pci);
     return r;
 }
 /* ---- shared memory and the address space ----
    The calls' arguments and copies; the work is mm's (mm/shared.h, mm/space.h). */
 
-/* A claimed function's memory BAR. */
-static int64_t sys_pci_bar(int h,uint32_t bar) {
-    struct handle *pci=handle_get(h),*range=NULL;
-    if(!pci)return -N_ERR_NO_HANDLE;
-    int64_t r=shared_bar(pci,bar,&range);
-    handle_close(pci);
-    return new_handle(r,range);
-}
 static int64_t sys_dma_create(int h,size_t bytes,uint32_t flags) {
-    struct handle *pci=handle_get(h),*dma=NULL;
-    if(!pci)return -N_ERR_NO_HANDLE;
-    int64_t r=shared_dma_create(pci,bytes,flags,&dma);
-    handle_close(pci);
+    struct handle *claim=handle_get(h),*dma=NULL;
+    if(!claim)return -N_ERR_NO_HANDLE;
+    int64_t r=shared_dma_create(claim,bytes,flags,&dma);
+    handle_close(claim);
     return new_handle(r,dma);
 }
 /* Bus addresses of a DMA object's (or a device range's) pages, also through views. */
@@ -1053,43 +1114,25 @@ void syscall_dispatch(struct regs *r) {
     case SYS_SHARED_VIEW: ret = sys_shared_view((int)a,b,c,(uint32_t)d,(uint32_t)e); break;
     case SYS_SHARED_COMPOSE: ret = sys_shared_compose((const struct n_shared_range *)a,b,(uint32_t)c); break;
     case SYS_SHARED_REVOKE: ret = sys_shared_revoke((int)a); break;
-    case SYS_PCI_CLAIM: {
-        struct handle *claim = NULL;
-        ret = cap_check((int)a, N_CAP_PCI_CLAIM);
-        if (ret < 0) break;
-        ret = pci_user_claim((uint32_t)b,&claim);
-        ret = new_handle(ret,claim);
-        break;
-    }
-    case SYS_PCI_BAR: ret = sys_pci_bar((int)a,(uint32_t)b); break;
-    case SYS_PCI_GIVE_SCREEN: ret = sys_pci_give_screen((int)a,(uint32_t)b,(const struct n_screen_buffers *)c); break;
-    case SYS_PCI_SCREEN_FLIPS: ret = sys_pci_screen_flips((int)a,(struct n_screen_flip *)b,(size_t)c,d); break;
-    case SYS_PCI_SCREEN_VBLANK: ret = sys_pci_screen_vblank((int)a,(const struct n_screen_vblank *)b); break;
-    case SYS_PCI_ACPI_EVAL: ret = sys_pci_acpi_eval((int)a,(const struct n_acpi_eval *)b,(void *)c,d); break;
-    case SYS_PCI_SCREEN_STATE: ret = sys_pci_screen_state((int)a,(uint32_t)b,c,(struct n_screen_state *)d,e); break;
-    case SYS_PCI_SCREEN_IMAGE: ret = sys_pci_screen_image((int)a,(uint32_t)b,(int)c,(const struct n_scanout *)d); break;
-    case SYS_PCI_SCREEN_MODES: ret = sys_pci_screen_modes((int)a,(uint32_t)b,(const struct n_screen_modes *)c); break;
+    case SYS_HAL_CLAIM: ret = sys_hal_claim((int)a,(uint32_t)b); break;
+    case SYS_HAL_CLAIM_RESOURCES: ret = sys_hal_resources((int)a,(struct n_hal_resource *)b,(size_t)c); break;
+    case SYS_HAL_MAP: ret = sys_hal_map((int)a,(uint32_t)b); break;
+    case SYS_HAL_INTERRUPTS: ret = sys_hal_interrupts((int)a,(uint32_t)b); break;
+    case SYS_HAL_INTERRUPT_TAKE: ret = sys_hal_interrupt_take((int)a,b,(uint64_t *)c,(uint32_t)d); break;
+    case SYS_HAL_BUS_CALL: ret = sys_hal_bus_call((int)a,(const struct n_hal_call *)b); break;
+    case SYS_HAL_OFFER: ret = sys_hal_offer((int)a,(uint32_t)b,(uint32_t)c,(const char *)d); break;
+    case SYS_HAL_OFFER_WITHDRAW: ret = sys_hal_offer_withdraw((int)a,(uint32_t)b,(uint32_t)c); break;
+    case SYS_HAL_POWER_WAIT: ret = sys_hal_power_wait((int)a,b); break;
+    case SYS_HAL_POWER_DONE: ret = sys_hal_power_done((int)a,b != 0); break;
+    case SYS_SCREEN_GIVE: ret = sys_screen_give((int)a,(uint32_t)b,(const struct n_screen_buffers *)c); break;
+    case SYS_SCREEN_FLIPS: ret = sys_screen_flips((int)a,(struct n_screen_flip *)b,(size_t)c,d); break;
+    case SYS_SCREEN_VBLANK: ret = sys_screen_vblank((int)a,(const struct n_screen_vblank *)b); break;
+    case SYS_SCREEN_STATE: ret = sys_screen_state((int)a,(uint32_t)b,c,(struct n_screen_state *)d,e); break;
+    case SYS_SCREEN_IMAGE: ret = sys_screen_image((int)a,(uint32_t)b,(int)c,(const struct n_scanout *)d); break;
+    case SYS_SCREEN_IMAGE_END: ret = sys_screen_image_end((int)a,(int64_t)b); break;
+    case SYS_SCREEN_MODES: ret = sys_screen_modes((int)a,(uint32_t)b,(const struct n_screen_modes *)c); break;
     case SYS_DMA_CREATE: ret = sys_dma_create((int)a,b,(uint32_t)c); break;
     case SYS_DMA_ADDRESSES: ret = sys_dma_addresses((int)a,b,(uint64_t *)c,d); break;
-    case SYS_PCI_INFO: case SYS_PCI_CONFIG_READ: case SYS_PCI_CONFIG_WRITE:
-    case SYS_PCI_INTERRUPTS: case SYS_PCI_INTERRUPT_TAKE: case SYS_PCI_HOLD_SCREEN:
-    case SYS_PCI_ACPI_NOTIFY_TAKE: case SYS_PCI_SCREEN_IMAGE_END: {
-        struct handle *f = handle_get((int)a);
-        if (!f) { ret = -N_ERR_NO_HANDLE; break; }
-        if (r->rax == SYS_PCI_INFO) {
-            struct n_pci_function info;
-            ret = pci_user_info(f, &info);
-            if (!ret) ret = copy_to_user((void *)b, &info, sizeof info);
-        } else if (r->rax == SYS_PCI_CONFIG_READ) ret = pci_user_config_read(f,b,(uint32_t)c,(uint32_t)d);
-        else if (r->rax == SYS_PCI_CONFIG_WRITE) ret = pci_user_config_write(f,(uint32_t)b,(uint32_t)c,(uint32_t)d);
-        else if (r->rax == SYS_PCI_INTERRUPTS) ret = pci_user_interrupts(f,(uint32_t)b);
-        else if (r->rax == SYS_PCI_HOLD_SCREEN) ret = pci_user_hold_screen(f, b != 0);
-        else if (r->rax == SYS_PCI_ACPI_NOTIFY_TAKE) ret = pci_user_acpi_notify_take(f, b);
-        else if (r->rax == SYS_PCI_SCREEN_IMAGE_END) ret = pci_user_screen_image_end(f, (int64_t)b);
-        else ret = pci_user_interrupt_take(f, b, (uint64_t *)c, (uint32_t)d);
-        handle_close(f);
-        break;
-    }
     case SYS_MEMORY_RESERVE: ret = memory_reserve(a, (int)b); break;
     case SYS_MEMORY_RELEASE: ret = memory_release(a, b); break;
     case SYS_MEMORY_PROTECT: ret = memory_protect(a, b, (int)c); break;
@@ -1302,7 +1345,7 @@ void syscall_dispatch(struct regs *r) {
         break;
     }
     case SYS_SYSTEM_LOG: ret = identity_at_least(N_CLASS_ADMIN) ? sys_system_log((char *)a, b) : -N_ERR_DENIED; break;
-    case SYS_HAL_LIST: ret = hal_syscall_list((struct n_hal_device *)a, b); break;
+    case SYS_HAL_LIST: ret = hal_syscall_list((void *)a, b); break;
     case SYS_HAL_WATCH: ret = hal_syscall_watch(); break;
     case SYS_HANDLE_CLOSE: ret = sys_handle_close((int)a); break;
     case SYS_HANDLE_KIND: ret = sys_handle_kind((int)a); break;

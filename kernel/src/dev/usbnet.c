@@ -4,6 +4,7 @@
  * is unplugged. */
 #include "kernel.h"
 #include "dev/usb.h"
+#include "hal/hal.h"
 #include "mm/heap.h"
 #include "net/net.h"
 #include "sys/wait.h"
@@ -26,9 +27,7 @@
 
 struct usbnet {
     struct netif nif; /* first: self is the adapter */
-    struct mutex lock; /* a mutex, as usb_send is a call that may take the host controller's locks */
-    struct usbnet *gone_next;
-    struct usb_device *dev; /* NULL once unplugged */
+    struct usb_device *dev;
     bool ncm, link;
     uint8_t comm, data, alt; /* interface numbers and the data interface's working setting */
     uint8_t in, out;
@@ -37,17 +36,13 @@ struct usbnet {
     uint32_t ntb_in, ntb_out;
     uint16_t out_divisor, out_remainder, out_align, seq;
     unsigned header; /* NTH16, padding, NDP16 and padding before the datagram */
+    uint8_t *bounce; /* NCM: a frame of two parts made one run (transmit's: one call at a time) */
 };
 
-/* Sends come from the stack on any CPU (under its lock, one at a time), arrival and removal from
-   the controllers' workers: an adapter's lock guards its dev, so a removed device is never sent
-   to. Order: the stack's net_lock, then an adapter's lock, then the host controller's locks;
-   net_register and net_unregister are called without an adapter's lock. Frames arrive and sends
-   finish in the drains (rx, notify, tx_done: dev/usb.h), which only queue and wake (net_rx). An
-   adapter's memory goes when the next one arrives: a drain of its controller may still hold it
-   while the slot is released. */
-static struct mutex gone_lock;
-static struct usbnet *gone;
+/* The stack calls transmit one call at a time, from any CPU; arrival and removal come from the
+   controllers' workers. Frames arrive and sends finish in the drains (rx, notify, tx_done: dev/usb.h),
+   which only queue and wake (net_rx). usb_remove ends the drains' calls before detach: a sender after
+   that finds usb_send failing, and net_unregister ends the stack's calls before the adapter's memory goes. */
 
 static uint16_t get16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint32_t get32(const uint8_t *p) { return get16(p) | (uint32_t)get16(p + 2) << 16; }
@@ -60,18 +55,23 @@ static void put32(uint8_t *p, uint32_t v) {
     put16(p + 2, (uint16_t)(v >> 16));
 }
 
-static bool usbnet_claims(const struct usb_interface_desc *intf) {
-    return intf->cls == 2 && (intf->subcls == CDC_ECM || intf->subcls == CDC_NCM) && intf->alternate == 0;
-}
-
 /* ---- data path ---- */
 
-/* n's lock held, n->dev there. */
-static int usbnet_queue(struct usbnet *n, const void *frame, size_t len) {
+/* One frame into a send slot: 0, -N_ERR_NOT_READY with every slot busy, else the reason it cannot go. */
+static int usbnet_queue(struct usbnet *n, const struct net_tx_frame *f) {
+    if (f->length > n->max_segment) return -N_ERR_INVALID;
+    const struct net_tx_part *p = f->parts;
     int r;
     if (!n->ncm) {
-        r = usb_send(n->dev, n->out, frame, (unsigned)len, NULL, 0);
+        bool two = f->part_count > 1;
+        r = usb_send(n->dev, n->out, p[0].data, (unsigned)p[0].length, two ? p[1].data : NULL, two ? (unsigned)p[1].length : 0);
     } else {
+        const void *frame = p[0].data;
+        if (f->part_count > 1) {
+            memcpy(n->bounce, p[0].data, p[0].length);
+            memcpy(n->bounce + p[0].length, p[1].data, p[1].length);
+            frame = n->bounce;
+        }
         /* one datagram per NTB (NCM 3): NTH16, NDP16 with its null entry, the datagram */
         uint8_t h[1024]; /* ncm_setup keeps the header within this */
         memset(h, 0, n->header);
@@ -79,26 +79,36 @@ static int usbnet_queue(struct usbnet *n, const void *frame, size_t len) {
         put32(h, NTH16_SIG);
         put16(h + 4, 12);
         put16(h + 6, n->seq++);
-        put16(h + 8, (uint16_t)(n->header + len));
+        put16(h + 8, (uint16_t)(n->header + f->length));
         put16(h + 10, (uint16_t)ndp);
         put32(h + ndp, NDP16_SIG);
         put16(h + ndp + 4, 16);
         put16(h + ndp + 8, (uint16_t)n->header);
-        put16(h + ndp + 10, (uint16_t)len);
-        r = usb_send(n->dev, n->out, h, n->header, frame, (unsigned)len);
+        put16(h + ndp + 10, (uint16_t)f->length);
+        r = usb_send(n->dev, n->out, h, n->header, frame, (unsigned)f->length);
     }
     return r > 0 ? 0 : r == 0 ? -N_ERR_NOT_READY : -N_ERR_IO;
 }
 
-static int usbnet_send(struct netif *self, const void *frame, size_t len) {
+/* Frames that wait for a free slot stay with the stack until tx_done says one has come; a frame that cannot
+   ever go (too long for the device, the device gone) is taken and dropped. */
+static unsigned usbnet_transmit(struct netif *self, unsigned queue, const struct net_tx_frame *frames, unsigned count) {
     struct usbnet *n = (struct usbnet *)self;
-    mutex_lock(&n->lock);
-    int r;
-    if (!n->dev) r = -N_ERR_NETWORK_DOWN;
-    else if (len > n->max_segment) r = -N_ERR_INVALID;
-    else r = usbnet_queue(n, frame, len);
-    mutex_unlock(&n->lock);
-    return r;
+    (void)queue;
+    unsigned taken = 0;
+    while (taken < count && usbnet_queue(n, &frames[taken]) != -N_ERR_NOT_READY) taken++;
+    return taken;
+}
+
+/* Reception comes from the drain (rx) into net_rx: there is nothing for the stack to poll. */
+static size_t usbnet_poll(struct netif *self, unsigned queue, size_t budget, net_input_fn input) {
+    (void)self, (void)queue, (void)budget, (void)input;
+    return 0;
+}
+
+static bool usbnet_rx_pending(struct netif *self, unsigned queue) {
+    (void)self, (void)queue;
+    return false;
 }
 
 static void tx_done(struct usb_device *d, void *ctx, const uint8_t *data, unsigned len, uint64_t at) {
@@ -122,7 +132,7 @@ static void ncm_input(struct usbnet *n, const uint8_t *b, unsigned len) {
             unsigned at = get16(b + e), size = get16(b + e + 2);
             if (!at || !size) break; /* the first null entry ends the list (3.7) */
             if (at < header || at + size > limit || size < 14 + crc) continue;
-            if (size - crc <= n->max_segment) net_rx(&n->nif, b + at, size - crc);
+            if (size - crc <= n->max_segment) net_rx(&n->nif, b + at, size - crc, 0);
         }
         unsigned next = get16(b + ndp + 6); /* reserved in NCM 1.0, a link in Figure 3-1 */
         if (next <= ndp) return;
@@ -135,7 +145,7 @@ static void rx(struct usb_device *d, void *ctx, const uint8_t *data, unsigned le
     struct usbnet *n = ctx;
     if (!len) return; /* the zero-length packet after a frame of whole packets */
     if (n->ncm) ncm_input(n, data, len);
-    else if (len >= 14) net_rx(&n->nif, data, len); /* ECM 3.4: no CRC */
+    else if (len >= 14) net_rx(&n->nif, data, len, 0); /* ECM 3.4: no CRC */
 }
 
 static void notify(struct usb_device *d, void *ctx, const uint8_t *data, unsigned len, uint64_t at) {
@@ -205,22 +215,25 @@ static bool ncm_setup(struct usbnet *n) {
     return true;
 }
 
-static int usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
-    const struct usb_interface_desc *comm = NULL;
+/* The communications interface of an ECM or NCM function; it takes the data interface for itself. */
+static int usbnet_attach(struct hal_device *hal) {
+    struct usb_interface *node = usb_interface_of(hal);
+    struct usb_device *d = node->dev;
+    const uint8_t *cfg = d->config;
+    unsigned total = d->config_bytes;
+    const struct usb_interface_desc *comm = node->desc;
     struct usb_ep_info eps[3], e; /* notification, bulk IN, bulk OUT */
     bool have_notify = false, have_in = false, have_out = false, found_data = false;
     int data_number = -1;
     unsigned mac_index = 0, max_segment = 1514, alt = 0;
-    enum { OTHER, COMM, DATA } in = OTHER; /* whose descriptors these are */
-    for (unsigned off = 0; off + 2 <= total && cfg[off] >= 2 && off + cfg[off] <= total && !found_data;
+    enum { OTHER, COMM, DATA } in = COMM; /* whose descriptors these are */
+    for (unsigned off = node->offset + comm->length; off + 2 <= total && cfg[off] >= 2 && off + cfg[off] <= total && !found_data;
          off += cfg[off]) {
         const uint8_t *x = cfg + off;
         if (x[1] == USB_DESC_INTERFACE && x[0] >= 9) {
             const struct usb_interface_desc *i = (const void *)x;
             in = OTHER;
-            if (!comm) {
-                if (usbnet_claims(i)) comm = i, in = COMM;
-            } else if (i->number != comm->number) {
+            if (i->number != comm->number) {
                 if (data_number < 0) data_number = comm->number + 1; /* no Union: the next interface */
                 /* the data interface: alternate 0 has no endpoints, the working one a bulk pair */
                 if (i->cls == 0x0A && i->number == data_number && i->alternate) {
@@ -246,19 +259,9 @@ static int usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned tota
             }
         }
     }
-    if (!comm) return USB_NOT_MINE;
     if (!found_data || !mac_index) {
         kprintf("usbnet: slot %u CDC function incomplete (data interface, MAC string)\n", d->slot);
         return -N_ERR_UNSUPPORTED;
-    }
-    mutex_lock(&gone_lock);
-    struct usbnet *old = gone;
-    gone = NULL;
-    mutex_unlock(&gone_lock);
-    while (old) {
-        struct usbnet *next = old->gone_next;
-        kfree(old);
-        old = next;
     }
     struct usbnet *n = kzalloc(sizeof *n);
     if (!n) return -N_ERR_NO_MEMORY;
@@ -270,6 +273,7 @@ static int usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned tota
     n->in = eps[1].address;
     n->out = eps[2].address;
     n->max_segment = max_segment < 1514 ? 1514 : max_segment > 9014 ? 9014 : max_segment;
+    hal->driver_data = n;
     uint8_t mac[6];
     if (!read_mac(d, mac_index, mac)) {
         kprintf("usbnet: slot %u MAC address string unreadable\n", d->slot);
@@ -281,7 +285,7 @@ static int usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned tota
      * which alternate 0 would reset again, then the working alternate */
     if (!usb_open_endpoints(d, have_notify ? eps : eps + 1, have_notify ? 3 : 2)) goto fail;
     usb_control(d, 0x01, USB_REQ_SET_INTERFACE, 0, n->data, NULL, 0);
-    if (n->ncm && !ncm_setup(n)) goto fail;
+    if (n->ncm && (!ncm_setup(n) || !(n->bounce = kmalloc(n->max_segment)))) goto fail;
     /* directed, broadcast, all multicast (ECM 6.2.4); NCM may lack the request (6.2.1 D0) */
     usb_control(d, 0x21, SET_ETHERNET_PACKET_FILTER, 0x000E, n->comm, NULL, 0);
     if (usb_control(d, 0x01, USB_REQ_SET_INTERFACE, n->alt, n->data, NULL, 0) < 0) {
@@ -293,11 +297,9 @@ static int usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned tota
     /* an IN transfer ends at a short packet, so its buffer is whole packets */
     unsigned rx_len = n->ncm ? n->ntb_in : (n->max_segment + mps - 1) / mps * mps;
     unsigned tx_len = n->ncm ? n->header + n->max_segment : n->max_segment;
-    d->state[USB_DRIVER_NET] = n;
     if (!usb_send_open(d, n->out, tx_len, TX_SLOTS, tx_done, n) ||
         !usb_stream_start(d, n->in, rx_len, n->ncm ? 4 : 16, rx, n)) {
         kprintf("usbnet: slot %u transfers could not start\n", d->slot);
-        d->state[USB_DRIVER_NET] = NULL;
         goto fail;
     }
     if (have_notify) {
@@ -310,28 +312,42 @@ static int usbnet_attach(struct usb_device *d, const uint8_t *cfg, unsigned tota
             mac[1], mac[2], mac[3], mac[4], mac[5]);
     memcpy(n->nif.mac, mac, 6);
     n->nif.driver = n->ncm ? "usb-ncm" : "usb-ecm";
-    n->nif.send = usbnet_send;
-    net_register(&n->nif);
+    n->nif.tx_queues = n->nif.rx_queues = 1;
+    n->nif.transmit = usbnet_transmit;
+    n->nif.poll = usbnet_poll;
+    n->nif.rx_pending = usbnet_rx_pending;
+    net_register(hal, &n->nif);
     return 0;
 fail:
+    hal->driver_data = NULL;
+    kfree(n->bounce);
     kfree(n);
     return -N_ERR_IO;
 }
 
-static void usbnet_detach(struct usb_device *d) {
-    struct usbnet *n = d->state[USB_DRIVER_NET];
-    if (!n) return;
-    d->state[USB_DRIVER_NET] = NULL;
-    mutex_lock(&n->lock);
-    n->dev = NULL; /* sends fail from here on; none is inside usb_send now */
-    mutex_unlock(&n->lock);
+static void usbnet_detach(struct hal_device *hal) {
+    struct usbnet *n = hal->driver_data;
     net_unregister(&n->nif);
-    mutex_lock(&gone_lock);
-    n->gone_next = gone;
-    gone = n;
-    mutex_unlock(&gone_lock);
     kprintf("usbnet: adapter unplugged\n");
+    hal->driver_data = NULL;
+    kfree(n->bounce);
+    kfree(n);
 }
 
-const struct usb_driver usbnet_driver = {.name = "usbnet", .claims = usbnet_claims, .attach = usbnet_attach,
-                                         .detach = usbnet_detach};
+/* A sleep removes every device and enumerates them again (the controller's resume), so the adapter comes back
+   as a new one (the same MAC address is the same adapter to the system): nothing of its own to bring back. */
+static bool usbnet_resume(struct hal_device *hal) {
+    (void)hal;
+    return true;
+}
+
+static const struct n_hal_rule usbnet_rules[] = {N_USB_INTERFACE_SUBCLASS(2, CDC_ECM), N_USB_INTERFACE_SUBCLASS(2, CDC_NCM)};
+static const struct hal_driver usbnet_driver = {
+    .name = "usbnet",
+    .rules = usbnet_rules,
+    .rule_count = ARRAY_SIZE(usbnet_rules),
+    .attach = usbnet_attach,
+    .detach = usbnet_detach,
+    .resume = usbnet_resume,
+};
+HAL_DRIVER(usbnet_driver);

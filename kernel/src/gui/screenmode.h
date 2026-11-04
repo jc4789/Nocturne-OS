@@ -2,7 +2,7 @@
 #include "kernel.h"
 
 /* The monitors' modes (docs/nocturne-native-abi.md §9). For each screen (dev/fb.h) a display
-   driver offers the modes it can show on the output's monitor (n_pci_screen_modes, dev/pciuser.c,
+   driver offers the modes it can show on the output's monitor (n_screen_offer_modes, dev/screen_driver.c,
    the only caller of the offers, one call at a time). The display service reads them
    (SYS_SCREEN_INFO, display_abi.h) and asks for one (screen_modes_apply); the driver hears through the
    screen's state (wm_screen_mode, gui/wm.c). The kernel chooses nothing and keeps no choice.

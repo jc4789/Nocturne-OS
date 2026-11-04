@@ -3,7 +3,7 @@
    BAR 0 and runs rm_init_rm (RM's CPU, registry and OS objects, all before the GPU is touched),
    then RM must refuse the device and nvrm end with status 1. A crash there (status 128 + the
    CPU exception, e.g. 141 for "mov %cr4" in user mode) is what real hardware hit first.
-   It claims with the N_CAP_PCI_CLAIM capability the test disk gives it; compiled inside Nocturne with tcc. Prints
+   nvrm claims with the N_CAP_HAL_CLAIM capability the test disk gives it; compiled inside Nocturne with tcc. Prints
    "nvrmtest: N failed". */
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,33 +20,39 @@ static int failed;
         }                                                                                                              \
     } while (0)
 
-int main(void) {
-    struct n_pciinfo list[128];
-    int n = pcilist(list, 128), at = -1;
-    for (int i = 0; i < n; i++)
-        if (list[i].vendor == 0x1234 && list[i].device == 0x11e8) at = i;
-    if (at < 0) {
-        printf("nvrmtest: no edu device (run QEMU with -device edu)\nnvrmtest: 1 failed\n");
-        return 1;
+/* The ledger id of QEMU's edu device, or 0. */
+static uint32_t find_edu(void) {
+    struct n_hal_snapshot ledger = {0};
+    uint32_t id = 0;
+    if (n_hal_snapshot(&ledger) < 0) return 0;
+    const struct n_hal_device *d = ledger.first;
+    for (uint32_t i = 0; i < ledger.count; i++, d = n_hal_device_next(d)) {
+        uint64_t vendor, device;
+        if (n_hal_device_number(d, N_PROP_PCI_VENDOR, &vendor) && n_hal_device_number(d, N_PROP_PCI_DEVICE, &device) &&
+            vendor == 0x1234 && device == 0x11e8)
+            id = d->id;
     }
-    struct n_pciinfo *e = &list[at];
-    n_handle pci = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(e->segment, e->bus, e->dev, e->func));
-    CHECK(pci >= 0, "claim: %s", n_result_text(pci));
-    if (pci < 0) {
-        printf("nvrmtest: %d failed\n", failed);
-        return 1;
-    }
+    free((void *)ledger.first);
+    return id;
+}
 
-    /* the same hand-over as init: arguments "nvrm <N_PCI_TARGET>", the claim as handle 3 */
+int main(void) {
+    uint32_t edu = find_edu();
+    if (!edu) {
+        printf("nvrmtest: no edu device (run QEMU with -device edu)
+nvrmtest: 1 failed
+");
+        return 1;
+    }
+    /* nvrm takes the claim itself: the argument is the device's ledger id, the capability the fourth handle */
     char where[16];
-    snprintf(where, sizeof where, "%08x", N_PCI_TARGET(e->segment, e->bus, e->dev, e->func));
+    snprintf(where, sizeof where, "%x", (unsigned)edu);
     n_handle log = n_system_log_open();
     const char *args[2] = {"nvrm", where};
-    int32_t handles[4] = {-1, log, log, pci};
+    int32_t handles[4] = {-1, log, log, n_cap_find(N_CAP_HAL_CLAIM)};
     struct n_launch l = {.arguments = args, .handles = handles, .argument_count = 2, .handle_count = 4};
     n_handle app = n_app_launch(N_FOLDER_SYSTEM "\\nvrm", &l);
     CHECK(app >= 0, "launch " N_FOLDER_SYSTEM "\\nvrm: %s", n_result_text(app));
-    n_handle_close(pci);
     if (log >= 0) n_handle_close(log);
     if (app >= 0) {
         int status = -1;
@@ -65,7 +71,7 @@ int main(void) {
     CHECK(got >= 0 && !strstr(text, "rm_init_rm failed"), "rm_init_rm succeeded");
 
     /* the claim ends with nvrm: the device can be claimed again */
-    n_handle again = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(e->segment, e->bus, e->dev, e->func));
+    n_handle again = n_hal_claim(n_cap_find(N_CAP_HAL_CLAIM), edu);
     CHECK(again >= 0, "claim after nvrm ended: %s", n_result_text(again));
     if (again >= 0) n_handle_close(again);
 

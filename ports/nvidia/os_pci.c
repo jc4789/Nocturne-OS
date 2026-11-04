@@ -1,12 +1,12 @@
 /* NVIDIA RM on Nocturne: the PCI function, its BARs and interrupts, and system memory for the GPU.
  *
- * Everything is reached through the N_KIND_PCI right nvrm claims with its N_CAP_PCI_CLAIM (main):
- *   config space      n_pci_config_read / n_pci_config_write
- *   register BAR      n_pci_bar + n_shared_map (BAR0, mapped whole at start)
- *   other BAR ranges  n_pci_bar + n_shared_view (uncached or write-combining) + n_shared_map
+ * Everything is reached through the claim (N_KIND_HAL_CLAIM) nvrm takes with its N_CAP_HAL_CLAIM (main):
+ *   config space      n_hal_pci_config_read / n_hal_pci_config_write
+ *   register BAR      n_hal_map + n_shared_map (BAR0, mapped whole at start)
+ *   other BAR ranges  n_hal_map + n_shared_view (uncached or write-combining) + n_shared_map
  *   system memory     n_dma_create / n_dma_addresses (physical addresses; where an IOMMU
  *                     isolates the GPU, its domain maps them at the same addresses)
- *   interrupts        n_pci_interrupts / n_pci_interrupt_take
+ *   interrupts        n_hal_interrupts / n_hal_interrupt_take
  */
 #include "nvrm_os.h"
 #include "display.h"
@@ -24,7 +24,7 @@
 
 enum { PCI_COMMAND = 0x04, PCI_COMMAND_MEMORY = 1u << 1, PCI_COMMAND_MASTER = 1u << 2 };
 
-struct nvrm_device nvrm_dev = { .pci = -1 };
+struct nvrm_device nvrm_dev = { .claim = -1 };
 nv_state_t nvrm_ctl_state = { .flags = NV_FLAG_CONTROL };
 
 static nvidia_stack_t dummy_stack;
@@ -62,8 +62,8 @@ static once_flag token_once = ONCE_FLAG_INIT;
 static void token_setup(void) { mtx_init(&token_lock, mtx_plain); }
 
 static n_result pci_read(struct pci_token *t, uint32_t offset, uint32_t width) {
-    if (!t || nvrm_dev.pci < 0) return -N_ERR_NO_HANDLE;
-    return n_pci_config_read(nvrm_dev.pci, t->target, offset, width);
+    if (!t || nvrm_dev.claim < 0) return -N_ERR_NO_HANDLE;
+    return n_hal_pci_config_read(nvrm_dev.claim, t->target, offset, width);
 }
 
 static bool function_present(n_result id) { return id >= 0 && (id & 0xFFFF) != 0xFFFF && (id & 0xFFFF) != 0; }
@@ -91,10 +91,10 @@ static struct pci_token *other_token(uint32_t target, n_result *id) {
 
 void *NV_API_CALL os_pci_init_handle(NvU32 domain, NvU8 bus, NvU8 slot, NvU8 function, NvU16 *vendor,
                                      NvU16 *device) {
-    if (domain > UINT16_MAX || slot > 31 || function > 7 || nvrm_dev.pci < 0) return NULL;
+    if (domain > UINT16_MAX || slot > 31 || function > 7 || nvrm_dev.claim < 0) return NULL;
     struct pci_token *t;
     n_result id;
-    const struct n_pci_function *g = &nvrm_dev.info;
+    const struct n_hal_pci_info *g = &nvrm_dev.info;
     if (domain == g->segment && bus == g->bus && slot == g->dev && function == g->func) {
         t = &self_token;
         id = pci_read(t, 0, 4);
@@ -127,8 +127,8 @@ NV_STATUS NV_API_CALL os_pci_read_dword(void *handle, NvU32 offset, NvU32 *value
 
 static NV_STATUS pci_write(void *handle, NvU32 offset, uint32_t width, NvU32 value) {
     struct pci_token *t = handle;
-    if (!t || !t->self || nvrm_dev.pci < 0) return NV_ERR_NOT_SUPPORTED;
-    return n_pci_config_write(nvrm_dev.pci, offset, width, value) >= 0 ? NV_OK : NV_ERR_GENERIC;
+    if (!t || !t->self || nvrm_dev.claim < 0) return NV_ERR_NOT_SUPPORTED;
+    return n_hal_pci_config_write(nvrm_dev.claim, offset, width, value) >= 0 ? NV_OK : NV_ERR_GENERIC;
 }
 NV_STATUS NV_API_CALL os_pci_write_byte(void *handle, NvU32 offset, NvU8 value) { return pci_write(handle, offset, 1, value); }
 NV_STATUS NV_API_CALL os_pci_write_word(void *handle, NvU32 offset, NvU16 value) { return pci_write(handle, offset, 2, value); }
@@ -156,7 +156,7 @@ void NV_API_CALL os_io_write_dword(NvU32 address, NvU32 value) { (void)address; 
 #define BAR_COUNT (sizeof nvrm_dev.info.bar / sizeof nvrm_dev.info.bar[0])
 
 struct bar {
-    n_handle handle;   /* n_pci_bar, opened on first use; -1 before */
+    n_handle handle;   /* n_hal_map, opened on first use; -1 before */
     uint8_t *map;      /* whole-BAR mapping (BAR0 only) */
 };
 
@@ -165,14 +165,14 @@ static struct bar bars[BAR_COUNT] = {
 };
 /* RM aperture order differs from PCI configuration indices after a 64-bit BAR. */
 static unsigned aperture_bar[NV_GPU_NUM_BARS];
-static void pci_apertures(const struct n_pci_function *g, nv_state_t *nv) {
+static void pci_apertures(const struct n_hal_pci_info *g, nv_state_t *nv) {
     for (unsigned a = 0; a < NV_GPU_NUM_BARS; a++) {
         aperture_bar[a] = N_PCI_NONE;
         nv->bars[a].cpu_address = nv->bars[a].size = 0;
     }
     unsigned aperture = 0;
     for (unsigned i = 0; i < BAR_COUNT && aperture < NV_GPU_NUM_BARS; i++) {
-        const struct n_pci_bar *b = &g->bar[i];
+        const struct n_hal_pci_bar *b = &g->bar[i];
         if ((b->flags & N_PCI_BAR_MEMORY) && b->size) {
             aperture_bar[aperture] = i;
             nv->bars[aperture].cpu_address = b->address;
@@ -190,7 +190,7 @@ static void bar_setup(void) { mtx_init(&bar_lock, mtx_plain); }
 static n_handle bar_handle(unsigned index) {
     call_once(&bar_once, bar_setup);
     mtx_lock(&bar_lock);
-    if (bars[index].handle < 0) bars[index].handle = n_pci_bar(nvrm_dev.pci, index);
+    if (bars[index].handle < 0) bars[index].handle = n_hal_map(nvrm_dev.claim, index);
     n_handle h = bars[index].handle;
     mtx_unlock(&bar_lock);
     return h;
@@ -199,7 +199,7 @@ static n_handle bar_handle(unsigned index) {
 /* The BAR holding [phys, phys + bytes), or -1. */
 static int bar_of(uint64_t phys, uint64_t bytes) {
     for (int i = 0; i < BAR_COUNT; i++) {
-        const struct n_pci_bar *b = &nvrm_dev.info.bar[i];
+        const struct n_hal_pci_bar *b = &nvrm_dev.info.bar[i];
         if (!(b->flags & N_PCI_BAR_MEMORY) || !b->size) continue;
         if (phys >= b->address && bytes <= b->size && phys - b->address <= b->size - bytes) return i;
     }
@@ -343,16 +343,16 @@ void NV_API_CALL os_flush_cpu_write_combine_buffer(void) { __asm__ volatile("sfe
  * ---------------------------------------------------------------------------------------- */
 NV_STATUS nvrm_pci_attach(void) {
     struct nvrm_device *d = &nvrm_dev;
-    if (n_handle_kind(d->pci) != N_KIND_PCI) {
-        nvrm_log("NVRM: handle %d is not a PCI right (kind %lld)", d->pci, (long long)n_handle_kind(d->pci));
+    if (n_handle_kind(d->claim) != N_KIND_HAL_CLAIM) {
+        nvrm_log("NVRM: handle %d is not a device claim (kind %lld)", d->claim, (long long)n_handle_kind(d->claim));
         return NV_ERR_INVALID_STATE;
     }
-    n_result r = n_pci_info(d->pci, &d->info);
+    n_result r = n_hal_pci_info(d->claim, &d->info);
     if (r < 0) {
-        nvrm_log("NVRM: n_pci_info failed: %s", n_result_text(r));
+        nvrm_log("NVRM: n_hal_pci_info failed: %s", n_result_text(r));
         return NV_ERR_GENERIC;
     }
-    const struct n_pci_function *g = &d->info;
+    const struct n_hal_pci_info *g = &d->info;
     if (g->flags & N_PCI_NEEDS_RECOVERY)
         nvrm_log("NVRM: the previous driver ended with an active GPU; DMA is isolated, but RM must recover the GPU. "
                  "The boot display was not reset and recovery is not yet confirmed");
@@ -390,14 +390,14 @@ NV_STATUS nvrm_pci_attach(void) {
                  g->framebuffer_address == nv->fb->cpu_address ? "RM keeps it mapped"
                                                                : "not at BAR1's start, RM will not keep it mapped");
 
-    n_result command = n_pci_config_read(d->pci, N_PCI_SELF, PCI_COMMAND, sizeof(uint16_t));
+    n_result command = n_hal_pci_config_read(d->claim, N_PCI_SELF, PCI_COMMAND, sizeof(uint16_t));
     if (command < 0) return NV_ERR_OPERATING_SYSTEM;
     nvrm_log("NVRM: PCI Command=0x%04x at attach (memory=%u, bus-master=%u); DMA addresses are physical, %s",
              (unsigned)command, !!(command & PCI_COMMAND_MEMORY), !!(command & PCI_COMMAND_MASTER),
              g->flags & N_PCI_ISOLATED ? "the IOMMU confines the GPU to its DMA memory" : "no IOMMU isolates the GPU");
 
     for (unsigned dw = 0; dw < NVRM_PCICFG_NUM_DWORDS; dw++) {
-        n_result v = n_pci_config_read(d->pci, N_PCI_SELF, dw * 4, 4);
+        n_result v = n_hal_pci_config_read(d->claim, N_PCI_SELF, dw * 4, 4);
         nv->pci_cfg_space[dw] = v < 0 ? 0xFFFFFFFFu : (NvU32)v;
     }
 
@@ -406,11 +406,11 @@ NV_STATUS nvrm_pci_attach(void) {
         nvrm_log("NVRM: no register memory BAR");
         return NV_ERR_INVALID_STATE;
     }
-    const struct n_pci_bar *b0 = &g->bar[registers];
+    const struct n_hal_pci_bar *b0 = &g->bar[registers];
     if (b0->size > SIZE_MAX) return NV_ERR_INVALID_ARGUMENT;
     n_handle h0 = bar_handle(registers);
     if (h0 < 0) {
-        nvrm_log("NVRM: n_pci_bar(%u) failed: %s", registers, n_result_text(h0));
+        nvrm_log("NVRM: n_hal_map(%u) failed: %s", registers, n_result_text(h0));
         return NV_ERR_GENERIC;
     }
     /* nvrm keeps one mapping of the whole BAR0; os_map_kernel_space hands out pieces of it.
@@ -437,15 +437,15 @@ NV_STATUS nvrm_pci_attach(void) {
    did not take it is not reported as mastering. */
 bool nvrm_pci_bus_master(bool on) {
     struct nvrm_device *d = &nvrm_dev;
-    n_result command = n_pci_config_read(d->pci, N_PCI_SELF, PCI_COMMAND, sizeof(uint16_t));
+    n_result command = n_hal_pci_config_read(d->claim, N_PCI_SELF, PCI_COMMAND, sizeof(uint16_t));
     if (command < 0) {
         nvrm_log("NVRM: cannot read PCI Command: %s", n_result_text(command));
         return false;
     }
     uint16_t want = on ? (uint16_t)command | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER
                        : (uint16_t)command & ~PCI_COMMAND_MASTER;
-    n_result r = n_pci_config_write(d->pci, PCI_COMMAND, sizeof(uint16_t), want);
-    n_result now = n_pci_config_read(d->pci, N_PCI_SELF, PCI_COMMAND, sizeof(uint16_t));
+    n_result r = n_hal_pci_config_write(d->claim, PCI_COMMAND, sizeof(uint16_t), want);
+    n_result now = n_hal_pci_config_read(d->claim, N_PCI_SELF, PCI_COMMAND, sizeof(uint16_t));
     bool mastering = now >= 0 && (now & PCI_COMMAND_MASTER);
     d->bus_master = on ? mastering : mastering && d->bus_master;
     if (r < 0 || now < 0 || mastering != on) {
@@ -474,9 +474,9 @@ void nvrm_pci_detach(void) {
    for RM's bookkeeping, as in NVIDIA's kernel interface). */
 static uint32_t irq_vectors;
 int nvrm_irq_enable(void) {
-    n_result n = n_pci_interrupts(nvrm_dev.pci, 1);
+    n_result n = n_hal_interrupts(nvrm_dev.claim, 1);
     if (n < 0) {
-        nvrm_log("NVRM: n_pci_interrupts failed: %s", n_result_text(n));
+        nvrm_log("NVRM: n_hal_interrupts failed: %s", n_result_text(n));
         return (int)n;
     }
     irq_vectors = (uint32_t)n;
@@ -490,13 +490,13 @@ uint32_t nvrm_interrupt_count(void) { return irq_vectors; }
 /* nv-procfs's "information" and "power" of the GPU, as lines of nvrm's log: there is no proc
    file system, and what the original shows a reader there is written once the GPU started. */
 static bool pci_express(void) {
-    n_result pointer = n_pci_config_read(nvrm_dev.pci, N_PCI_SELF, 0x34, 1);
+    n_result pointer = n_hal_pci_config_read(nvrm_dev.claim, N_PCI_SELF, 0x34, 1);
     for (unsigned hops = 0; pointer >= 0x40 && hops < 48; hops++) {
         unsigned offset = (unsigned)pointer & 0xFCu;
-        n_result id = n_pci_config_read(nvrm_dev.pci, N_PCI_SELF, offset, 1);
+        n_result id = n_hal_pci_config_read(nvrm_dev.claim, N_PCI_SELF, offset, 1);
         if (id < 0) return false;
         if (id == 0x10) return true;  /* PCI Express capability */
-        pointer = n_pci_config_read(nvrm_dev.pci, N_PCI_SELF, offset + 1, 1);
+        pointer = n_hal_pci_config_read(nvrm_dev.claim, N_PCI_SELF, offset + 1, 1);
     }
     return false;
 }
@@ -555,7 +555,7 @@ void NV_API_CALL nv_schedule_uvm_resume_p2p(NvU8 *uuid) {
 void NV_API_CALL nv_get_screen_info(nv_state_t *nv, NvU64 *base, NvU32 *width, NvU32 *height, NvU32 *depth,
                                     NvU32 *pitch, NvU64 *size) {
     (void)nv;
-    const struct n_pci_function *g = &nvrm_dev.info;
+    const struct n_hal_pci_info *g = &nvrm_dev.info;
     *base = 0; *width = *height = *depth = *pitch = 0; *size = 0;
     if (g->framebuffer_bar == N_PCI_NONE || !g->framebuffer_size) return;
     *base = g->framebuffer_address;
@@ -569,19 +569,19 @@ void NV_API_CALL nv_get_screen_info(nv_state_t *nv, NvU64 *base, NvU32 *width, N
 /* RM brackets starting, disabling and shutting down the adapter (and power transitions) with
    these when nv_get_screen_info reports the boot screen in this GPU's BAR: physical RM (GSP)
    rebuilds BAR1 meanwhile, and a CPU write through BAR1 can disturb that. The system stops
-   drawing there (n_pci_hold_screen) until the matching enable. RM keeps the boot screen mapped
+   drawing there (n_hal_pci_hold_screen) until the matching enable. RM keeps the boot screen mapped
    at BAR1 offset 0 through virtual mode when the screen starts there (logged at attach), so
    drawing then goes on where it was. Only the enable or the end of nvrm's claim (which revokes
    BAR access, interrupts and bus mastering first) releases drawing. This does not guarantee
    recovery of GPU firmware or scanout; with boot option fbhold=<s> the system stops nvrm when
    a hold lasts that long. */
 void NV_API_CALL os_disable_console_access(void) {
-    n_result r = n_pci_hold_screen(nvrm_dev.pci, true);
+    n_result r = n_hal_pci_hold_screen(nvrm_dev.claim, true);
     if (r < 0 && r != -N_ERR_NOT_FOUND) nvrm_log("NVRM: cannot hold the boot screen: %s", n_result_text(r));
     else if (r >= 0) nvrm_log("NVRM: the system stopped drawing to the boot screen");
 }
 void NV_API_CALL os_enable_console_access(void) {
-    n_result r = n_pci_hold_screen(nvrm_dev.pci, false);
+    n_result r = n_hal_pci_hold_screen(nvrm_dev.claim, false);
     if (r < 0 && r != -N_ERR_NOT_FOUND) nvrm_log("NVRM: cannot release the boot screen: %s", n_result_text(r));
     else if (r >= 0) nvrm_log("NVRM: the system draws to the boot screen again");
 }
@@ -753,7 +753,7 @@ NV_STATUS NV_API_CALL nv_alloc_pages(nv_state_t *nv, NvU32 page_count, NvU64 pag
     /* No scattered retry for big pages: page_size is the GPU's page granularity, and RM promises
        its callers whole aligned chunks of it. When the run cannot be had, the failure goes back
        to RM; sysmemConstruct retries with smaller pages only when the page size was the default. */
-    n_handle dma = n_dma_create(nvrm_dev.pci, (size_t)bytes, flags);
+    n_handle dma = n_dma_create(nvrm_dev.claim, (size_t)bytes, flags);
     if (dma < 0) {
         free(a);
         return NV_ERR_NO_MEMORY;
@@ -766,7 +766,7 @@ NV_STATUS NV_API_CALL nv_alloc_pages(nv_state_t *nv, NvU32 page_count, NvU64 pag
         /* Misaligned run: take a larger one and use an aligned part of it. */
         n_handle_close(dma);
         a->dma = a->root = -1;
-        n_handle big = n_dma_create(nvrm_dev.pci, (size_t)(bytes + page_size - PAGE), flags);
+        n_handle big = n_dma_create(nvrm_dev.claim, (size_t)(bytes + page_size - PAGE), flags);
         if (big < 0) {
             alloc_destroy(a);
             return NV_ERR_NO_MEMORY;

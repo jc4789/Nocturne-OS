@@ -106,23 +106,38 @@ n_result n_shared_map(n_handle h, size_t bytes, int access, void **mapping) {
     *mapping = shared_page;
     return 0;
 }
-n_result pcilist(struct n_pciinfo *list, int capacity) {
+/* One ledger record of a PCI function; the record's id is its position + 1. */
+struct fake_function { uint16_t vendor; uint8_t cls, subcls, progif; };
+#define FAKE_PROPS 3
+static void fake_record(struct n_hal_device *d, uint32_t id, const struct fake_function *f) {
+    d->bytes = sizeof *d + FAKE_PROPS * sizeof(struct n_hal_prop);
+    d->id = id; d->bus = N_BUS_PCI; d->prop_count = FAKE_PROPS;
+    struct n_hal_prop *p = (struct n_hal_prop *)(d + 1);
+    p[0] = (struct n_hal_prop){.key = N_HAL_PROP_BUS, .value = N_BUS_PCI};
+    p[1] = (struct n_hal_prop){.key = N_PROP_PCI_VENDOR, .value = f->vendor};
+    p[2] = (struct n_hal_prop){.key = N_PROP_PCI_CLASS, .value = N_PCI_CLASS_CODE(f->cls, f->subcls, f->progif)};
+}
+n_result n_hal_snapshot(struct n_hal_snapshot *out) {
     /* The ready GPU follows several non-display entries, so truncation misses it. */
-    struct n_pciinfo entries[] = {
+    static const struct fake_function entries[] = {
         {.vendor = 0x1234}, {.vendor = 0x10de, .cls = 0x04},
         {.vendor = 0x10de, .cls = 0x03, .subcls = 0x01},
         {.vendor = 0x10de, .cls = 0x03, .subcls = 0x00, .progif = 1},
-        {.bus = 3, .dev = 4, .func = 1, .vendor = 0x10de, .cls = 0x03},
-        {.bus = 4, .vendor = 0x10de, .cls = 0x03, .subcls = 0x02},
+        {.vendor = 0x10de, .cls = 0x03},
+        {.vendor = 0x10de, .cls = 0x03, .subcls = 0x02},
     };
-    int count = sizeof entries / sizeof entries[0];
-    if (count > capacity) count = capacity;
-    memcpy(list, entries, count * sizeof *list);
+    const unsigned count = sizeof entries / sizeof entries[0];
+    const size_t record = sizeof(struct n_hal_device) + FAKE_PROPS * sizeof(struct n_hal_prop);
+    char *bytes = calloc(count, record);
+    if (!bytes) return -N_ERR_NO_MEMORY;
+    for (unsigned i = 0; i < count; i++) fake_record((struct n_hal_device *)(bytes + i * record), i + 1, &entries[i]);
+    out->first = (const struct n_hal_device *)bytes;
+    out->count = count;
     return count;
 }
 void *nvrm_rm_file_open(bool admin, uint32_t principal) { CHECK(!admin && principal == sender_app); return &rm_calls; }
 bool nvrm_rm_adapter_ready(void) {
-    return fixture_adapter_ready && (!multi_gpu_ready || strcmp(connected_name, "nocturne.nvidia.rm.00000321"));
+    return fixture_adapter_ready && (!multi_gpu_ready || strcmp(connected_name, "nocturne.nvidia.rm.00000005"));
 }
 void nvrm_rm_file_close(void *file) { (void)file; }
 /* UVM (uvm_nvrm.h), as the server sees it when nvrm runs no UVM. */
@@ -307,11 +322,11 @@ int main(void) {
        BDF, not the first daemon that wins a shared service-name race. */
     server.file = NULL;
     struct nvrm *connection = nvrm_connect();
-    CHECK(connection && !strcmp(connected_name, "nocturne.nvidia.rm.00000321"));
+    CHECK(connection && !strcmp(connected_name, "nocturne.nvidia.rm.00000005"));
     CHECK(nvrm_device_ready(connection));
     nvrm_disconnect(connection);
     server.file = NULL; server.arena = NULL; server.arena_handle = -1;
-    connection = nvrm_connect_device(N_PCI_TARGET(0, 7, 0, 0));
+    connection = nvrm_connect_device(0x700);
     CHECK(connection && !strcmp(connected_name, "nocturne.nvidia.rm.00000700"));
     CHECK(nvrm_device_ready(connection));
     nvrm_disconnect(connection);
@@ -342,13 +357,13 @@ int main(void) {
     override_hello = false;
     multi_gpu_ready = true;
     connection = nvrm_connect();
-    CHECK(connection && !nvrm_device_ready(connection) && !strcmp(connected_name, "nocturne.nvidia.rm.00000321"));
+    CHECK(connection && !nvrm_device_ready(connection) && !strcmp(connected_name, "nocturne.nvidia.rm.00000005"));
     nvrm_disconnect(connection);
     connection = nvrm_connect_ready();
-    CHECK(connection && nvrm_device_ready(connection) && !strcmp(connected_name, "nocturne.nvidia.rm.00000400"));
+    CHECK(connection && nvrm_device_ready(connection) && !strcmp(connected_name, "nocturne.nvidia.rm.00000006"));
     nvrm_disconnect(connection);
     connection = NULL;
-    CHECK(nvrm_connect_ready_status(&connection) == 0 && connection && !strcmp(connected_name, "nocturne.nvidia.rm.00000400"));
+    CHECK(nvrm_connect_ready_status(&connection) == 0 && connection && !strcmp(connected_name, "nocturne.nvidia.rm.00000006"));
     nvrm_disconnect(connection);
     /* Why there is none: the first GPU's reason, not the last one's. */
     fixture_adapter_ready = false;
@@ -361,9 +376,16 @@ int main(void) {
     connect_result = 12;
     CHECK(nvrm_connect_ready_status(NULL) == -N_ERR_INVALID);
     multi_gpu_ready = false;
-    CHECK(nvrm_pci_is_gpu(0x10de, 0x03, 0x02, 0x00));
-    CHECK(!nvrm_pci_is_gpu(0x10de, 0x03, 0x01, 0x00));
-    CHECK(!nvrm_pci_is_gpu(0x10de, 0x03, 0x00, 0x01));
+    {
+        char bytes[sizeof(struct n_hal_device) + FAKE_PROPS * sizeof(struct n_hal_prop)] __attribute__((aligned(8)));
+        struct n_hal_device *d = (struct n_hal_device *)bytes;
+        fake_record(d, 1, &(struct fake_function){.vendor = 0x10de, .cls = 0x03, .subcls = 0x02});
+        CHECK(nvrm_is_gpu(d));
+        fake_record(d, 1, &(struct fake_function){.vendor = 0x10de, .cls = 0x03, .subcls = 0x01});
+        CHECK(!nvrm_is_gpu(d));
+        fake_record(d, 1, &(struct fake_function){.vendor = 0x10de, .cls = 0x03, .progif = 0x01});
+        CHECK(!nvrm_is_gpu(d));
+    }
 
     struct nvrm *status_connection = NULL;
     connect_result = -N_ERR_NOT_FOUND;
@@ -394,11 +416,11 @@ int main(void) {
     void *refused;
     CHECK(n_shared_map(42, N_PAGE_SIZE, N_MEMORY_READ_WRITE, &refused) == -N_ERR_DENIED && !refused);
 
-    CHECK(nvrm_serve(N_PCI_TARGET(1, 2, 1, 0)) == -N_ERR_CANCELLED);
+    CHECK(nvrm_serve(0x10208) == -N_ERR_CANCELLED);
     CHECK(listener_calls == 1 && watches == 1);
     CHECK(!strcmp(listened_name, "nocturne.nvidia.rm.00010208"));
     listener_calls = watches = listener_closes = 0;
-    CHECK(nvrm_serve(N_PCI_TARGET(0, 3, 1, 0)) == -N_ERR_CANCELLED);
+    CHECK(nvrm_serve(0x319) == -N_ERR_CANCELLED);
     CHECK(listener_calls == 1 && watches == 1);
     CHECK(stop_wakes == 2 && threads_started == 0); /* the end is announced to client threads */
     printf("nvrm_transport_hosttest: %d failed (channel/RM fixtures; no GPU execution)\n", failures);

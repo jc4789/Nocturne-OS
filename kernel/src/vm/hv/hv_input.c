@@ -1,8 +1,11 @@
-/* Hyper-V synthetic keyboard and mouse (VMBus). The keyboard sends scancode set 1, which
+/* Hyper-V synthetic keyboard and mouse (VMBus), one driver each: a device is a channel of its
+   type, bound by its rule. The keyboard sends scancode set 1, which
    vm/set1.h turns into HID usages. The mouse is a HID device with absolute coordinates; we read
    its report descriptor to find the buttons, X, Y and wheel. */
 #include "kernel.h"
 #include "dev/input.h"
+#include "hal/hal.h"
+#include "mm/heap.h"
 #include "sys/clock.h"
 #include "vm/hv/vmbus.h"
 #include "vm/set1.h"
@@ -36,12 +39,15 @@ struct kbd_msg {
     };
 } PACKED;
 
-static volatile bool kbd_answered;
-static uint32_t kbd_status;
-
-static struct input_device kbd_input = {.id = "hyperv:keyboard", .kinds = N_INPUT_KEYBOARD};
+struct hv_keyboard {
+    struct input_device input;
+    struct vmbus_channel *ch;
+    volatile bool answered;
+    uint32_t status;
+};
 
 static void kbd_callback(struct vmbus_channel *ch) {
+    struct hv_keyboard *kbd = ch->priv;
     uint8_t pkt[256];
     int n;
     while ((n = vmbus_recv(ch, pkt, sizeof pkt)) != 0) {
@@ -49,44 +55,66 @@ static void kbd_callback(struct vmbus_channel *ch) {
         if (vmpacket_datalen(pkt) < 8) continue;
         struct kbd_msg *m = vmpacket_data(pkt);
         if (m->type == KBD_PROTOCOL_RESPONSE) {
-            kbd_status = m->status;
-            kbd_answered = true;
+            kbd->status = m->status;
+            kbd->answered = true;
         } else if (m->type == KBD_EVENT) {
             if (m->key.info & KBD_IS_UNICODE) { /* typed text (e.g. VMConnect's "Type clipboard text") */
-                input_text(&kbd_input, m->key.make_code, !(m->key.info & KBD_IS_BREAK), clock_now_ns());
+                input_text(&kbd->input, m->key.make_code, !(m->key.info & KBD_IS_BREAK), clock_now_ns());
                 continue;
             }
             /* one key in one call, its 0xE0 with it; one after 0xE1 (KBD_IS_E1, Pause) goes as the
                plain key, set 1 has nothing else for it */
             uint16_t usage = set1_usage((uint8_t)m->key.make_code, (m->key.info & KBD_IS_E0) != 0);
-            if (usage) input_key(&kbd_input, usage, !(m->key.info & KBD_IS_BREAK), clock_now_ns());
+            if (usage) input_key(&kbd->input, usage, !(m->key.info & KBD_IS_BREAK), clock_now_ns());
         }
     }
 }
 
-static bool kbd_init(void) {
-    struct vmbus_channel *ch = vmbus_find(&kbd_guid, 0);
-    if (!ch) return false;
-    if (vmbus_open(ch, RING_BYTES, RING_BYTES, kbd_callback, NULL)) goto failed;
+static int kbd_attach(struct hal_device *d) {
+    struct vmbus_channel *ch = vmbus_channel_of(d);
+    struct hv_keyboard *kbd = kzalloc(sizeof *kbd);
+    if (!kbd) return -N_ERR_NO_MEMORY;
+    kbd->ch = ch;
+    kbd->input = (struct input_device){.id = "hyperv:keyboard", .kinds = N_INPUT_KEYBOARD};
+    d->driver_data = kbd;
+    if (vmbus_open(ch, RING_BYTES, RING_BYTES, kbd_callback, kbd)) goto failed;
     struct kbd_msg req = {.type = KBD_PROTOCOL_REQUEST, .version = KBD_VERSION};
     int st = vmbus_send(ch, VM_PKT_DATA_INBAND, VMBUS_FLAG_COMPLETION_REQUESTED, &req, 8, 1);
-    if (!vmbus_wait(&kbd_answered, 2000) || !(kbd_status & KBD_ACCEPTED)) {
+    if (!vmbus_wait(&kbd->answered, 2000) || !(kbd->status & KBD_ACCEPTED)) {
         kprintf("hv-input: keyboard protocol not accepted (send %d, answered %d status %x; out w%u r%u, in w%u r%u)\n",
-                st, kbd_answered, kbd_status, ch->out->write_index, ch->out->read_index, ch->in->write_index,
+                st, kbd->answered, kbd->status, ch->out->write_index, ch->out->read_index, ch->in->write_index,
                 ch->in->read_index);
+        vmbus_close(ch);
         goto failed;
     }
-    input_device_add(&kbd_input);
-    hal_bound(&ch->hal, "hv_input");
-    return true;
+    input_device_add(&kbd->input);
+    hal_offer(d, N_OFFER_INPUT, 0, kbd->input.id);
+    kprintf("hv-input: synthetic keyboard ready\n");
+    return 0;
 failed:
-    hal_failed(&ch->hal, "hv_input", -N_ERR_IO);
-    return false;
+    d->driver_data = NULL;
+    kfree(kbd);
+    return -N_ERR_IO;
 }
 
-/* ---- mouse ---- */
+static void kbd_detach(struct hal_device *d) {
+    struct hv_keyboard *kbd = d->driver_data;
+    vmbus_close(kbd->ch); /* no callback runs after this */
+    input_device_remove(&kbd->input);
+    d->driver_data = NULL;
+    kfree(kbd);
+}
 
-static struct input_device mouse_input = {.id = "hyperv:mouse", .kinds = N_INPUT_POINTER};
+static const struct n_hal_rule kbd_rules[] = {N_VMBUS_TYPE(kbd_guid.b)};
+const struct hal_driver hv_keyboard_driver = {
+    .name = "hv_keyboard",
+    .rules = kbd_rules,
+    .rule_count = ARRAY_SIZE(kbd_rules),
+    .attach = kbd_attach,
+    .detach = kbd_detach,
+};
+
+/* ---- mouse ---- */
 
 enum { HID_PROTOCOL_REQUEST, HID_PROTOCOL_RESPONSE, HID_DEVICE_INFO, HID_DEVICE_INFO_ACK, HID_INPUT_REPORT };
 #define HID_VERSION 0x00020000 /* 2.0 */
@@ -106,13 +134,15 @@ struct hid_field {
     int32_t min, max;
 };
 
-static struct {
+struct hv_mouse {
+    struct input_device input;
     struct vmbus_channel *ch;
     volatile bool answered, have_info;
     bool approved;
     bool uses_ids;
     struct hid_field x, y, wheel, buttons[5];
-} ms;
+    uint8_t packet[4096]; /* the callback's, one at a time */
+};
 
 static uint32_t item_u(const uint8_t *p, int n) {
     uint32_t v = 0;
@@ -128,7 +158,7 @@ static int32_t item_s(const uint8_t *p, int n) {
 }
 
 /* Walk a HID report descriptor and remember where the fields we care about are. */
-static void parse_report_descriptor(const uint8_t *d, uint32_t len) {
+static void parse_report_descriptor(struct hv_mouse *ms, const uint8_t *d, uint32_t len) {
     uint32_t page = 0, rsize = 0, rcount = 0, rid = 0;
     int32_t lmin = 0, lmax = 0;
     uint32_t usages[16], nusages = 0, umin = 0, umax = 0;
@@ -153,7 +183,7 @@ static void parse_report_descriptor(const uint8_t *d, uint32_t len) {
             case 1: lmin = item_s(data, sz); break;
             case 2: lmax = sz < 4 && lmin >= 0 ? (int32_t)item_u(data, sz) : item_s(data, sz); break;
             case 7: rsize = item_u(data, sz); break;
-            case 8: rid = item_u(data, sz) & 0xFF; ms.uses_ids = true; break;
+            case 8: rid = item_u(data, sz) & 0xFF; ms->uses_ids = true; break;
             case 9: rcount = item_u(data, sz); break;
             }
         } else if (type == 2) { /* local */
@@ -171,11 +201,11 @@ static void parse_report_descriptor(const uint8_t *d, uint32_t len) {
                     else if (nusages) usage = usages[k < nusages ? k : nusages - 1];
                     struct hid_field *f = NULL;
                     if (!(flags & 1) && (flags & 2)) { /* data, variable */
-                        if (usage == 0x10030) f = &ms.x;
-                        else if (usage == 0x10031) f = &ms.y;
-                        else if (usage == 0x10038) f = &ms.wheel;
+                        if (usage == 0x10030) f = &ms->x;
+                        else if (usage == 0x10031) f = &ms->y;
+                        else if (usage == 0x10038) f = &ms->wheel;
                         else if ((usage >> 16) == 9 && (usage & 0xFFFF) >= 1 && (usage & 0xFFFF) <= 5)
-                            f = &ms.buttons[(usage & 0xFFFF) - 1];
+                            f = &ms->buttons[(usage & 0xFFFF) - 1];
                     }
                     if (f && !f->present) {
                         f->present = true;
@@ -207,33 +237,33 @@ static int32_t field_value(const struct hid_field *f, const uint8_t *r, uint32_t
     return (int32_t)v;
 }
 
-static void mouse_report(const uint8_t *r, uint32_t len) {
+static void mouse_report(struct hv_mouse *ms, const uint8_t *r, uint32_t len) {
     uint8_t id = 0;
-    if (ms.uses_ids) {
+    if (ms->uses_ids) {
         if (!len) return;
         id = *r++;
         len--;
     }
-    if (!ms.x.present || ms.x.report_id != id) return;
+    if (!ms->x.present || ms->x.report_id != id) return;
     struct mouse_event e = {.time_ns = clock_now_ns()};
     for (int i = 0; i < 5; i++)
-        if (ms.buttons[i].present && field_value(&ms.buttons[i], r, len)) e.buttons |= 1 << i;
+        if (ms->buttons[i].present && field_value(&ms->buttons[i], r, len)) e.buttons |= 1 << i;
     e.buttons &= 7;
-    int32_t x = field_value(&ms.x, r, len), y = ms.y.present ? field_value(&ms.y, r, len) : 0;
-    if (ms.x.relative) {
+    int32_t x = field_value(&ms->x, r, len), y = ms->y.present ? field_value(&ms->y, r, len) : 0;
+    if (ms->x.relative) {
         e.dx = x;
         e.dy = y;
     } else {
-        int32_t xr = ms.x.max - ms.x.min, yr = ms.y.max - ms.y.min;
+        int32_t xr = ms->x.max - ms->x.min, yr = ms->y.max - ms->y.min;
         e.absolute = true;
-        e.x = xr > 0 ? (int)((int64_t)(x - ms.x.min) * MOUSE_ABS_MAX / xr) : 0;
-        e.y = yr > 0 ? (int)((int64_t)(y - ms.y.min) * MOUSE_ABS_MAX / yr) : 0;
+        e.x = xr > 0 ? (int)((int64_t)(x - ms->x.min) * MOUSE_ABS_MAX / xr) : 0;
+        e.y = yr > 0 ? (int)((int64_t)(y - ms->y.min) * MOUSE_ABS_MAX / yr) : 0;
     }
-    if (ms.wheel.present) e.wheel = -field_value(&ms.wheel, r, len); /* HID: positive is away from the user */
-    input_mouse(&mouse_input, &e);
+    if (ms->wheel.present) e.wheel = -field_value(&ms->wheel, r, len); /* HID: positive is away from the user */
+    input_mouse(&ms->input, &e);
 }
 
-static void mouse_send(uint32_t type, const void *data, uint32_t len) {
+static void mouse_send(struct hv_mouse *ms, uint32_t type, const void *data, uint32_t len) {
     uint8_t buf[64];
     struct hid_msg *m = (void *)buf;
     m->pipe_type = PIPE_MESSAGE_DATA;
@@ -241,13 +271,14 @@ static void mouse_send(uint32_t type, const void *data, uint32_t len) {
     m->type = type;
     m->size = len;
     memcpy(m->data, data, len);
-    vmbus_send(ms.ch, VM_PKT_DATA_INBAND, VMBUS_FLAG_COMPLETION_REQUESTED, buf, sizeof *m + len, type + 1);
+    vmbus_send(ms->ch, VM_PKT_DATA_INBAND, VMBUS_FLAG_COMPLETION_REQUESTED, buf, sizeof *m + len, type + 1);
 }
 
 static void mouse_callback(struct vmbus_channel *ch) {
-    static uint8_t pkt[4096];
+    struct hv_mouse *ms = ch->priv;
+    uint8_t *pkt = ms->packet;
     int n;
-    while ((n = vmbus_recv(ch, pkt, sizeof pkt)) != 0) {
+    while ((n = vmbus_recv(ch, pkt, sizeof ms->packet)) != 0) {
         if (n < 0 || ((struct vmpacket_desc *)pkt)->type != VM_PKT_DATA_INBAND) continue;
         uint32_t len = vmpacket_datalen(pkt);
         struct hid_msg *m = vmpacket_data(pkt);
@@ -255,8 +286,8 @@ static void mouse_callback(struct vmbus_channel *ch) {
         uint32_t dlen = MIN(m->size, len - (uint32_t)sizeof *m);
         switch (m->type) {
         case HID_PROTOCOL_RESPONSE:
-            ms.approved = dlen >= 5 && m->data[4];
-            ms.answered = true;
+            ms->approved = dlen >= 5 && m->data[4];
+            ms->answered = true;
             break;
         case HID_DEVICE_INFO: {
             /* device info (it starts with its own size), then a HID descriptor, then the report descriptor */
@@ -264,49 +295,66 @@ static void mouse_callback(struct vmbus_channel *ch) {
             if (info_len && dlen >= info_len + 9) {
                 const uint8_t *hd = m->data + info_len;
                 uint32_t rd_len = hd[7] | (uint32_t)hd[8] << 8;
-                if (info_len + hd[0] + rd_len <= dlen) parse_report_descriptor(hd + hd[0], rd_len);
+                if (info_len + hd[0] + rd_len <= dlen) parse_report_descriptor(ms, hd + hd[0], rd_len);
             }
             uint8_t ack = 0;
-            mouse_send(HID_DEVICE_INFO_ACK, &ack, 1);
-            ms.have_info = true;
+            mouse_send(ms, HID_DEVICE_INFO_ACK, &ack, 1);
+            ms->have_info = true;
             break;
         }
-        case HID_INPUT_REPORT: mouse_report(m->data, dlen); break;
+        case HID_INPUT_REPORT: mouse_report(ms, m->data, dlen); break;
         }
     }
 }
 
-static bool mouse_init(void) {
-    ms.ch = vmbus_find(&mouse_guid, 0);
-    if (!ms.ch) return false;
-    if (vmbus_open(ms.ch, RING_BYTES, RING_BYTES, mouse_callback, NULL)) goto failed;
+static int mouse_attach(struct hal_device *d) {
+    struct vmbus_channel *ch = vmbus_channel_of(d);
+    struct hv_mouse *ms = kzalloc(sizeof *ms);
+    if (!ms) return -N_ERR_NO_MEMORY;
+    ms->ch = ch;
+    ms->input = (struct input_device){.id = "hyperv:mouse", .kinds = N_INPUT_POINTER};
+    d->driver_data = ms;
+    if (vmbus_open(ch, RING_BYTES, RING_BYTES, mouse_callback, ms)) goto failed;
     uint32_t version = HID_VERSION;
-    mouse_send(HID_PROTOCOL_REQUEST, &version, 4);
-    if (!vmbus_wait(&ms.answered, 2000) || !ms.approved) {
+    mouse_send(ms, HID_PROTOCOL_REQUEST, &version, 4);
+    if (!vmbus_wait(&ms->answered, 2000) || !ms->approved) {
         kprintf("hv-input: mouse protocol not accepted\n");
-        goto failed;
+        goto closed;
     }
-    if (!vmbus_wait(&ms.have_info, 2000)) {
+    if (!vmbus_wait(&ms->have_info, 2000)) {
         kprintf("hv-input: no mouse device info\n");
-        goto failed;
+        goto closed;
     }
-    if (!ms.x.present) {
+    if (!ms->x.present) {
         kprintf("hv-input: mouse report has no X axis\n");
-        goto failed;
+        goto closed;
     }
-    input_device_add(&mouse_input);
-    hal_bound(&ms.ch->hal, "hv_input");
-    return true;
+    input_device_add(&ms->input);
+    hal_offer(d, N_OFFER_INPUT, 0, ms->input.id);
+    kprintf("hv-input: synthetic mouse ready%s%s\n", !ms->x.relative ? " (absolute)" : "",
+            ms->wheel.present ? " (wheel)" : "");
+    return 0;
+closed:
+    vmbus_close(ch);
 failed:
-    hal_failed(&ms.ch->hal, "hv_input", -N_ERR_IO);
-    return false;
+    d->driver_data = NULL;
+    kfree(ms);
+    return -N_ERR_IO;
 }
 
-void hv_input_init(void) {
-    if (!vmbus_ready()) return;
-    bool k = kbd_init(), m = mouse_init();
-    if (k || m)
-        kprintf("hv-input: synthetic keyboard %s, mouse %s%s%s\n", k ? "ready" : "missing",
-                m ? "ready" : "missing", m && !ms.x.relative ? " (absolute)" : "",
-                m && ms.wheel.present ? " (wheel)" : "");
+static void mouse_detach(struct hal_device *d) {
+    struct hv_mouse *ms = d->driver_data;
+    vmbus_close(ms->ch); /* no callback runs after this */
+    input_device_remove(&ms->input);
+    d->driver_data = NULL;
+    kfree(ms);
 }
+
+static const struct n_hal_rule mouse_rules[] = {N_VMBUS_TYPE(mouse_guid.b)};
+const struct hal_driver hv_mouse_driver = {
+    .name = "hv_mouse",
+    .rules = mouse_rules,
+    .rule_count = ARRAY_SIZE(mouse_rules),
+    .attach = mouse_attach,
+    .detach = mouse_detach,
+};

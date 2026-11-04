@@ -39,8 +39,8 @@ struct input_device {
     int rest_x, rest_y;                  /* what a slow move has not yet made into a pixel: its driver's */
 };
 
-/* Once at boot: the modifiers back to none after each sleep. */
-void input_init(void);
+/* After a sleep (dev/pm.c): the keys held when it began were let go long ago. */
+void input_resumed(void);
 /* The sinks get every key and pointer move, called by the driver that has it, in any context
    (an interrupt's handler included) and on several CPUs at once: a sink does not sleep or take a
    mutex, and keeps its own order with its own lock. One driver's events reach it in their order. */

@@ -87,7 +87,7 @@ n_handle n_shared_compose(const struct n_shared_range *ranges, size_t count, uin
     live++;
     return 300;
 }
-n_handle n_pci_bar(n_handle pci, uint32_t index) {
+n_handle n_hal_map(n_handle pci, uint32_t index) {
     (void)pci;
     CHECK(index < BAR_COUNT);
     allocated_bytes = nvrm_dev.info.bar[index].size;
@@ -110,19 +110,19 @@ static uint16_t command_register;
 static bool command_ignores_writes, command_unreadable;
 static int command_writes, screen_holds, screen_calls;
 static n_result screen_result;
-n_result n_pci_config_read(n_handle pci, uint64_t target, uint32_t offset, uint32_t width) {
+n_result n_hal_pci_config_read(n_handle pci, uint64_t target, uint32_t offset, uint32_t width) {
     (void)pci;
     CHECK(target == N_PCI_SELF && offset == PCI_COMMAND && width == 2);
     return command_unreadable ? -N_ERR_IO : command_register;
 }
-n_result n_pci_config_write(n_handle pci, uint32_t offset, uint32_t width, uint32_t value) {
+n_result n_hal_pci_config_write(n_handle pci, uint32_t offset, uint32_t width, uint32_t value) {
     (void)pci;
     CHECK(offset == PCI_COMMAND && width == 2 && value <= UINT16_MAX);
     command_writes++;
     if (!command_ignores_writes) command_register = (uint16_t)value;
     return 0;
 }
-n_result n_pci_hold_screen(n_handle pci, bool hold) {
+n_result n_hal_pci_hold_screen(n_handle pci, bool hold) {
     (void)pci;
     screen_calls++;
     if (screen_result < 0) return screen_result;
@@ -347,14 +347,14 @@ static void mapping_cases(void) {
 
 static void bar_cases(void) {
     reset_fixture();
-    struct n_pci_function *g = &nvrm_dev.info;
+    struct n_hal_pci_info *g = &nvrm_dev.info;
     nv_state_t *nv = &nvrm_dev.nv;
     memset(g, 0, sizeof *g);
     /* Pre-Hopper: 32-bit registers followed by two 64-bit apertures. */
     unsigned old_layout[] = {0, 1, 3};
     for (unsigned a = 0; a < sizeof old_layout / sizeof old_layout[0]; a++) {
         unsigned i = old_layout[a];
-        g->bar[i] = (struct n_pci_bar){.address = (i + 1) * 16 * PAGE, .size = 8 * PAGE,
+        g->bar[i] = (struct n_hal_pci_bar){.address = (i + 1) * 16 * PAGE, .size = 8 * PAGE,
             .flags = N_PCI_BAR_MEMORY | (a ? N_PCI_BAR_64BIT : 0)};
     }
     pci_apertures(g, nv);
@@ -364,7 +364,7 @@ static void bar_cases(void) {
     /* All 64-bit: the PCI indices are 0,2,4, not the RM indices 0,1,2. */
     memset(g, 0, sizeof *g);
     for (unsigned i = 0; i < BAR_COUNT; i += 2)
-        g->bar[i] = (struct n_pci_bar){.address = (i + 1) * 16 * PAGE, .size = 8 * PAGE,
+        g->bar[i] = (struct n_hal_pci_bar){.address = (i + 1) * 16 * PAGE, .size = 8 * PAGE,
             .flags = N_PCI_BAR_MEMORY | N_PCI_BAR_64BIT | N_PCI_BAR_PREFETCH};
     pci_apertures(g, nv);
     for (unsigned a = 0; a < NV_GPU_NUM_BARS; a++) {

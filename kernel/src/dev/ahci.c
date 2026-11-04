@@ -5,16 +5,19 @@
 
    A port has as many command slots as its adapter gives (CAP.NCS). A disk with native command
    queuing (CAP.SNCQ and the disk's IDENTIFY word 76) takes its reads and writes as READ/WRITE
-   FPDMA QUEUED, as many at once as both have slots and the disk has tags (word 75), from any CPU;
-   the rest of its commands (flush, identify, standby) have the port to themselves, since a
-   non-queued command may not meet a queued one (SATA 3.3, 13.6). A disk without it takes one
-   command at a time. The data goes straight between the disk and the caller's memory, a PRD for
-   each physically contiguous run; a bounce buffer only for a request that does not cover whole
-   blocks of word aligned memory, or for an adapter that reaches only the first 4 GiB.
+   FPDMA QUEUED, as many at once as both have slots and the disk has tags (word 75): a request
+   chain (dev/blk.h) gets a slot each, from any CPU, and one write of PxSACT and PxCI issues as many
+   as the port took at once (3.3.13); the completion interrupt ends each request there. The rest of
+   its commands (flush, identify, standby) have the port to themselves, since a non-queued command
+   may not meet a queued one (SATA 3.3, 13.6): they, and a queued command that failed, which is
+   given again alone where a failure is its own, run one at a time on the disk's own thread
+   (blk_serial_start). A disk without queuing takes one command at a time on that thread. The data
+   goes straight between the disk and the caller's memory, a PRD for each segment of the request;
+   an adapter that reaches only the first 4 GiB goes through a buffer below it, one request at a time.
 
-   Completions arrive by MSI, or are polled when the platform offers none. A thread for each adapter
-   handles what may wait: a device that came or went (7.3, 6.2.2.3), and what the adapter lost in
-   a sleep.
+   Completions arrive by MSI or INTx, or are polled when the platform offers none. A thread for each
+   adapter handles what may wait: a device that came or went (7.3, 6.2.2.3), what the adapter lost
+   in a sleep, a port that went on through an error with requests in it, and the time of each request.
 
    A failure goes down the steps of 10.4: the command list engine stopped and started again, a
    COMRESET when the device stays busy, a queued command was in it or an overflow came, an HBA reset
@@ -28,11 +31,8 @@
 #include "arch/topology.h"
 #include "dev/blk.h"
 #include "dev/pci.h"
-#include "dev/pm.h"
-#include "dev/pci_drivers.h"
+#include "hal/hal.h"
 #include "mm/heap.h"
-#include "mm/pmm.h"
-#include "mm/vmm.h"
 #include "sys/clock.h"
 #include "sys/thread.h"
 #include "sys/wait.h"
@@ -40,7 +40,6 @@
 #define PORTS 32          /* PI has a bit for each */
 #define XFER_PAGES 128    /* the most a command moves: 512 KiB */
 #define PRDS (XFER_PAGES + 1) /* any 512 KiB of memory, aligned anyhow, in runs of a page at worst */
-#define PRD_MOST (4u << 20) /* one PRD's bytes (4.2.3.3) */
 #define LINK_NS NS_PER_S            /* after a COMRESET or a spin-up the link is up within this */
 #define READY_NS (10 * NS_PER_S)    /* a disk that was asleep or spinning up answers within this */
 #define STOP_NS (500 * NS_PER_MS)   /* a port's engines stop within this (10.1.2) */
@@ -48,6 +47,7 @@
 #define OWNER_NS (25 * NS_PER_MS)   /* the firmware shows it is busy within this (10.6.3) */
 #define OWNER_BUSY_NS (2 * NS_PER_S) /* and then has at least this to finish (10.6.3) */
 #define IO_NS (30 * NS_PER_S)
+#define TICK_NS (250 * NS_PER_MS)   /* the adapter's thread looks at the requests' time this often */
 #define RETRY_NS NS_PER_S           /* a port with a device that does not answer is looked at again after this */
 #define RETRY_MOST_NS (60 * NS_PER_S) /* and twice as long each time, up to this */
 
@@ -155,11 +155,15 @@ enum { PENDING, DONE, FAILED };
 struct hba;
 
 /* A command slot's end: reap sets status and moves seq on, under the port's lock, then wakes wq.
-   The waiter reads seq before it gives the command and sleeps while seq still reads that. */
+   The waiter reads seq before it gives the command and sleeps while seq still reads that. A slot
+   that has a request (a queued read or write of a request chain) has no waiter: the end of the
+   command ends the request (slots_end), and deadline is when the worker thread finds it late. */
 struct slot {
     struct wait_queue wq;
     uint64_t seq;
     int status;
+    struct blk_request *request; /* atomic: set under the port's lock before the command is issued */
+    uint64_t deadline;
 };
 
 struct port;
@@ -182,17 +186,17 @@ struct port {
     unsigned no;
     volatile uint8_t *regs;
     uint8_t *mem; /* LIST_AT, FIS_AT, TABLES_AT */
-    uint64_t mem_phys;
+    uint64_t mem_bus;
     unsigned pages; /* of mem */
     struct disk *disk; /* the last one seen; written with the port to itself */
     struct disk *disks; /* atomic: every one it has seen, newest first */
     uint64_t retry_at, retry_ns; /* a device that did not answer: its next look (the examiner's) */
-    bool looking; /* atomic: it counts in blk_looking until a look has said who is there (port_looked) */
-    /* An adapter that reaches only the first 4 GiB: every transfer through this buffer below it,
-       one at a time under low_lock. NULL for every other. */
+    bool looking; /* atomic: it counts in hal_settled until a look has said who is there (port_looked) */
+    /* An adapter that reaches only the first 4 GiB: every transfer through this buffer below it, one
+       at a time (the disk's thread). NULL for every other. */
     uint8_t *low;
     uint64_t low_phys;
-    struct mutex low_lock;
+    unsigned requests; /* atomic: the slots issued that have a request */
 
     /* Under lock, with the interrupt handler: the slots taken (a command being put together or in
        the port) and issued (in the port: PxCI, and PxSACT for a queued one, written under the lock,
@@ -220,8 +224,8 @@ struct port {
 };
 
 struct hba {
-    struct hba *next;
     int index;
+    struct hal_device *hal;
     struct pci_device *pci;
     volatile uint8_t *regs;
     bool s64, sncq, sss, ssc, sds, sadm;
@@ -240,10 +244,11 @@ struct hba {
     bool look_all;
     uint64_t kicks;
     struct wait_queue wq;
+    unsigned inflight; /* atomic: the requests issued and not ended */
+    bool stopping;     /* atomic: the adapter's thread ends */
 };
 
-static struct hba *hbas; /* added to in attach, before any power change */
-static int nhbas;
+static int nhbas; /* atomic: the adapters' numbers */
 
 static uint32_t hba_rd(struct hba *h, unsigned off) { return mmio_read32(h->regs + off); }
 static void hba_wr(struct hba *h, unsigned off, uint32_t v) { mmio_write32(h->regs + off, v); }
@@ -283,8 +288,41 @@ static uint32_t finish(struct port *p, uint32_t which, int status) {
     return which;
 }
 
-static void wake_slots(struct port *p, uint32_t which) {
-    for (; which; which &= which - 1) wq_wake_all(&p->slots[__builtin_ctz(which)].wq);
+static void leave(struct port *p, int slot, bool alone);
+
+/* The slots in `which` have ended, or the port wants whoever waits on them to look: a waiter is
+   woken; a request ends here, given back its slot, when its command has ended (not issued any more:
+   settle also names the slots that stay issued while the port goes on through something, and
+   those the worker thread stops). Done, it is complete; failed, it is given to the disk's thread,
+   which gives it again alone, where a failure is its own, up to three times. Any context. */
+static void slots_end(struct port *p, uint32_t which) {
+    for (; which; which &= which - 1) {
+        unsigned n = (unsigned)__builtin_ctz(which);
+        struct slot *s = &p->slots[n];
+        if (!__atomic_load_n(&s->request, __ATOMIC_ACQUIRE)) {
+            wq_wake_all(&s->wq);
+            continue;
+        }
+        uint64_t f = spin_lock(&p->lock);
+        bool ended = !(p->issued & 1u << n);
+        int status = s->status;
+        uint32_t is = p->error_is, tfd = p->error_tfd;
+        struct blk_request *r = ended ? __atomic_exchange_n(&s->request, NULL, __ATOMIC_ACQ_REL) : NULL;
+        spin_unlock(&p->lock, f);
+        if (!r) continue;
+        struct disk *d = r->device->priv;
+        if (r->op == BLK_WRITE) blk_write_ended(&d->blk);
+        __atomic_sub_fetch(&p->requests, 1, __ATOMIC_RELEASE);
+        __atomic_sub_fetch(&p->h->inflight, 1, __ATOMIC_RELEASE);
+        leave(p, (int)n, false);
+        if (status == DONE) {
+            blk_complete(r, 0);
+            continue;
+        }
+        kprintf("ahci%d: port %u: queued command failed (status %x, error %x, events %x), again alone\n", p->h->index,
+                p->no, tfd & 0xFF, tfd >> 8 & 0xFF, is);
+        blk_serial_ops.submit(&d->blk, r);
+    }
 }
 
 /* lock held, the engines not stopped by us (that clears PxCI and PxSACT): what the port's registers
@@ -333,11 +371,16 @@ static void attention_over(struct port *p) {
     p->live = false;
 }
 
+/* The adapter's thread looks at what there is. Any context. */
+static void hba_kick(struct hba *h) {
+    __atomic_add_fetch(&h->kicks, 1, __ATOMIC_RELEASE);
+    wq_wake_all(&h->wq);
+}
+
 /* Port no's link change is for the adapter's thread to see to. */
 static void hba_note(struct hba *h, unsigned no) {
     __atomic_or_fetch(&h->changed, 1u << no, __ATOMIC_RELEASE);
-    __atomic_add_fetch(&h->kicks, 1, __ATOMIC_RELEASE);
-    wq_wake_all(&h->wq);
+    hba_kick(h);
 }
 
 /* The port's events. A link change (PCS, PRCS) stays in PxIS until PxSERR is cleared (3.3.5), which
@@ -367,15 +410,18 @@ static void reap(struct port *p) {
     } else if (!gone && !p->halting && !p->resetting && is & (IS_ERRORS | IS_OFS)) {
         p->live = false;
     }
+    bool attention = p->attention;
     spin_unlock(&p->lock, f);
-    wake_slots(p, woken);
+    slots_end(p, woken);
     if (noted) hba_note(p->h, p->no);
+    /* no waiter stops the port that went on through something with requests in it: the thread does */
+    if (attention && __atomic_load_n(&p->requests, __ATOMIC_ACQUIRE)) hba_kick(p->h);
 }
 
 static enum irq_result ahci_isr(void *context) {
     struct hba *h = context;
     uint32_t is = hba_rd(h, IS);
-    if (is == 0xFFFFFFFFu) return IRQ_NONE;
+    if (!is || is == 0xFFFFFFFFu) return IRQ_NONE; /* a shared line may be another device's */
     for (uint32_t m = is; m; m &= m - 1) {
         unsigned n = (unsigned)__builtin_ctz(m);
         struct port *p = h->ports[n];
@@ -437,7 +483,7 @@ static void port_fail_all(struct port *p) {
     p->unverified = true;
     uint32_t woken = finish(p, p->issued, FAILED);
     spin_unlock(&p->lock, f);
-    wake_slots(p, woken);
+    slots_end(p, woken);
 }
 
 static bool hba_lock(struct hba *h) {
@@ -454,7 +500,7 @@ static void hba_unlock(struct hba *h, bool held) {
    its disks with it. */
 static void hba_kill(struct hba *h) {
     kprintf("ahci%d: the adapter is hung, turned off\n", h->index);
-    hal_failed(&h->pci->hal, ahci_driver.name, -N_ERR_IO);
+    hal_failed(h->hal, -N_ERR_IO);
     __atomic_store_n(&h->dead, true, __ATOMIC_RELEASE);
     pci_disable_busmaster(h->pci, NULL);
     for (unsigned n = 0; n < PORTS; n++)
@@ -465,8 +511,7 @@ static void hba_kill(struct hba *h) {
 /* The adapter's thread looks at every port. */
 static void hba_look_all(struct hba *h) {
     __atomic_store_n(&h->look_all, true, __ATOMIC_RELEASE);
-    __atomic_add_fetch(&h->kicks, 1, __ATOMIC_RELEASE);
-    wq_wake_all(&h->wq);
+    hba_kick(h);
 }
 
 /* The last step (10.4.3): the whole adapter reset, which clears GHC.AE too, the first thing to set
@@ -515,10 +560,10 @@ static void port_listen(struct port *p) {
 }
 
 static void port_give_memory(struct port *p) {
-    wr(p, PxCLB, (uint32_t)(p->mem_phys + LIST_AT));
-    wr(p, PxCLB + 4, (uint32_t)((p->mem_phys + LIST_AT) >> 32));
-    wr(p, PxFB, (uint32_t)(p->mem_phys + FIS_AT));
-    wr(p, PxFB + 4, (uint32_t)((p->mem_phys + FIS_AT) >> 32));
+    wr(p, PxCLB, (uint32_t)(p->mem_bus + LIST_AT));
+    wr(p, PxCLB + 4, (uint32_t)((p->mem_bus + LIST_AT) >> 32));
+    wr(p, PxFB, (uint32_t)(p->mem_bus + FIS_AT));
+    wr(p, PxFB + 4, (uint32_t)((p->mem_bus + FIS_AT) >> 32));
     wr(p, PxCMD, rd(p, PxCMD) | CMD_FRE);
 }
 
@@ -811,7 +856,7 @@ static void halt(struct port *p, uint32_t bit) {
     if (p->halting || !(p->issued & bit)) {
         attention_over(p);
         spin_unlock(&p->lock, f);
-        wake_slots(p, woken);
+        slots_end(p, woken);
         return;
     }
     p->halting = true;
@@ -823,7 +868,7 @@ static void halt(struct port *p, uint32_t bit) {
     }
     p->attention = false;
     spin_unlock(&p->lock, f);
-    wake_slots(p, woken);
+    slots_end(p, woken);
     /* An adapter reset under way ends first: until GHC.HR falls (10.4.3) its engines may still move
        data. After one they are stopped, and what it set up is not this one's to stop. */
     bool held = hba_lock(p->h);
@@ -834,35 +879,25 @@ static void halt(struct port *p, uint32_t bit) {
     woken = finish(p, p->issued, FAILED);
     p->halting = false;
     spin_unlock(&p->lock, f);
-    wake_slots(p, woken);
+    slots_end(p, woken);
 }
 
-/* The PRDs for `bytes` at buf in the slot's table (4.2.3.3): one for each physically contiguous
-   run. 0 when a page is not mapped or lies beyond the adapter's reach. */
-static unsigned prds(struct port *p, uint8_t *table, const uint8_t *buf, unsigned bytes) {
+/* The PRDs for `count` segments in the slot's table (4.2.3.3), one for each: a segment is physically
+   contiguous, and a request's total is far below a PRD's 4 MiB (4.2.3.3). 0 when there are more than
+   the table holds, or one lies beyond the adapter's reach. */
+static unsigned prds(struct port *p, uint8_t *table, const struct blk_segment *segs, unsigned count) {
     uint32_t *prd = (uint32_t *)(table + PRDT_AT);
-    unsigned n = 0;
-    uint64_t va = (uint64_t)buf, end = 0;
-    while (bytes) {
-        unsigned run = (unsigned)MIN((uint64_t)bytes, PAGE_SIZE - (va & (PAGE_SIZE - 1)));
-        uint64_t pa = vmm_kernel_translate(va);
-        if (!pa || (!p->h->s64 && pa + run > 1ull << 32)) return 0;
-        uint32_t *last = &prd[4 * (n - 1)];
-        if (n && pa == end && (last[3] & 0x3FFFFF) + 1 + run <= PRD_MOST) {
-            last[3] += run;
-        } else {
-            if (n == PRDS) return 0;
-            uint32_t *e = &prd[4 * n++];
-            e[0] = (uint32_t)pa;
-            e[1] = (uint32_t)(pa >> 32);
-            e[2] = 0;
-            e[3] = run - 1; /* no interrupt of its own: the command's FIS ends it */
-        }
-        end = pa + run;
-        va += run;
-        bytes -= run;
+    if (count > PRDS) return 0;
+    for (unsigned i = 0; i < count; i++) {
+        uint64_t bus = hal_dma_address(p->h->hal, segs[i].phys);
+        if (!p->h->s64 && bus + segs[i].bytes > 1ull << 32) return 0;
+        uint32_t *e = &prd[4 * i];
+        e[0] = (uint32_t)bus;
+        e[1] = (uint32_t)(bus >> 32);
+        e[2] = 0;
+        e[3] = segs[i].bytes - 1; /* no interrupt of its own: the command's FIS ends it */
     }
-    return n;
+    return count;
 }
 
 /* An H2D register FIS (SATA 3.3, 10.5.6) for `command` on `count` sectors from `lba`. A queued
@@ -892,29 +927,36 @@ static void fis_make(uint8_t f[20], uint8_t command, uint64_t lba, unsigned coun
     }
 }
 
-/* One command with `bytes` at buf, given in the slot the caller entered with, and its end waited
-   for. 0; -1 when the disk reported an error, the adapter one of its own or the time ran out; -2
-   when buf cannot be described to the adapter. */
-static int command_in(struct port *p, int slot, const uint8_t fis[20], bool queued, bool write, const uint8_t *buf,
-                      unsigned bytes, uint64_t ns) {
-    uint32_t bit = 1u << slot;
-    uint64_t table_phys = p->mem_phys + TABLES_AT + (uint64_t)slot * TABLE_BYTES;
+/* The command table and list header of `slot` for the FIS and the PRDs of segs. False when the
+   segments cannot be described to the adapter. */
+static bool table_make(struct port *p, int slot, const uint8_t fis[20], bool queued, bool write,
+                       const struct blk_segment *segs, unsigned count) {
+    uint64_t table_bus = p->mem_bus + TABLES_AT + (uint64_t)slot * TABLE_BYTES;
     uint8_t *table = p->mem + TABLES_AT + (size_t)slot * TABLE_BYTES;
     memset(table, 0, PRDT_AT);
     memcpy(table, fis, 20);
     if (queued) table[12] = (uint8_t)(slot << 3); /* the tag is the slot (3.3.13) */
-    unsigned n = bytes ? prds(p, table, buf, bytes) : 0;
-    if (bytes && !n) {
-        kprintf("ahci%d: port %u: a buffer for command %02x is not mapped, or beyond the adapter's reach\n",
+    unsigned n = prds(p, table, segs, count);
+    if (count && !n) {
+        kprintf("ahci%d: port %u: the memory for command %02x has too many parts, or is beyond the adapter's reach\n",
                 p->h->index, p->no, fis[2]);
-        return -2;
+        return false;
     }
     uint32_t *hdr = (uint32_t *)(p->mem + LIST_AT) + 8 * slot;
     hdr[0] = 5u | (write ? 1u << 6 : 0) | n << 16; /* a 5-dword FIS, its direction, its PRDs */
     hdr[1] = 0;
-    hdr[2] = (uint32_t)table_phys;
-    hdr[3] = (uint32_t)(table_phys >> 32);
+    hdr[2] = (uint32_t)table_bus;
+    hdr[3] = (uint32_t)(table_bus >> 32);
+    return true;
+}
 
+/* One command with the data of `segs`, given in the slot the caller entered with, and its end waited
+   for. 0; -1 when the disk reported an error, the adapter one of its own or the time ran out; -2
+   when the segments cannot be described to the adapter. */
+static int command_in(struct port *p, int slot, const uint8_t fis[20], bool queued, bool write,
+                      const struct blk_segment *segs, unsigned count, uint64_t ns) {
+    uint32_t bit = 1u << slot;
+    if (!table_make(p, slot, fis, queued, write, segs, count)) return -2;
     struct slot *s = &p->slots[slot];
     uint64_t start = __atomic_load_n(&s->seq, __ATOMIC_ACQUIRE);
     uint64_t f = spin_lock(&p->lock);
@@ -974,8 +1016,8 @@ static int command_in(struct port *p, int slot, const uint8_t fis[20], bool queu
 
 /* A command for the disk: queued beside the others, or alone with the port to itself (a queued one
    alone: see transfer). As command_in; also -2 when the disk is not there, or not known to be. */
-static int command(struct disk *d, const uint8_t fis[20], bool queued, bool alone, bool write, const uint8_t *buf,
-                   unsigned bytes, uint64_t ns) {
+static int command(struct disk *d, const uint8_t fis[20], bool queued, bool alone, bool write,
+                   const struct blk_segment *segs, unsigned count, uint64_t ns) {
     struct port *p = d->p;
     if (__atomic_load_n(&d->blk.gone, __ATOMIC_ACQUIRE)) return -2;
     int slot = enter(p, alone, false);
@@ -983,29 +1025,113 @@ static int command(struct disk *d, const uint8_t fis[20], bool queued, bool alon
     /* with the slot held the adapter's thread cannot be looking at another disk there */
     int r = __atomic_load_n(&d->blk.gone, __ATOMIC_ACQUIRE)
                 ? -2
-                : command_in(p, slot, fis, queued, write, buf, bytes, ns);
+                : command_in(p, slot, fis, queued, write, segs, count, ns);
     leave(p, slot, alone);
     return r;
 }
 
-/* Read or write `n` logical blocks between the disk and buf (blk_by_blocks). When a queued command
-   fails, the disk may have aborted it for another's error, and which one failed would have to be
-   read from a log page: so it is given again alone, where a failure is its own, up to three times. */
-static int transfer(void *ctx, bool write, uint64_t lba, unsigned n, uint8_t *buf) {
-    struct disk *d = ctx;
-    uint8_t fis[20];
+/* The FIS of the request r for d: its read or write, queued where the disk has that. */
+static void request_fis(const struct disk *d, const struct blk_request *r, uint8_t fis[20]) {
+    bool write = r->op == BLK_WRITE;
     uint8_t op = d->ncq     ? (write ? ATA_WRITE_FPDMA_QUEUED : ATA_READ_FPDMA_QUEUED)
                  : d->lba48 ? (write ? ATA_WRITE_DMA_EXT : ATA_READ_DMA_EXT)
                             : (write ? ATA_WRITE_DMA : ATA_READ_DMA);
-    fis_make(fis, op, lba, n, d->lba48, d->ncq);
-    bool alone = !d->ncq;
-    for (int failed_alone = 0; failed_alone < 3;) {
-        int r = command(d, fis, d->ncq, alone, write, buf, n * d->block, IO_NS);
-        if (r != -1) return r ? -1 : 0;
-        if (alone) failed_alone++;
-        alone = true;
+    unsigned per = d->block / 512;
+    fis_make(fis, op, r->lba / per, r->sectors / per, d->lba48, d->ncq);
+}
+
+/* A slot of the live port for a queued command beside the others, if one is free this moment: the
+   port may not be set up, or have a caller waiting for it to itself, and then -1. */
+static int enter_more(struct port *p) {
+    int slot = -1;
+    uint64_t f = spin_lock(&p->lock);
+    if (!p->unverified && !p->sole && p->live && !p->wanting && (p->taken & p->all) != p->all) {
+        slot = __builtin_ctz(~p->taken & p->all);
+        p->taken |= 1u << slot;
     }
-    return -1;
+    spin_unlock(&p->lock, f);
+    return slot;
+}
+
+/* The commands of the slots in `mask`, each with its table and its request, given to the port at
+   once: PxSACT before PxCI (3.3.13). A port that is not live any more (an error since the slots were
+   taken) has them given to the disk's thread, which sets it up. */
+static void issue(struct port *p, uint32_t mask) {
+    uint64_t deadline = clock_after(IO_NS);
+    uint64_t f = spin_lock(&p->lock);
+    bool live = p->live;
+    if (live) {
+        for (uint32_t m = mask; m; m &= m - 1) {
+            struct slot *s = &p->slots[__builtin_ctz(m)];
+            struct disk *d = s->request->device->priv;
+            s->status = PENDING;
+            s->deadline = deadline;
+            if (s->request->op == BLK_WRITE) blk_write_given(&d->blk);
+        }
+        p->issued |= mask;
+        p->queued |= mask;
+        __atomic_add_fetch(&p->requests, (unsigned)__builtin_popcount(mask), __ATOMIC_ACQ_REL);
+        __atomic_add_fetch(&p->h->inflight, (unsigned)__builtin_popcount(mask), __ATOMIC_ACQ_REL);
+        __atomic_thread_fence(__ATOMIC_RELEASE); /* the tables and headers before the port sees them */
+        wr(p, PxSACT, mask);
+        wr(p, PxCI, mask);
+    }
+    spin_unlock(&p->lock, f);
+    if (live) return;
+    for (uint32_t m = mask; m; m &= m - 1) {
+        unsigned n = (unsigned)__builtin_ctz(m);
+        struct blk_request *r = __atomic_exchange_n(&p->slots[n].request, NULL, __ATOMIC_ACQ_REL);
+        leave(p, (int)n, false);
+        blk_serial_ops.submit(r->device, r);
+    }
+}
+
+/* The requests of a chain on a disk that takes queued commands: a slot each as the port has them,
+   and one issue for the ones taken together. Flushes, and what no slot is for, go to the disk's
+   thread, which does them alone. */
+static void ahci_submit(struct blkdev *b, struct blk_request *chain) {
+    struct disk *d = b->priv;
+    struct port *p = d->p;
+    uint32_t batch = 0;
+    while (chain) {
+        struct blk_request *r = chain;
+        int slot = -1;
+        if (r->op != BLK_PERSIST && !__atomic_load_n(&b->gone, __ATOMIC_ACQUIRE)) {
+            slot = batch ? enter_more(p) : enter(p, false, false);
+            if (slot < 0 && batch) { /* no slot more at the moment: these go, then the next waits for one */
+                issue(p, batch);
+                batch = 0;
+                continue;
+            }
+        }
+        chain = r->next;
+        r->next = NULL;
+        uint8_t fis[20];
+        request_fis(d, r, fis);
+        if (slot >= 0 && !table_make(p, slot, fis, true, r->op == BLK_WRITE, r->segments, r->segment_count)) {
+            leave(p, slot, false);
+            slot = -1;
+        }
+        if (slot < 0) {
+            blk_serial_ops.submit(b, r);
+            continue;
+        }
+        __atomic_store_n(&p->slots[slot].request, r, __ATOMIC_RELEASE);
+        batch |= 1u << slot;
+    }
+    if (batch) issue(p, batch);
+}
+
+static const struct blk_ops ahci_ops = {.submit = ahci_submit};
+
+/* r's data between the request's memory and the port's low buffer. */
+static void low_copy(uint8_t *low, const struct blk_request *r, bool into_low) {
+    for (uint32_t i = 0; i < r->segment_count; i++) {
+        uint8_t *memory = phys_to_virt(r->segments[i].phys);
+        if (into_low) memcpy(low, memory, r->segments[i].bytes);
+        else memcpy(memory, low, r->segments[i].bytes);
+        low += r->segments[i].bytes;
+    }
 }
 
 static int flush(struct disk *d) {
@@ -1014,66 +1140,58 @@ static int flush(struct disk *d) {
     return command(d, fis, false, true, false, NULL, 0, IO_NS);
 }
 
-/* 512-byte sectors on top of the disk's logical blocks: the caller's memory itself where the
-   request covers whole blocks of word aligned memory (a PRD's address is), else a bounce buffer of
-   its own; for an adapter that reaches only 4 GiB the port's buffer below it. */
-static int rw(struct disk *d, bool write, uint64_t lba, uint32_t count, uint8_t *buf) {
-    struct port *p = d->p;
-    if (p->low) {
-        mutex_lock(&p->low_lock);
-        int r = blk_by_blocks(&d->blk, write, lba, count, buf, p->low, d->most, false, transfer, d);
-        mutex_unlock(&p->low_lock);
-        return r;
-    }
-    unsigned per = d->block / 512, most = d->most;
-    bool direct = !((uint64_t)buf & 1), whole = !(lba % per) && !(count % per);
-    uint8_t *bounce = NULL;
-    if (!direct || !whole) {
-        size_t bytes = (size_t)MIN((uint64_t)most, (count + 2ull * per - 1) / per) * d->block;
-        if (!(bounce = kmalloc(bytes))) return -N_ERR_NO_MEMORY;
-        most = (unsigned)(bytes / d->block);
-    }
-    int r = blk_by_blocks(&d->blk, write, lba, count, buf, bounce, most, direct, transfer, d);
-    kfree(bounce);
-    return r;
-}
-
-static int blk_ahci_read(struct blkdev *b, uint64_t lba, uint32_t n, void *buf) { return rw(b->priv, false, lba, n, buf); }
-static int blk_ahci_write(struct blkdev *b, uint64_t lba, uint32_t n, const void *buf) {
-    return rw(b->priv, true, lba, n, (uint8_t *)buf);
-}
-
-/* FLUSH CACHE (EXT): the write cache reaches the medium, with every write that ended before it. A
-   disk's cache may come on or go off with its power: IDENTIFY says each time it is looked at (word 85). */
-static int blk_ahci_persist(struct blkdev *b) {
+/* The disk's thread: a request on its own. A queued command that failed was perhaps aborted for
+   another's error, and which one failed would have to be read from a log page: so it is given again
+   alone, where a failure is its own, up to three times. A flush (FLUSH CACHE) puts the write cache
+   on the medium, with every write that ended before it; a disk's cache may come on or go off with
+   its power, which IDENTIFY says each time it is looked at (word 85). On an adapter that reaches
+   only 4 GiB the data goes through the port's buffer below it. */
+static int transfer(struct blkdev *b, const struct blk_request *r) {
     struct disk *d = b->priv;
-    return __atomic_load_n(&d->cache, __ATOMIC_ACQUIRE) && flush(d) < 0 ? -N_ERR_IO : 0;
-}
-
-/* count contiguous pages the adapter reaches, on its node first. */
-static uint64_t alloc_dma(struct hba *h, unsigned count) {
-    if (!h->s64) return pmm_alloc_contig(count, 32);
-    int node = h->pci->node >= 0 ? h->pci->node : (int)topology.cpu[cpu_current_index()].node;
-    uint64_t phys = pmm_alloc_run(count, (unsigned)node);
-    return phys ? phys : pmm_alloc_contig(count, 64);
+    struct port *p = d->p;
+    if (r->op == BLK_PERSIST) return __atomic_load_n(&d->cache, __ATOMIC_ACQUIRE) && flush(d) < 0 ? -N_ERR_IO : 0;
+    bool write = r->op == BLK_WRITE;
+    unsigned bytes = r->sectors * 512;
+    struct blk_segment low = {p->low_phys, bytes};
+    const struct blk_segment *segs = r->segments;
+    unsigned count = r->segment_count;
+    if (p->low) {
+        if (write) low_copy(p->low, r, true);
+        segs = &low;
+        count = 1;
+    }
+    uint8_t fis[20];
+    request_fis(d, r, fis);
+    bool alone = !d->ncq;
+    for (int failed_alone = 0; failed_alone < 3;) {
+        int rc = command(d, fis, d->ncq, alone, write, segs, count, IO_NS);
+        if (rc != -1) {
+            if (rc) return -N_ERR_IO;
+            if (p->low && !write) low_copy(p->low, r, false);
+            return 0;
+        }
+        if (alone) failed_alone++;
+        alone = true;
+    }
+    return -N_ERR_IO;
 }
 
 /* IDENTIFY DEVICE (ACS-3 7.12): its size, sector size, commands, queue and write cache, in d. The
    caller has the port to itself, slot its own. *again: it did not answer, or there was no memory,
    and it may yet be a disk. */
 static bool identify(struct port *p, int slot, struct disk *d, char model[41], bool *again) {
-    uint64_t page = alloc_dma(p->h, 1);
-    if (!page) {
+    uint64_t bus;
+    uint16_t *id = hal_dma_alloc(p->h->hal, PAGE_SIZE, p->h->s64 ? 0 : 32, &bus);
+    if (!id) {
         *again = true;
         return false;
     }
-    const uint16_t *id = phys_to_virt(page);
     uint8_t fis[20];
     fis_make(fis, ATA_IDENTIFY, 0, 0, false, false);
     fis[7] = 0;
-    memset((void *)id, 0, 512);
-    if (command_in(p, slot, fis, false, false, (const uint8_t *)id, 512, IO_NS)) {
-        pmm_free(page);
+    const struct blk_segment page = {bus - p->h->hal->dma_offset, 512};
+    if (command_in(p, slot, fis, false, false, &page, 1, IO_NS)) {
+        hal_dma_free(p->h->hal, id);
         *again = true;
         return false;
     }
@@ -1096,7 +1214,7 @@ static bool identify(struct port *p, int slot, struct disk *d, char model[41], b
     d->ncq = p->h->sncq && d->lba48 && id[76] != 0xFFFF && (id[76] >> 8 & 1);
     unsigned depth = d->ncq ? MIN(p->h->nslots, (id[75] & 0x1Fu) + 1) : 1;
     d->all = depth == 32 ? 0xFFFFFFFFu : (1u << depth) - 1;
-    pmm_free(page);
+    hal_dma_free(p->h->hal, id);
     if (d->block < 512 || d->block > 4096 || (d->block & (d->block - 1)) || !sectors) {
         kprintf("ahci%d: port %u: %s has %u-byte sectors, skipped\n", p->h->index, p->no, model, d->block);
         return false;
@@ -1114,13 +1232,11 @@ static void port_add(struct hba *h, unsigned no) {
     p->regs = h->regs + 0x100 + 0x80 * no;
     p->all = 1;
     p->pages = (unsigned)(ALIGN_UP(TABLES_AT + (uint64_t)h->nslots * TABLE_BYTES, PAGE_SIZE) / PAGE_SIZE);
-    if (!(p->mem_phys = alloc_dma(h, p->pages))) {
+    if (!(p->mem = hal_dma_alloc(h->hal, (size_t)p->pages * PAGE_SIZE, h->s64 ? 0 : 32, &p->mem_bus))) {
         kprintf("ahci%d: port %u: no memory %sfor its commands\n", h->index, no, h->s64 ? "" : "below 4 GiB ");
         kfree(p);
         return;
     }
-    p->mem = phys_to_virt(p->mem_phys);
-    memset(p->mem, 0, (size_t)p->pages * PAGE_SIZE);
     h->ports[no] = p;
 }
 
@@ -1129,7 +1245,7 @@ static bool same_disk(const struct disk *a, const struct disk *b) {
 }
 
 static void port_looked(struct port *p) {
-    if (__atomic_exchange_n(&p->looking, false, __ATOMIC_ACQ_REL)) blk_looking_end();
+    if (__atomic_exchange_n(&p->looking, false, __ATOMIC_ACQ_REL)) hal_looking_end();
 }
 
 /* Who is on the port now: reset, and asked. A disk it knew goes on if it is the one there; the one it
@@ -1163,8 +1279,9 @@ static void port_examine(struct port *p) {
                      sig == 0xEB140101u ? "an ATAPI drive" : sig == 0x96690101u ? "a port multiplier" : "not a disk");
     }
     if (is_disk && !h->s64 && !p->low) {
-        if ((p->low_phys = alloc_dma(h, XFER_PAGES))) {
-            p->low = phys_to_virt(p->low_phys);
+        uint64_t bus;
+        if ((p->low = hal_dma_alloc(h->hal, XFER_PAGES * PAGE_SIZE, 32, &bus))) {
+            p->low_phys = bus - h->hal->dma_offset;
         } else {
             kprintf("ahci%d: port %u: no memory below 4 GiB for its transfers\n", h->index, p->no);
             is_disk = false;
@@ -1218,17 +1335,20 @@ static void port_examine(struct port *p) {
     ksnprintf(found->blk.name, sizeof found->blk.name, "sata%d.%u", h->index, p->no);
     strlcpy(found->blk.model, model, sizeof found->blk.model);
     found->blk.block = found->block;
-    found->blk.read = blk_ahci_read;
-    found->blk.write = blk_ahci_write;
-    found->blk.persist = blk_ahci_persist;
+    found->blk.max_sectors = found->most * found->block / 512;
+    found->blk.max_segments = PRDS;
+    found->blk.segment_align = 2; /* a PRD's address and byte count are even (4.2.3.3) */
+    found->blk.has_cache = true;  /* whether its cache is on is IDENTIFY's word at each look (transfer) */
     found->blk.priv = found;
+    blk_serial_start(&found->blk, transfer);
+    if (found->ncq && h->s64) found->blk.ops = &ahci_ops;
     const char *cache = found->cache ? "" : ", no write cache now";
     if (found->ncq)
         kprintf("ahci%d: port %u: %s, %u queued commands at once%s\n", h->index, p->no, model,
                 (unsigned)__builtin_popcount(found->all), cache);
     else
         kprintf("ahci%d: port %u: %s, one command at a time%s\n", h->index, p->no, model, cache);
-    blk_register(&found->blk);
+    blk_register(h->hal, &found->blk);
     port_looked(p);
 }
 
@@ -1254,14 +1374,13 @@ static int start(struct hba *h);
    disks, as the adapter's thread does. */
 static void first_look(void *arg) {
     struct port *p = arg;
-    blk_busy_begin();
+    hal_busy_begin();
     mutex_lock(&p->examining);
     port_examine(p);
     mutex_unlock(&p->examining);
-    blk_busy_end();
+    hal_busy_end();
     /* its retry time is for the adapter's thread to see */
-    __atomic_add_fetch(&p->h->kicks, 1, __ATOMIC_RELEASE);
-    wq_wake_all(&p->h->wq);
+    hba_kick(p->h);
 }
 
 static void first_looks(struct hba *h) {
@@ -1271,76 +1390,85 @@ static void first_looks(struct hba *h) {
         char name[24];
         ksnprintf(name, sizeof name, "ahci%d.%u", h->index, n);
         p->looking = true;
-        blk_looking_begin();
-        if (!kthread_create(name, first_look, p)) hba_note(h, n); /* for the adapter's thread, in its turn */
+        hal_looking_begin();
+        if (!kthread_create(name, first_look, p)) {
+            port_looked(p);
+            hba_note(h, n); /* for the adapter's thread, in its turn */
+        }
     }
 }
 
-/* The adapter's thread. What it does counts as a request of the disks (blk_busy_begin): a power
+/* The slots of p's requests that have had their time: the engines are stopped for them (halt). */
+static void requests_late(struct port *p) {
+    if (!__atomic_load_n(&p->requests, __ATOMIC_ACQUIRE)) return;
+    uint64_t now = clock_now_ns();
+    uint32_t late = 0;
+    uint64_t f = spin_lock(&p->lock);
+    for (uint32_t m = p->issued; m; m &= m - 1) {
+        struct slot *s = &p->slots[__builtin_ctz(m)];
+        if (__atomic_load_n(&s->request, __ATOMIC_ACQUIRE) && s->deadline <= now) late |= 1u << __builtin_ctz(m);
+    }
+    spin_unlock(&p->lock, f);
+    if (late) kprintf("ahci%d: port %u: a command timed out\n", p->h->index, p->no);
+    if (late || __atomic_load_n(&p->attention, __ATOMIC_ACQUIRE)) halt(p, late ? late : 0xFFFFFFFFu);
+}
+
+/* The adapter's thread. What it does counts as a request of the disks (hal_busy_begin): a power
    change waits for it, and it waits for that. It looks again at the ports whose devices did not
-   answer, once their time comes. Polled, it looks at the links itself each second. Of the ports to
-   look at, the next is one where a device shows: an empty one takes its COMRESET's whole time, and a
-   disk's callers are waiting. It starts the adapter first: all of that can take seconds, the
-   firmware's handover and a staggered spin-up, and no disk elsewhere waits for that. */
+   answer, once their time comes. Polled, it reads the completions itself each millisecond while
+   requests are out, and looks at the links each second. A port that went on through an error with
+   requests in it, and a request that is late, are stopped here, the requests having no waiter of
+   their own. Of the ports to look at, the next is one where a device shows: an empty one takes its
+   COMRESET's whole time, and a disk's callers are waiting. */
 static void ahci_worker(void *arg) {
     struct hba *h = arg;
-    blk_busy_begin();
-    int r = start(h);
-    blk_busy_end();
-    if (r < 0) hal_failed(&h->pci->hal, ahci_driver.name, r);
-    else first_looks(h);
-    blk_looking_end();
-    if (r < 0) return;
-    for (;;) {
+    while (!__atomic_load_n(&h->stopping, __ATOMIC_ACQUIRE)) {
         uint64_t seen = __atomic_load_n(&h->kicks, __ATOMIC_ACQUIRE);
-        uint64_t now = clock_now_ns(), next = h->irq ? CLOCK_NEVER : now + NS_PER_S;
+        uint64_t now = clock_now_ns();
+        bool out = __atomic_load_n(&h->inflight, __ATOMIC_ACQUIRE);
+        uint64_t next = !out ? (h->irq ? CLOCK_NEVER : now + NS_PER_S) : now + (h->irq ? TICK_NS : NS_PER_MS);
         uint32_t changed = __atomic_exchange_n(&h->changed, 0, __ATOMIC_ACQ_REL);
         if (__atomic_exchange_n(&h->look_all, false, __ATOMIC_ACQ_REL)) changed = h->implemented;
+        hal_busy_begin();
         for (unsigned n = 0; n < PORTS; n++) {
             struct port *p = h->ports[n];
             if (!p) continue;
             if (!h->irq) reap(p);
+            requests_late(p);
             uint64_t retry_at = __atomic_load_n(&p->retry_at, __ATOMIC_ACQUIRE);
             if (!retry_at) continue;
             if (now >= retry_at) changed |= 1u << n;
             else next = MIN(next, retry_at);
         }
         changed &= h->implemented;
-        if (!changed) {
-            wq_wait_unless(&h->wq, &h->kicks, seen, next);
-            continue;
-        }
-        blk_busy_begin();
-        bool held = hba_lock(h);
-        hba_ready(h);
-        hba_unlock(h, held);
-        while (changed) {
-            unsigned pick = (unsigned)__builtin_ctz(changed);
-            for (uint32_t m = changed; m; m &= m - 1) {
-                struct port *p = h->ports[__builtin_ctz(m)];
-                if (p && rd(p, PxSSTS) & DET_FOUND) {
-                    pick = (unsigned)__builtin_ctz(m);
-                    break;
+        if (changed) {
+            bool held = hba_lock(h);
+            hba_ready(h);
+            hba_unlock(h, held);
+            while (changed) {
+                unsigned pick = (unsigned)__builtin_ctz(changed);
+                for (uint32_t m = changed; m; m &= m - 1) {
+                    struct port *p = h->ports[__builtin_ctz(m)];
+                    if (p && rd(p, PxSSTS) & DET_FOUND) {
+                        pick = (unsigned)__builtin_ctz(m);
+                        break;
+                    }
                 }
+                changed &= ~(1u << pick);
+                if (h->ports[pick]) port_changed(h->ports[pick]);
             }
-            changed &= ~(1u << pick);
-            if (h->ports[pick]) port_changed(h->ports[pick]);
         }
-        blk_busy_end();
+        hal_busy_end();
+        if (!changed) wq_wait_unless(&h->wq, &h->kicks, seen, next);
     }
 }
 
 static int start(struct hba *h) {
     struct pci_device *pci = h->pci;
-    uint64_t base = pci_bar_address(pci, 5);
-    if (!base) {
+    h->regs = hal_map(h->hal, 5); /* the adapter's registers and those of every port */
+    if (!h->regs) {
         kprintf("ahci%d: no register window\n", h->index);
         return -N_ERR_NOT_FOUND;
-    }
-    h->regs = vmm_map_mmio(base, 0x100 + 0x80 * PORTS); /* the adapter's registers and those of every port */
-    if (!h->regs) {
-        kprintf("ahci%d: no memory to map its registers\n", h->index);
-        return -N_ERR_NO_MEMORY;
     }
     hba_take(h);
     uint32_t cap = hba_rd(h, CAP);
@@ -1354,9 +1482,10 @@ static int start(struct hba *h) {
     h->nslots = (cap >> 8 & 0x1F) + 1;
     for (uint32_t m = h->implemented; m; m &= m - 1) port_add(h, (unsigned)__builtin_ctz(m));
     hba_wr(h, GHC, hba_rd(h, GHC) & ~GHC_IE); /* until PxIS and IS are clear */
-    pci_irq_enable(pci, &(struct irq_spec){.name = "AHCI", .handler = ahci_isr, .context = h, .node = pci->node}, 1, &h->irq);
+    hal_irq_enable(h->hal, &(struct irq_spec){.name = "AHCI", .handler = ahci_isr, .context = h, .node = h->hal->node}, 1,
+                   &h->irq);
     kprintf("ahci%d: %04x:%04x, version %x, ports %x, %u slots%s, %s\n", h->index, pci->vendor, pci->device,
-            hba_rd(h, VS), h->implemented, h->nslots, h->sncq ? ", queued commands" : "", h->irq ? "MSI" : "polled");
+            hba_rd(h, VS), h->implemented, h->nslots, h->sncq ? ", queued commands" : "", h->irq ? "interrupts" : "polled");
     mutex_lock(&h->reset);
     bool up = hba_set_up(h, false);
     mutex_unlock(&h->reset);
@@ -1393,81 +1522,111 @@ static void port_to_listen(struct port *p) {
    no DMA after this. Interrupts are already off, and blk_hold let no request in. A disk that is gone
    and a dead adapter hold nothing that could be kept. An adapter reset on the way leaves every port
    unverified, so no later port is set up again, or given a command. */
-static bool ahci_quiesce(void *arg) {
-    (void)arg;
+static bool ahci_quiesce(struct hal_device *d) {
+    struct hba *h = d->driver_data;
     bool all = true;
-    for (struct hba *h = hbas; h; h = h->next)
-        for (unsigned n = 0; n < PORTS; n++) {
-            struct port *p = h->ports[n];
-            if (!p || __atomic_load_n(&h->dead, __ATOMIC_ACQUIRE)) continue;
-            struct disk *d = p->disk;
-            if (d && !__atomic_load_n(&d->blk.gone, __ATOMIC_ACQUIRE)) {
-                uint8_t fis[20];
-                fis_make(fis, ATA_STANDBY_IMMEDIATE, 0, 0, false, false);
-                fis[7] = 0;
-                if ((__atomic_load_n(&d->cache, __ATOMIC_ACQUIRE) && flush(d)) || command(d, fis, false, true, false, NULL, 0, READY_NS)) all = false;
-                else port_to_slumber(p);
-            }
-            if (port_stop(p)) {
-                port_to_listen(p);
-            } else {
-                port_force_stop(p);
+    for (unsigned n = 0; n < PORTS; n++) {
+        struct port *p = h->ports[n];
+        if (!p || __atomic_load_n(&h->dead, __ATOMIC_ACQUIRE)) continue;
+        struct disk *disk = p->disk;
+        if (disk && !__atomic_load_n(&disk->blk.gone, __ATOMIC_ACQUIRE)) {
+            uint8_t fis[20];
+            fis_make(fis, ATA_STANDBY_IMMEDIATE, 0, 0, false, false);
+            fis[7] = 0;
+            if ((__atomic_load_n(&disk->cache, __ATOMIC_ACQUIRE) && flush(disk)) ||
+                command(disk, fis, false, true, false, NULL, 0, READY_NS))
                 all = false;
-            }
-            uint64_t f = spin_lock(&p->lock);
-            p->live = false;
-            p->need_reset = true;
-            spin_unlock(&p->lock, f);
+            else
+                port_to_slumber(p);
         }
+        if (port_stop(p)) {
+            port_to_listen(p);
+        } else {
+            port_force_stop(p);
+            all = false;
+        }
+        uint64_t f = spin_lock(&p->lock);
+        p->live = false;
+        p->need_reset = true;
+        spin_unlock(&p->lock, f);
+    }
     return all;
 }
 
 /* After a sleep the adapter has lost its state, the firmware may own it again, and the disks may have
    changed. All of that takes waiting, and resume must not wait: the next command, or the adapter's
    thread, sets it up again (hba_set_up in port_start). */
-static bool ahci_resume(void *arg) {
-    (void)arg;
-    for (struct hba *h = hbas; h; h = h->next) {
-        if (!h->regs) continue;
-        __atomic_store_n(&h->lost, true, __ATOMIC_RELEASE);
-        for (unsigned n = 0; n < PORTS; n++) {
-            struct port *p = h->ports[n];
-            if (!p) continue;
-            uint64_t f = spin_lock(&p->lock);
-            p->unverified = true;
-            spin_unlock(&p->lock, f);
-        }
-        hba_look_all(h);
+static bool ahci_resume(struct hal_device *d) {
+    struct hba *h = d->driver_data;
+    if (!h->regs) return true;
+    __atomic_store_n(&h->lost, true, __ATOMIC_RELEASE);
+    for (unsigned n = 0; n < PORTS; n++) {
+        struct port *p = h->ports[n];
+        if (!p) continue;
+        uint64_t f = spin_lock(&p->lock);
+        p->unverified = true;
+        spin_unlock(&p->lock, f);
     }
+    hba_look_all(h);
     return true;
 }
 
-static struct pm_device ahci_pm = {.name = "ahci", .stage = PM_STAGE_STORAGE, .quiesce = ahci_quiesce,
-                                   .resume = ahci_resume};
-
-static int ahci_attach(struct pci_device *p) {
+static int ahci_attach(struct hal_device *d) {
     struct hba *h = kzalloc(sizeof *h);
     if (!h) {
-        kprintf("ahci: no memory for the adapter at %04x:%04x\n", p->vendor, p->device);
+        kprintf("ahci: no memory for the adapter at %s\n", d->location);
         return -N_ERR_NO_MEMORY;
     }
-    h->index = nhbas++;
-    h->pci = p;
-    struct hba **tail = &hbas;
-    while (*tail) tail = &(*tail)->next;
-    *tail = h;
-    if (!h->index) pm_register(&ahci_pm);
-    pci_enable_busmaster(p);
-    blk_looking_begin();
+    h->index = __atomic_fetch_add(&nhbas, 1, __ATOMIC_ACQ_REL);
+    h->hal = d;
+    h->pci = pci_device_of(d);
+    d->driver_data = h;
     char name[16];
     ksnprintf(name, sizeof name, "ahci%d", h->index);
     if (!kthread_create(name, ahci_worker, h)) {
-        kprintf("ahci%d: no thread to start it\n", h->index);
-        blk_looking_end();
+        kprintf("ahci%d: no thread for it\n", h->index);
         return -N_ERR_NO_MEMORY;
     }
+    hal_enable(d, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA);
+    /* the firmware's handover and a staggered spin-up can take seconds: this thread is the device's own */
+    hal_busy_begin();
+    int r = start(h);
+    hal_busy_end();
+    if (r < 0) {
+        __atomic_store_n(&h->stopping, true, __ATOMIC_RELEASE);
+        hba_kick(h);
+        return r;
+    }
+    first_looks(h);
     return 0;
 }
 
-static const struct n_pci_match ahci_matches[] = {N_PCI_CLASS_PROGIF(0x01, 0x06, 0x01)};
-const struct pci_driver ahci_driver = {"ahci", ahci_matches, ARRAY_SIZE(ahci_matches), ahci_attach};
+/* The adapter leaves, or is given to a program: its ports stopped, so nothing moves any more, and
+   every command in them failed. The disks stay listed, gone; their threads stay, and fail what
+   still reaches them. */
+static void ahci_detach(struct hal_device *d) {
+    struct hba *h = d->driver_data;
+    __atomic_store_n(&h->dead, true, __ATOMIC_RELEASE);
+    __atomic_store_n(&h->stopping, true, __ATOMIC_RELEASE);
+    hba_kick(h);
+    for (unsigned n = 0; n < PORTS; n++) {
+        struct port *p = h->ports[n];
+        if (!p) continue;
+        for (struct disk *disk = __atomic_load_n(&p->disks, __ATOMIC_ACQUIRE); disk; disk = disk->older)
+            __atomic_store_n(&disk->blk.gone, true, __ATOMIC_RELEASE);
+        if (!port_stop(p)) port_force_stop(p);
+        port_fail_all(p);
+    }
+}
+
+static const struct n_hal_rule ahci_rules[] = {N_PCI_CLASS_PROGIF(0x01, 0x06, 0x01)};
+static const struct hal_driver ahci_driver = {
+    .name = "ahci",
+    .rules = ahci_rules,
+    .rule_count = ARRAY_SIZE(ahci_rules),
+    .attach = ahci_attach,
+    .detach = ahci_detach,
+    .quiesce = ahci_quiesce,
+    .resume = ahci_resume,
+};
+HAL_DRIVER(ahci_driver);

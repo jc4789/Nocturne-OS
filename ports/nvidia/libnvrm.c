@@ -36,11 +36,11 @@ struct nvrm {
     uint64_t hello_capabilities;
 };
 
-int64_t nvrm_connect_device_status(uint32_t pci_target, struct nvrm **out) {
+int64_t nvrm_connect_device_status(uint32_t device, struct nvrm **out) {
     if (!out) return -N_ERR_INVALID;
     *out = NULL;
     char channel[NVRM_CHANNEL_NAME_BYTES];
-    snprintf(channel, sizeof channel, NVRM_CHANNEL_FORMAT, (unsigned)pci_target);
+    snprintf(channel, sizeof channel, NVRM_CHANNEL_FORMAT, (unsigned)device);
     struct nvrm *rm = calloc(1, sizeof *rm);
     if (!rm) return -N_ERR_NO_MEMORY;
     n_result result;
@@ -81,9 +81,9 @@ fail:
     return result;
 }
 
-struct nvrm *nvrm_connect_device(uint32_t pci_target) {
+struct nvrm *nvrm_connect_device(uint32_t device) {
     struct nvrm *rm = NULL;
-    nvrm_connect_device_status(pci_target, &rm);
+    nvrm_connect_device_status(device, &rm);
     return rm;
 }
 
@@ -96,27 +96,15 @@ bool nvrm_device_ready(const struct nvrm *rm) {
    there is none (nvrm.h, nvrm_connect_ready_status). */
 static int64_t connect_any(bool ready_only, struct nvrm **out) {
     *out = NULL;
-    /* pcilist fills the supplied capacity. Grow until the complete snapshot fits,
-       rather than truncating the set of GPUs to a driver-specific constant. */
-    struct n_pciinfo *list = NULL;
-    size_t capacity = 1;
-    n_result count;
-    for (;;) {
-        if (capacity > INT_MAX || capacity > SIZE_MAX / sizeof *list) { free(list); return -N_ERR_NO_MEMORY; }
-        struct n_pciinfo *grown = realloc(list, capacity * sizeof *list);
-        if (!grown) { free(list); return -N_ERR_NO_MEMORY; }
-        list = grown;
-        count = pcilist(list, (int)capacity);
-        if (count < 0) { free(list); return count; }
-        if ((size_t)count < capacity) break;
-        if (capacity > INT_MAX / 2) { free(list); return -N_ERR_NO_MEMORY; }
-        capacity *= 2;
-    }
+    struct n_hal_snapshot ledger;
+    n_result count = n_hal_snapshot(&ledger);
+    if (count < 0) return count;
     int64_t why = -N_ERR_NOT_FOUND;
-    for (n_result i = 0; i < count && !*out; i++) {
-        if (!nvrm_pci_is_gpu(list[i].vendor, list[i].cls, list[i].subcls, list[i].progif)) continue;
+    const struct n_hal_device *device = ledger.first;
+    for (uint32_t i = 0; i < ledger.count && !*out; i++, device = n_hal_device_next(device)) {
+        if (!nvrm_is_gpu(device)) continue;
         struct nvrm *rm;
-        int64_t result = nvrm_connect_device_status(N_PCI_TARGET(list[i].segment, list[i].bus, list[i].dev, list[i].func), &rm);
+        int64_t result = nvrm_connect_device_status(device->id, &rm);
         if (result >= 0 && ready_only && !nvrm_device_ready(rm)) {
             nvrm_disconnect(rm);
             result = -N_ERR_NOT_READY;
@@ -124,7 +112,7 @@ static int64_t connect_any(bool ready_only, struct nvrm **out) {
         if (result >= 0) *out = rm;
         else if (why == -N_ERR_NOT_FOUND) why = result;
     }
-    free(list);
+    free((void *)ledger.first);
     return *out ? 0 : why;
 }
 

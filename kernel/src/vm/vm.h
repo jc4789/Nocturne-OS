@@ -4,7 +4,7 @@
    firmware, and every entry below returns at once without touching a port, a register or a
    device. The rest of the kernel reaches VM code only through these entries; the hypervisor
    interface (vm/hyperv.c), the VMBus devices (vm/hv/), the enhanced session (vm/rdp.c) and the
-   drivers of devices that only emulators provide (vm/devices.h) stay behind them. A VM's needs
+   drivers of devices that only emulators provide (their `struct hal_driver`, added by vm_init) stay behind them. A VM's needs
    never decide how real hardware is driven. */
 #pragma once
 #include <stdbool.h>

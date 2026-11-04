@@ -1,16 +1,13 @@
 /* Intel 8254x "e1000" network driver (QEMU's default NIC, also VirtualBox and VMware). */
 #include "kernel.h"
-#include "vm/devices.h"
 #include "net/net.h"
 #include "sys/clock.h"
 #include "arch/cpu.h"
 #include "arch/irq.h"
 #include "arch/spin.h"
-#include "dev/acpi.h"
 #include "dev/pci.h"
-#include "dev/pm.h"
-#include "mm/pmm.h"
-#include "mm/vmm.h"
+#include "hal/hal.h"
+#include "mm/heap.h"
 
 #define REG_CTRL   0x0000
 #define REG_EERD   0x0014
@@ -63,39 +60,42 @@ struct tx_desc {
     uint16_t special;
 } PACKED;
 
-/* Each descriptor ring owns one physical page: 256 legacy descriptors. This
-   satisfies the hardware's 16-byte base and 128-byte ring-length alignment;
-   packet buffering is backed by these DMA descriptors, not another RX queue. */
+/* Each descriptor ring owns one page: 256 legacy descriptors. This satisfies the hardware's
+   16-byte base and 128-byte ring-length alignment; packet buffering is backed by these DMA
+   descriptors, not another RX queue. */
 #define NRX (PAGE_SIZE / sizeof(struct rx_desc))
 #define NTX (PAGE_SIZE / sizeof(struct tx_desc))
-#define BUFS_PER_PAGE (PAGE_SIZE / BUFSZ)
 _Static_assert(sizeof(struct rx_desc) == 16 && sizeof(struct tx_desc) == 16, "e1000 descriptor ABI");
-_Static_assert(PAGE_SIZE % 128 == 0 && PAGE_SIZE % BUFSZ == 0, "e1000 DMA alignment");
+_Static_assert(PAGE_SIZE % 128 == 0, "e1000 DMA alignment");
 
-/* The receive ring belongs to the net thread (poll_rx, rx_pending), the transmit ring to send,
-   which the stack calls one at a time. The interrupt handler and poll_rx, each on any CPU,
+/* The receive ring belongs to the net thread (poll, rx_pending), the transmit ring to transmit,
+   which the stack calls one at a time. The interrupt handler and poll, each on any CPU,
    share the receive interrupt mask and rx_irq_pending: e1000_lock, a leaf under the stack's
    net_lock, guards them; net_rx_notify comes after it is given back. A power change runs
    alone (every other CPU halted). */
-static volatile uint8_t *mmio;
-static volatile struct rx_desc *rx;
-static volatile struct tx_desc *tx;
-static uint8_t *rxbuf[NRX], *txbuf[NTX];
-static int rx_cur, tx_cur, tx_clean;
-static struct spinlock e1000_lock;
-static volatile bool rx_irq_pending;
-static bool new_eerd; /* 82574-style EERD layout */
-static struct netif nif = {.driver = "e1000"};
+struct e1000 {
+    struct netif nif; /* first: self is the device */
+    volatile uint8_t *mmio;
+    volatile struct rx_desc *rx;
+    volatile struct tx_desc *tx;
+    uint8_t *rxbuf[NRX], *txbuf[NTX];
+    uint64_t rx_ring_bus, tx_ring_bus;
+    unsigned rx_cur, tx_cur, tx_clean;
+    struct spinlock e1000_lock;
+    volatile bool rx_irq_pending;
+    bool new_eerd;      /* 82574-style EERD layout */
+    uint32_t itr_ticks; /* 0: the 82544GC/EI, which has no ITR */
+};
 
-static uint32_t rd(uint32_t r) { return mmio_read32(mmio + r); }
-static void wr(uint32_t r, uint32_t v) { mmio_write32(mmio + r, v); }
+static uint32_t rd(struct e1000 *c, uint32_t r) { return mmio_read32(c->mmio + r); }
+static void wr(struct e1000 *c, uint32_t r, uint32_t v) { mmio_write32(c->mmio + r, v); }
 
-static uint16_t eeprom_read(uint8_t addr) {
-    if (new_eerd) wr(REG_EERD, 1 | ((uint32_t)addr << 2));
-    else wr(REG_EERD, 1 | ((uint32_t)addr << 8));
-    uint32_t done = new_eerd ? 2 : 16;
+static uint16_t eeprom_read(struct e1000 *c, uint8_t addr) {
+    if (c->new_eerd) wr(c, REG_EERD, 1 | ((uint32_t)addr << 2));
+    else wr(c, REG_EERD, 1 | ((uint32_t)addr << 8));
+    uint32_t done = c->new_eerd ? 2 : 16;
     for (int i = 0; i < 100000; i++) {
-        uint32_t v = rd(REG_EERD);
+        uint32_t v = rd(c, REG_EERD);
         if (v & done) return (uint16_t)(v >> 16);
         pause();
     }
@@ -103,83 +103,98 @@ static uint16_t eeprom_read(uint8_t addr) {
 }
 
 static enum irq_result e1000_irq(void *context) {
-    (void)context;
-    spin_take(&e1000_lock);
-    uint32_t icr = rd(REG_ICR); /* reading acknowledges */
+    struct e1000 *c = context;
+    spin_take(&c->e1000_lock);
+    uint32_t icr = rd(c, REG_ICR); /* reading acknowledges */
     if (icr) {
         /* DMA ownership remains with the driver until the net thread has consumed
            the frame. Suppress RX interrupts while that thread drains the ring. */
-        if (icr & RX_IRQS) wr(REG_IMC, RX_IRQS);
-        rx_irq_pending = true;
+        if (icr & RX_IRQS) wr(c, REG_IMC, RX_IRQS);
+        c->rx_irq_pending = true;
     }
-    spin_give(&e1000_lock);
+    spin_give(&c->e1000_lock);
     if (icr) net_rx_notify();
     return icr ? IRQ_HANDLED : IRQ_NONE; /* its INTx line may be shared */
 }
 
-static bool e1000_rx_pending(struct netif *self) {
-    (void)self;
-    return rx_irq_pending || (rx[rx_cur].status & DESC_DD);
+static bool e1000_rx_pending(struct netif *self, unsigned queue) {
+    (void)queue;
+    struct e1000 *c = (struct e1000 *)self;
+    return c->rx_irq_pending || (c->rx[c->rx_cur].status & DESC_DD);
 }
 
-static size_t e1000_poll_rx(struct netif *self, void (*input)(struct netif *, const void *, size_t)) {
-    wr(REG_IMC, RX_IRQS);
+static size_t e1000_poll(struct netif *self, unsigned queue, size_t budget, net_input_fn input) {
+    (void)queue;
+    struct e1000 *c = (struct e1000 *)self;
+    wr(c, REG_IMC, RX_IRQS);
     size_t consumed = 0;
     int returned = -1;
     /* Return ownership only after this drain, so hardware cannot refill the
-       descriptors consumed here until the single RDT write below. One ring
-       is a finite poll bound; the net thread applies its service time/byte
-       budget between polls without extra tail writes for small batches. */
-    while (consumed < NRX && (rx[rx_cur].status & DESC_DD)) {
+       descriptors consumed here until the single RDT write below. */
+    while (consumed < budget && (c->rx[c->rx_cur].status & DESC_DD)) {
         /* x86 coherent DMA writes the packet before DD. Prevent the compiler
            from moving the packet read ahead of the volatile ownership check. */
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        uint16_t len = rx[rx_cur].len;
-        if ((rx[rx_cur].status & RX_EOP) && !rx[rx_cur].errors && len <= BUFSZ)
-            input(self, rxbuf[rx_cur], len);
-        rx[rx_cur].status = 0;
-        returned = rx_cur;
-        rx_cur = (rx_cur + 1) % NRX;
+        uint16_t len = c->rx[c->rx_cur].len;
+        if ((c->rx[c->rx_cur].status & RX_EOP) && !c->rx[c->rx_cur].errors && len <= BUFSZ)
+            input(self, c->rxbuf[c->rx_cur], len, 0);
+        c->rx[c->rx_cur].status = 0;
+        returned = (int)c->rx_cur;
+        c->rx_cur = (c->rx_cur + 1) % NRX;
         consumed++;
     }
-    uint64_t flags = spin_lock(&e1000_lock);
-    rx_irq_pending = false;
+    uint64_t flags = spin_lock(&c->e1000_lock);
+    c->rx_irq_pending = false;
     if (returned >= 0) {
         __atomic_thread_fence(__ATOMIC_RELEASE);
-        wr(REG_RDT, (uint32_t)returned); /* one tail write for the whole drain */
+        wr(c, REG_RDT, (uint32_t)returned); /* one tail write for the whole drain */
     }
-    wr(REG_IMS, RX_IRQS);
+    wr(c, REG_IMS, RX_IRQS);
     /* A packet may arrive between the empty check and rearming. Never wait
        for a fresh edge if its descriptor is already visible. */
-    bool again = rx[rx_cur].status & DESC_DD;
+    bool again = c->rx[c->rx_cur].status & DESC_DD;
     if (again) {
-        wr(REG_IMC, RX_IRQS);
-        rx_irq_pending = true;
+        wr(c, REG_IMC, RX_IRQS);
+        c->rx_irq_pending = true;
     }
-    spin_unlock(&e1000_lock, flags);
+    spin_unlock(&c->e1000_lock, flags);
     if (again) net_rx_notify();
     return consumed;
 }
 
-static int e1000_send(struct netif *self, const void *frame, size_t len) {
-    (void)self;
-    if (len > BUFSZ) return -N_ERR_INVALID;
-    while (tx_clean != tx_cur && (tx[tx_clean].status & DESC_DD))
-        tx_clean = (tx_clean + 1) % NTX;
-    int next = (tx_cur + 1) % NTX;
-    volatile struct tx_desc *d = &tx[tx_cur];
-    /* TDH == TDT denotes an empty hardware ring, so retain one descriptor to
-       distinguish full from empty even before DMA has completed any send. */
-    if (next == tx_clean || !(d->status & DESC_DD))
-        return -N_ERR_NOT_READY; /* local backpressure, not a packet lost on the wire */
-    memcpy(txbuf[tx_cur], frame, len);
-    d->len = (uint16_t)len;
-    d->cmd = 0x0B; /* EOP | IFCS | RS */
-    d->status = 0;
-    tx_cur = next;
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    wr(REG_TDT, tx_cur);
-    return 0;
+static unsigned e1000_transmit(struct netif *self, unsigned queue, const struct net_tx_frame *frames, unsigned count) {
+    (void)queue;
+    struct e1000 *c = (struct e1000 *)self;
+    while (c->tx_clean != c->tx_cur && (c->tx[c->tx_clean].status & DESC_DD)) c->tx_clean = (c->tx_clean + 1) % NTX;
+    unsigned taken = 0, posted = 0;
+    while (taken < count) {
+        const struct net_tx_frame *f = &frames[taken];
+        if (f->length > BUFSZ) { /* it does not fit a buffer: dropped */
+            taken++;
+            continue;
+        }
+        unsigned next = (c->tx_cur + 1) % NTX;
+        volatile struct tx_desc *d = &c->tx[c->tx_cur];
+        /* TDH == TDT denotes an empty hardware ring, so retain one descriptor to
+           distinguish full from empty even before DMA has completed any send. */
+        if (next == c->tx_clean || !(d->status & DESC_DD)) break; /* the rest waits for a completion */
+        size_t len = 0;
+        for (unsigned i = 0; i < f->part_count; i++) {
+            memcpy(c->txbuf[c->tx_cur] + len, f->parts[i].data, f->parts[i].length);
+            len += f->parts[i].length;
+        }
+        d->len = (uint16_t)len;
+        d->cmd = 0x0B; /* EOP | IFCS | RS */
+        d->status = 0;
+        c->tx_cur = next;
+        taken++;
+        posted++;
+    }
+    if (posted) {
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        wr(c, REG_TDT, c->tx_cur); /* one tail write for the batch */
+    }
+    return taken;
 }
 
 static uint32_t e1000_itr_ticks(void) {
@@ -189,171 +204,159 @@ static uint32_t e1000_itr_ticks(void) {
     return (uint32_t)((us * 1000 + ITR_TICK_NS - 1) / ITR_TICK_NS);
 }
 
-/* Power change (dev/pm.h): no more interrupts, receive or transmit DMA. */
-static bool e1000_quiesce(void *arg) {
-    (void)arg;
-    wr(REG_IMC, 0xFFFFFFFF);
-    wr(REG_RCTL, 0);
-    wr(REG_TCTL, 0);
+/* Power change (hal.h): no more interrupts, receive or transmit DMA. */
+static bool e1000_quiesce(struct hal_device *d) {
+    struct e1000 *c = d->driver_data;
+    wr(c, REG_IMC, 0xFFFFFFFF);
+    wr(c, REG_RCTL, 0);
+    wr(c, REG_TCTL, 0);
     /* The 8254x has no bit that says its DMA went idle (EN reads back what was written): neither
        engine fetches another descriptor, and the one in flight lands within this wait. */
     for (int i = 0; i < 100; i++) io_wait(); /* ~1 us each */
     return true;
 }
 
-static uint64_t rx_ring_phys, tx_ring_phys;
-static uint32_t itr_ticks; /* 0: the 82544GC/EI, which has no ITR */
-
-static void hw_reset(void) {
-    wr(REG_IMC, 0xFFFFFFFF);
-    wr(REG_CTRL, rd(REG_CTRL) | (1u << 26)); /* device reset */
+static void hw_reset(struct e1000 *c) {
+    wr(c, REG_IMC, 0xFFFFFFFF);
+    wr(c, REG_CTRL, rd(c, REG_CTRL) | (1u << 26)); /* device reset */
     clock_spin(10 * NS_PER_MS);
-    for (uint64_t until = clock_after(NS_PER_S); (rd(REG_CTRL) & (1u << 26)) && clock_now_ns() < until;)
+    for (uint64_t until = clock_after(NS_PER_S); (rd(c, REG_CTRL) & (1u << 26)) && clock_now_ns() < until;)
         clock_spin(NS_PER_MS);
-    wr(REG_IMC, 0xFFFFFFFF);
-    uint32_t ctrl = rd(REG_CTRL);
+    wr(c, REG_IMC, 0xFFFFFFFF);
+    uint32_t ctrl = rd(c, REG_CTRL);
     ctrl |= (1u << 6) | (1u << 5);                  /* SLU, ASDE */
     ctrl &= ~((1u << 3) | (1u << 31) | (1u << 7)); /* LRST, PHY_RST, ILOS */
-    wr(REG_CTRL, ctrl);
+    wr(c, REG_CTRL, ctrl);
 }
 
 /* After the reset: the address, both rings from their first descriptor, the interrupt rate and
    the interrupts. At probe and after a sleep, which lost every register. */
-static void hw_start(void) {
-    wr(REG_RAL, nif.mac[0] | nif.mac[1] << 8 | nif.mac[2] << 16 | (uint32_t)nif.mac[3] << 24);
-    wr(REG_RAH, nif.mac[4] | nif.mac[5] << 8 | 0x80000000u);
-    for (int i = 0; i < 128; i++) wr(REG_MTA + i * 4, 0);
-    for (size_t i = 0; i < NRX; i++) rx[i].status = 0;
+static void hw_start(struct e1000 *c) {
+    const uint8_t *mac = c->nif.mac;
+    wr(c, REG_RAL, mac[0] | mac[1] << 8 | mac[2] << 16 | (uint32_t)mac[3] << 24);
+    wr(c, REG_RAH, mac[4] | mac[5] << 8 | 0x80000000u);
+    for (int i = 0; i < 128; i++) wr(c, REG_MTA + i * 4, 0);
+    for (size_t i = 0; i < NRX; i++) c->rx[i].status = 0;
     for (size_t i = 0; i < NTX; i++) {
-        tx[i].status = 1; /* DD: free */
-        tx[i].cmd = 0;
+        c->tx[i].status = 1; /* DD: free */
+        c->tx[i].cmd = 0;
     }
-    rx_cur = tx_cur = tx_clean = 0;
-    rx_irq_pending = false;
-    wr(REG_RDBAL, (uint32_t)rx_ring_phys);
-    wr(REG_RDBAH, (uint32_t)(rx_ring_phys >> 32));
-    wr(REG_RDLEN, NRX * sizeof *rx);
-    wr(REG_RDH, 0);
-    wr(REG_RDT, NRX - 1);
-    wr(REG_RCTL, (1u << 1) | (1u << 15) | (1u << 26)); /* EN, BAM, SECRC; 2048-byte buffers */
-    wr(REG_TDBAL, (uint32_t)tx_ring_phys);
-    wr(REG_TDBAH, (uint32_t)(tx_ring_phys >> 32));
-    wr(REG_TDLEN, NTX * sizeof *tx);
-    wr(REG_TDH, 0);
-    wr(REG_TDT, 0);
-    wr(REG_TCTL, (1u << 1) | (1u << 3) | (15u << 4) | (64u << 12)); /* EN, PSP, CT, COLD */
-    wr(REG_TIPG, 10 | (8 << 10) | (6 << 20));
+    c->rx_cur = c->tx_cur = c->tx_clean = 0;
+    c->rx_irq_pending = false;
+    wr(c, REG_RDBAL, (uint32_t)c->rx_ring_bus);
+    wr(c, REG_RDBAH, (uint32_t)(c->rx_ring_bus >> 32));
+    wr(c, REG_RDLEN, NRX * sizeof *c->rx);
+    wr(c, REG_RDH, 0);
+    wr(c, REG_RDT, NRX - 1);
+    wr(c, REG_RCTL, (1u << 1) | (1u << 15) | (1u << 26)); /* EN, BAM, SECRC; 2048-byte buffers */
+    wr(c, REG_TDBAL, (uint32_t)c->tx_ring_bus);
+    wr(c, REG_TDBAH, (uint32_t)(c->tx_ring_bus >> 32));
+    wr(c, REG_TDLEN, NTX * sizeof *c->tx);
+    wr(c, REG_TDH, 0);
+    wr(c, REG_TDT, 0);
+    wr(c, REG_TCTL, (1u << 1) | (1u << 3) | (15u << 4) | (64u << 12)); /* EN, PSP, CT, COLD */
+    wr(c, REG_TIPG, 10 | (8 << 10) | (6 << 20));
 
     /* Intel explicitly recommends ITR instead of RDTR/RADV (receive-delay
        errata). ITR is not implemented by the 82544GC/EI, device 0x100C. */
-    wr(REG_RDTR, 0);
-    if (itr_ticks) {
-        wr(REG_RADV, 0);
-        wr(REG_ITR, itr_ticks);
+    wr(c, REG_RDTR, 0);
+    if (c->itr_ticks) {
+        wr(c, REG_RADV, 0);
+        wr(c, REG_ITR, c->itr_ticks);
     }
-    rd(REG_ICR);
-    wr(REG_IMS, ICR_TXDW | ICR_LSC | RX_IRQS);
+    rd(c, REG_ICR);
+    wr(c, REG_IMS, ICR_TXDW | ICR_LSC | RX_IRQS);
 }
 
-static bool e1000_resume(void *arg) {
-    (void)arg;
-    hw_reset();
-    bool reset = !(rd(REG_CTRL) & (1u << 26));
-    hw_start();
+static bool e1000_resume(struct hal_device *d) {
+    struct e1000 *c = d->driver_data;
+    hw_reset(c);
+    bool reset = !(rd(c, REG_CTRL) & (1u << 26));
+    hw_start(c);
     net_rx_notify(); /* whatever the net thread was waiting for is gone: let it look again */
-    return reset && (rd(REG_RCTL) & (1u << 1)) && (rd(REG_TCTL) & (1u << 1));
+    return reset && (rd(c, REG_RCTL) & (1u << 1)) && (rd(c, REG_TCTL) & (1u << 1));
 }
 
-static struct pm_device e1000_pm = {.name = "e1000", .stage = PM_STAGE_IO, .quiesce = e1000_quiesce,
-                                    .resume = e1000_resume};
+static int e1000_attach(struct hal_device *d) {
+    struct pci_device *pci = pci_device_of(d);
+    if (!hal_resource(d, N_HAL_MEMORY, 0)) return -N_ERR_UNSUPPORTED;
+    struct e1000 *c = kzalloc(sizeof *c);
+    if (!c) return -N_ERR_NO_MEMORY;
+    d->driver_data = c;
+    int r = -N_ERR_NO_MEMORY;
+    c->new_eerd = pci->device == 0x10D3;
+    if (!(c->mmio = hal_map(d, 0))) goto fail;
+    hal_enable(d, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA);
+    hw_reset(c);
 
-static void e1000_free_dma(uint64_t rx_ring, uint64_t tx_ring) {
-    for (size_t i = 0; i < NRX; i += BUFS_PER_PAGE)
-        if (rxbuf[i]) pmm_free(hhdm_virt_to_phys(rxbuf[i]));
-    for (size_t i = 0; i < NTX; i += BUFS_PER_PAGE)
-        if (txbuf[i]) pmm_free(hhdm_virt_to_phys(txbuf[i]));
-    if (rx_ring) pmm_free(rx_ring);
-    if (tx_ring) pmm_free(tx_ring);
-    memset(rxbuf, 0, sizeof rxbuf);
-    memset(txbuf, 0, sizeof txbuf);
-    rx = NULL;
-    tx = NULL;
-}
-
-static int e1000_attach(struct pci_device *d) {
-    if (mmio) return -N_ERR_BUSY; /* one adapter: its state is this file's */
-    if (d->bar[0] & 1) return -N_ERR_UNSUPPORTED;
-    new_eerd = d->device == 0x10D3;
-    uint64_t phys = d->bar[0] & ~0xFULL;
-    if ((d->bar[0] & 6) == 4) phys |= (uint64_t)d->bar[1] << 32;
-    if (!(mmio = vmm_map_mmio(phys, 0x20000))) return -N_ERR_NO_MEMORY;
-    pci_enable_busmaster(d);
-    hw_reset();
-
-    uint32_t ral = rd(REG_RAL), rah = rd(REG_RAH);
+    uint8_t *mac = c->nif.mac;
+    uint32_t ral = rd(c, REG_RAL), rah = rd(c, REG_RAH);
     if ((rah & 0x80000000u) && (ral || (rah & 0xFFFF))) {
-        for (int i = 0; i < 4; i++) nif.mac[i] = (uint8_t)(ral >> (i * 8));
-        nif.mac[4] = (uint8_t)rah;
-        nif.mac[5] = (uint8_t)(rah >> 8);
+        for (int i = 0; i < 4; i++) mac[i] = (uint8_t)(ral >> (i * 8));
+        mac[4] = (uint8_t)rah;
+        mac[5] = (uint8_t)(rah >> 8);
     } else {
         for (int i = 0; i < 3; i++) {
-            uint16_t w = eeprom_read((uint8_t)i);
-            nif.mac[i * 2] = (uint8_t)w;
-            nif.mac[i * 2 + 1] = (uint8_t)(w >> 8);
+            uint16_t w = eeprom_read(c, (uint8_t)i);
+            mac[i * 2] = (uint8_t)w;
+            mac[i * 2 + 1] = (uint8_t)(w >> 8);
         }
     }
 
-    /* descriptor rings and buffers */
-    uint64_t rx_ring = pmm_alloc_zeroed(), tx_ring = pmm_alloc_zeroed();
-    if (!rx_ring || !tx_ring) goto no_dma;
-    rx = phys_to_virt(rx_ring);
-    tx = phys_to_virt(tx_ring);
-    for (size_t i = 0; i < NRX; i += BUFS_PER_PAGE) {
-        uint64_t p = pmm_alloc();
-        if (!p) goto no_dma;
-        for (size_t k = 0; k < BUFS_PER_PAGE; k++) {
-            rxbuf[i + k] = (uint8_t *)phys_to_virt(p) + k * BUFSZ;
-            rx[i + k].addr = p + k * BUFSZ;
-        }
+    /* the rings, then the buffers they point at: one block each, the buffers after one another */
+    uint64_t ring_bus, buffer_bus;
+    uint8_t *rings = hal_dma_alloc(d, 2 * PAGE_SIZE, 0, &ring_bus);
+    uint8_t *buffers = hal_dma_alloc(d, (NRX + NTX) * BUFSZ, 0, &buffer_bus);
+    if (!rings || !buffers) {
+        kprintf("net: e1000 DMA allocation failed\n");
+        goto fail;
     }
-    for (size_t i = 0; i < NTX; i += BUFS_PER_PAGE) {
-        uint64_t p = pmm_alloc();
-        if (!p) goto no_dma;
-        for (size_t k = 0; k < BUFS_PER_PAGE; k++) {
-            txbuf[i + k] = (uint8_t *)phys_to_virt(p) + k * BUFSZ;
-            tx[i + k].addr = p + k * BUFSZ;
-        }
+    c->rx = (volatile struct rx_desc *)rings;
+    c->tx = (volatile struct tx_desc *)(rings + PAGE_SIZE);
+    c->rx_ring_bus = ring_bus;
+    c->tx_ring_bus = ring_bus + PAGE_SIZE;
+    for (size_t i = 0; i < NRX; i++) {
+        c->rxbuf[i] = buffers + i * BUFSZ;
+        c->rx[i].addr = buffer_bus + i * BUFSZ;
     }
-    rx_ring_phys = rx_ring;
-    tx_ring_phys = tx_ring;
-    if (d->device != 0x100C) {
-        itr_ticks = e1000_itr_ticks();
-        kprintf("net: e1000 ITR %u x %u ns (e1000-itr-us=0 disables)\n", itr_ticks, ITR_TICK_NS);
+    for (size_t i = 0; i < NTX; i++) {
+        c->txbuf[i] = buffers + (NRX + i) * BUFSZ;
+        c->tx[i].addr = buffer_bus + (NRX + i) * BUFSZ;
+    }
+    if (pci->device != 0x100C) {
+        c->itr_ticks = e1000_itr_ticks();
+        kprintf("net: e1000 ITR %u x %u ns (e1000-itr-us=0 disables)\n", c->itr_ticks, ITR_TICK_NS);
     }
 
-    /* its INTx, through the IOAPIC line ACPI routes it to (the models this drives have no MSI) */
-    uint32_t gsi;
-    if (!acpi_pci_gsi(d, &gsi) ||
-        !irq_request_gsi(&(struct irq_spec){.name = "e1000", .handler = e1000_irq, .node = -1}, gsi)) {
-        e1000_free_dma(rx_ring, tx_ring);
+    if (!hal_irq_enable(d, &(struct irq_spec){.name = "e1000", .handler = e1000_irq, .context = c, .node = -1}, 1, NULL)) {
         kprintf("net: e1000 has no interrupt route\n");
-        return -N_ERR_UNSUPPORTED;
+        r = -N_ERR_UNSUPPORTED;
+        goto fail;
     }
-    nif.send = e1000_send;
-    nif.rx_pending = e1000_rx_pending;
-    nif.poll_rx = e1000_poll_rx;
-    net_register(&nif);
-    pm_register(&e1000_pm);
-    hw_start();
-    kprintf("net: e1000 (%04x) GSI %u mac %02x:%02x:%02x:%02x:%02x:%02x\n", d->device, gsi, nif.mac[0],
-            nif.mac[1], nif.mac[2], nif.mac[3], nif.mac[4], nif.mac[5]);
+    c->nif.driver = "e1000";
+    c->nif.tx_queues = c->nif.rx_queues = 1;
+    c->nif.transmit = e1000_transmit;
+    c->nif.rx_pending = e1000_rx_pending;
+    c->nif.poll = e1000_poll;
+    net_register(d, &c->nif);
+    hw_start(c);
+    kprintf("net: e1000 (%04x) mac %02x:%02x:%02x:%02x:%02x:%02x\n", pci->device, mac[0], mac[1], mac[2], mac[3], mac[4],
+            mac[5]);
     return 0;
-no_dma:
-    e1000_free_dma(rx_ring, tx_ring);
-    kprintf("net: e1000 DMA allocation failed\n");
-    return -N_ERR_NO_MEMORY;
+fail:
+    hal_irq_disable(d); /* before the handler's memory goes */
+    d->driver_data = NULL;
+    kfree(c);
+    return r;
 }
 
-static const struct n_pci_match e1000_matches[] = {N_PCI_ID(0x8086, 0x100E), N_PCI_ID(0x8086, 0x100F), N_PCI_ID(0x8086, 0x1004),
-                                                   N_PCI_ID(0x8086, 0x100C), N_PCI_ID(0x8086, 0x1015), N_PCI_ID(0x8086, 0x10D3)};
-const struct pci_driver e1000_driver = {"e1000", e1000_matches, ARRAY_SIZE(e1000_matches), e1000_attach};
+static const struct n_hal_rule e1000_rules[] = {N_PCI_ID(0x8086, 0x100E), N_PCI_ID(0x8086, 0x100F), N_PCI_ID(0x8086, 0x1004),
+                                                N_PCI_ID(0x8086, 0x100C), N_PCI_ID(0x8086, 0x1015), N_PCI_ID(0x8086, 0x10D3)};
+const struct hal_driver e1000_driver = {
+    .name = "e1000",
+    .rules = e1000_rules,
+    .rule_count = ARRAY_SIZE(e1000_rules),
+    .attach = e1000_attach,
+    .quiesce = e1000_quiesce,
+    .resume = e1000_resume,
+};

@@ -172,13 +172,10 @@ void input_mouse(struct input_device *d, const struct mouse_event *e) {
     if (sink) sink(&out);
 }
 
-/* After a sleep the keys held when it began were let go long ago. */
-static bool input_resume(void *arg) {
-    (void)arg;
+void input_resumed(void) {
     __atomic_fetch_and(&mods, (uint8_t)NMOD_CAPS, __ATOMIC_ACQ_REL);
     __atomic_store_n(&left_alt_held, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&right_alt_held, 0, __ATOMIC_RELEASE);
-    return true;
 }
 
 void input_set_sinks(key_sink_t k, mouse_sink_t m) {

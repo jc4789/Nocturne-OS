@@ -2,15 +2,25 @@
 /* USB devices as the host controller driver (xhci.c) hands them to the class drivers
  * (usbhid.c, usbhub.c, usbmsc.c, usbnet.c).
  *
- * Contexts. Each controller has a worker thread: it enumerates, so a class driver's attach,
- * detach and work functions run there, one device of that controller at a time, and may sleep.
- * A report function (usb_report_fn) runs in the drain of the event ring that took the completion:
+ * Nodes. A device is a HAL node of bus N_BUS_USB, the child of its hub's node (of the controller's
+ * PCI function on a root port). Each interface of alternate 0 of its configuration is a child of the
+ * device, a node of bus N_BUS_USB_INTERFACE with the class code, the interface number and the
+ * device's vendor and product among its properties. A class driver is a struct hal_driver whose rules
+ * name the interface classes it takes (N_USB_INTERFACE_CLASS, N_USB_INTERFACE_SUBCLASS); the HAL binds
+ * it to each interface node that matches.
+ *
+ * Contexts. Each controller has a worker thread: it enumerates, runs hub work and the work functions
+ * the class drivers register (usb_work_set), and removes devices: a class driver's detach runs
+ * there, in hal_remove, after the device's last report. A class driver's attach runs in a thread
+ * of its own for that interface, one per interface, and may sleep for seconds. A report function
+ * (usb_report_fn) runs in the drain of the event ring that took the completion:
  * an interrupt, or a polled controller's alarm, with interrupts off. It never sleeps, takes no
  * mutex and keeps short; whatever needs the worker it asks for with usb_note_work. usb_control,
  * usb_bulk and usb_clear_halt sleep until their transfer completes and run in any thread, on a
  * device that is not removed meanwhile (its class driver's detach waits for its users). */
 #include <stdint.h>
 #include <stdbool.h>
+#include "hal/hal.h"
 #include "sys/clock.h"
 
 /* A port whose device does not come up, or that stays stuck, is tried one reset at a time, with the
@@ -90,6 +100,7 @@ struct usb_endpoint_desc {
 } __attribute__((packed));
 
 struct usb_device {
+    struct hal_device hal; /* first: N_BUS_USB, published once the device descriptor is read */
     struct usb_hc *hc;
     struct usb_device *parent; /* hub, or NULL on a root port */
     uint8_t slot, speed, port, root_port, depth;
@@ -103,7 +114,24 @@ struct usb_device {
     char *product; /* usb_product */
     bool product_read;
     void *hub; /* usbhub.c state when the device is a hub */
+    /* The configuration descriptor in use, with its interfaces: they stay until the device's nodes are
+       removed (usb_remove), so a class driver reads its descriptors for as long as it is bound. */
+    const uint8_t *config;
+    unsigned config_bytes;
 };
+
+/* An interface of alternate 0: the node a class driver binds to. The device's child; removed before it. */
+struct usb_interface {
+    struct hal_device hal; /* first: N_BUS_USB_INTERFACE */
+    struct usb_device *dev;
+    const struct usb_interface_desc *desc; /* in dev->config */
+    unsigned offset;                       /* of desc in dev->config */
+    void (*work)(struct usb_interface *);  /* usb_work_set (atomic) */
+};
+static inline struct usb_interface *usb_interface_of(struct hal_device *d) {
+    ASSERT(d->bus == N_BUS_USB_INTERFACE);
+    return (struct usb_interface *)d;
+}
 
 /* An endpoint as a class driver found it in the configuration descriptor. */
 struct usb_ep_info {
@@ -153,11 +181,20 @@ bool usb_send_open(struct usb_device *d, uint8_t address, unsigned size, unsigne
  * removed meanwhile (its class driver's detach waits for it). */
 int usb_send(struct usb_device *d, uint8_t address, const void *a, unsigned alen, const void *b, unsigned blen);
 
+/* The interface's descriptors after its own up to the first interrupt IN endpoint, and that endpoint:
+   *extra is what lies between (a HID descriptor), extra_len its bytes. False for an interface with no
+   interrupt IN endpoint. */
+bool usb_interface_interrupt(const struct usb_interface *i, const uint8_t **extra, unsigned *extra_len,
+                             const struct usb_endpoint_desc **ep);
+/* Run `work` for interface i on its controller's worker whenever the device asks (usb_note_work);
+   NULL ends it. A class driver sets it when its state is whole, and clears it in detach. */
+void usb_work_set(struct usb_interface *i, void (*work)(struct usb_interface *));
+
 /* hub support, on the worker */
 struct usb_device *usb_attach_child(struct usb_device *hub, unsigned port, unsigned speed, unsigned rank);
 void usb_remove(struct usb_device *d);
 void usb_hub_info(struct usb_device *d, unsigned ports, unsigned think_time, bool multi_tt);
-/* Any context: run the work functions (usbhub_work, struct usb_driver's work) for d on its worker soon. */
+/* Any context: run the work functions (usbhub_work, the interfaces' usb_work_set) for d on its worker soon. */
 void usb_note_work(struct usb_device *d);
 /* On the worker, for an event a report function notes (usb_note_work): read usb_kicks, look at
    the condition, then usb_wait_kick sleeps unless a note came after that read, or until the
@@ -169,16 +206,11 @@ void usb_wait_kick(struct usb_device *d, uint64_t seen, uint64_t deadline);
 char *usb_string(struct usb_device *d, uint8_t index);
 /* The device's product string in full, "" without one, read once and given to the ledger. On the worker. */
 const char *usb_product(struct usb_device *d);
-/* The next interface of alternate 0 from *at that has an interrupt IN endpoint, with the descriptors between
-   it and that endpoint. *at moves past the interface. False when there is no other. */
-bool usb_next_interrupt_interface(const uint8_t *cfg, unsigned total, unsigned *at, const struct usb_interface_desc **intf,
-                                  const uint8_t **extra, unsigned *extra_len, const struct usb_endpoint_desc **ep);
 bool usbhub_prepare(struct usb_device *d);    /* configured: reads the hub descriptor and calls usb_hub_info */
 bool usbhub_set_depth(struct usb_device *d);  /* configured as a hub: tells it its tier */
 bool usbhub_reset_port(struct usb_device *hub, unsigned port); /* reset the device on it; true once enabled */
-void usbhub_attach(struct usb_device *d, const struct usb_endpoint_desc *ep);
 void usbhub_work(struct usb_device *d);       /* port changes noticed by its interrupt endpoint */
 bool usbhub_pending(struct usb_device *d);    /* port changes not handled yet, or a port's next try */
 bool usbhub_trying(struct usb_device *d);     /* a device at a port is yet to get another try */
 void usbhub_reports_lost(struct usb_device *d, uint8_t address); /* endpoint `address` was given up */
-void usbhub_detach(struct usb_device *d); /* the device is going away */
+void usbhub_detach(struct usb_device *d); /* the device is going away: its devices go, its state is freed */

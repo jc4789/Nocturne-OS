@@ -18,6 +18,7 @@ struct spinlock hal_lock;
 struct hal_device hal_root;
 static uint32_t hal_ids;
 static uint64_t hal_ledger_bytes;
+static struct wait_queue hal_holds_wq;
 static struct watched hal_changed;
 
 void hal_ledger_changed(void) { watched_changed(&hal_changed); }
@@ -103,16 +104,24 @@ void hal_publish(struct hal_device *parent, struct hal_device *d) {
 
 void hal_remove(struct hal_device *d) {
     hal_busy_begin();
+    uint64_t f = spin_lock(&hal_lock);
     __atomic_store_n(&d->gone, true, __ATOMIC_RELEASE);
+    pending_forget(d);
+    spin_unlock(&hal_lock, f);
     mutex_lock(&d->bind);
-    if (d->claim) hal_claim_revoke(d->claim);
+    hal_claim_end_device(d);
     if (d->driver) {
         ASSERT(d->driver->detach);
         d->driver->detach(d);
         hal_release(d);
     }
     mutex_unlock(&d->bind);
-    uint64_t f = spin_lock(&hal_lock);
+    /* 動き出した attach の thread と、呼出しの中の claim は、まだ記録を読む */
+    f = spin_lock(&hal_lock);
+    while (d->holds) {
+        wq_wait_locked(&hal_holds_wq, &hal_lock);
+        spin_take(&hal_lock);
+    }
     ASSERT(!d->first_child); /* 出した者が先に消す */
     *(d->prev ? &d->prev->next : &d->parent->first_child) = d->next;
     *(d->next ? &d->next->prev : &d->parent->last_child) = d->prev;
@@ -249,8 +258,18 @@ struct hal_device *hal_find(uint32_t id) {
     uint64_t f = spin_lock(&hal_lock);
     struct hal_device *d = &hal_root;
     while (d && d->id != id) d = hal_walk_next(d);
+    if (d && d->gone) d = NULL;
+    if (d) d->holds++;
     spin_unlock(&hal_lock, f);
     return d;
+}
+
+void hal_put(struct hal_device *d) {
+    uint64_t f = spin_lock(&hal_lock);
+    ASSERT(d->holds);
+    /* 起こす列は記録の外にある。hal_remove はこの錠を取るまで戻らない */
+    if (!--d->holds) wq_wake_all(&hal_holds_wq);
+    spin_unlock(&hal_lock, f);
 }
 
 /* 記録は頭の中の長さも bytes に入れるので、丸めた分は読み手に見えない。 */

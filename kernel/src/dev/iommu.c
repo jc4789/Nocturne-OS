@@ -20,6 +20,7 @@
 #include "dev/iommu.h"
 #include "fs/bootrecord.h"
 #include "dev/pci.h"
+#include "hal/hal.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "sys/clock.h"
@@ -1012,3 +1013,26 @@ bool iommu_shutdown(void) {
     if (hw && !hw->shutdown()) restore_failed = true;
     return !restore_failed;
 }
+
+/* The function a unit of the AMD IOMMU sits in (class 08h, subclass 06h): iommu_init (before the
+   drivers are bound) has taken its registers and interrupt from the firmware's tables, so binding
+   only records that the IOMMU drives it. The units come back from a sleep in iommu_resume. */
+static int iommu_function_attach(struct hal_device *d) {
+    (void)d;
+    return 0;
+}
+
+static bool iommu_function_resume(struct hal_device *d) {
+    (void)d;
+    return true;
+}
+
+static const struct n_hal_rule iommu_rules[] = {N_PCI_CLASS(0x08, 0x06)};
+static const struct hal_driver iommu_driver = {
+    .name = "iommu",
+    .rules = iommu_rules,
+    .rule_count = ARRAY_SIZE(iommu_rules),
+    .attach = iommu_function_attach,
+    .resume = iommu_function_resume,
+};
+HAL_DRIVER(iommu_driver);

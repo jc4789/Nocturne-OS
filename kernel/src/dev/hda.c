@@ -34,16 +34,12 @@
 #include "arch/cpu.h"
 #include "arch/irq.h"
 #include "arch/spin.h"
-#include "dev/acpi.h"
 #include "dev/hda_codec.h"
 #include "dev/iommu.h"
 #include "dev/pci.h"
-#include "dev/pm.h"
-#include "dev/pci_drivers.h"
+#include "hal/hal.h"
 #include "mm/heap.h"
-#include "mm/pmm.h"
 #include "mm/shared.h"
-#include "mm/vmm.h"
 #include "sys/alarm.h"
 #include "sys/clock.h"
 #include "sys/object.h"
@@ -147,28 +143,26 @@ struct hda_sink {
 struct hda {
     struct hda_link link; /* first: the verbs' way back to it */
     struct pci_device *pci;
-    volatile uint8_t *regs;
+    struct hal_device *hal;
+    volatile uint8_t *regs; /* its memory BAR (hal_map) */
     volatile uint8_t *sd;   /* the output stream descriptor's registers */
     unsigned sd_index;      /* and its bit in INTCTL and INTSTS */
     bool bidirectional;
-    uint64_t dma_phys;
+    uint64_t dma_phys, dma_bus; /* the page of rings and descriptors: where the CPU's memory is, and what the controller is told */
     uint32_t *corb;
     volatile uint64_t *rirb;
     struct bdl_entry *bdl;
     uint8_t *ring;          /* what is open's */
-    uint64_t ring_phys;
+    uint64_t ring_phys, ring_bus;
     size_t ring_pages;
     struct object *ring_object;
     struct iommu_domain *guest_dom; /* the claim's domain its memory has to be in; written with `state` */
     struct iommu_guest guest;
-    struct pm_device pm;
 
     struct mutex state;
     bool stopped;      /* a claim's guest out of use; written with `engine` too */
     bool probed;
-    struct irq *line;  /* its INTx, where its messages cannot be used */
-    bool messages;
-    bool quiet;        /* neither: tick wakes the audio thread, and the thread looks every POLL_NS */
+    bool quiet;        /* no interrupt: tick wakes the audio thread, and the thread looks every POLL_NS */
     struct alarm tick;
     struct hda_codec *codecs[15];      /* by address (4.3) */
     struct hda_output *outputs[15];
@@ -256,7 +250,7 @@ static void rings_place(struct hda *h) {
     write8(h, RIRBSIZE, (uint8_t)rirb_size);
     h->corb_entries = sizes[corb_size];
     h->rirb_entries = sizes[rirb_size];
-    uint64_t rings = h->dma_phys, rirb = rings + PAGE_SIZE / 2;
+    uint64_t rings = h->dma_bus, rirb = rings + PAGE_SIZE / 2;
     write32(h, CORBLBASE, (uint32_t)rings);
     write32(h, CORBUBASE, (uint32_t)(rings >> 32));
     write32(h, RIRBLBASE, (uint32_t)rirb);
@@ -446,34 +440,17 @@ static void hda_tick(struct alarm *a, struct regs *r) {
     tell_open((struct hda *)((char *)a - offsetof(struct hda, tick)));
 }
 
-/* state held: its interrupt on. A message when it may send one; a guest in a claim's domain does not:
-   the domain's interrupt table is the claimed function's. Else its INTx, else nothing. */
-static void irq_on(struct hda *h, bool messages) {
-    struct pci_device *d = h->pci;
-    struct irq_spec spec = {.name = "HD Audio", .handler = hda_irq, .context = h, .node = d->node};
-    h->messages = messages && pci_irq_enable(d, &spec, 1, NULL);
-    h->quiet = false;
-    if (h->messages) return;
-    uint32_t gsi;
-    if (acpi_pci_gsi(d, &gsi)) {
-        pci_write16(d->address, PCI_COMMAND,
-                    pci_read16(d->address, PCI_COMMAND) & ~PCI_COMMAND_INTX_DISABLE);
-        h->line = irq_request_gsi(&spec, gsi);
-    }
-    h->quiet = !h->line;
+/* state held: its interrupt on, as the bus gives it (hal_irq_enable: a message where the function may send
+   one, a guest in a claim's domain may not). Without one, tick and the thread look instead. */
+static void irq_on(struct hda *h) {
+    struct irq_spec spec = {.name = "HD Audio", .handler = hda_irq, .context = h, .node = h->pci->node};
+    h->quiet = !hal_irq_enable(h->hal, &spec, 1, NULL);
 }
 
 /* state held; its source is off. */
 static void irq_off(struct hda *h) {
-    struct pci_device *d = h->pci;
-    if (h->messages) pci_irq_disable(d);
-    if (h->line) {
-        pci_write16(d->address, PCI_COMMAND,
-                    pci_read16(d->address, PCI_COMMAND) | PCI_COMMAND_INTX_DISABLE);
-        irq_free(h->line);
-    }
-    h->messages = false;
-    h->line = NULL;
+    if (!h->quiet) hal_irq_disable(h->hal);
+    h->quiet = true;
 }
 
 /* ---- the stream ---- */
@@ -504,9 +481,9 @@ static void stream_stop(struct hda *h) {
 static bool stream_start(struct hda *h, struct hda_sink *o, uint64_t gen) {
     uint32_t bytes = block_bytes(h);
     for (unsigned i = 0; i < h->blocks; i++)
-        h->bdl[i] = (struct bdl_entry){.address = h->ring_phys + i * bytes, .length = bytes, .flags = 1};
+        h->bdl[i] = (struct bdl_entry){.address = h->ring_bus + i * bytes, .length = bytes, .flags = 1};
     iommu_cache_flush(h->bdl, h->blocks * sizeof *h->bdl);
-    uint64_t bdl = h->dma_phys + RINGS_PAGES * PAGE_SIZE;
+    uint64_t bdl = h->dma_bus + RINGS_PAGES * PAGE_SIZE;
     sd_write8(h, SD_CTL, CTL_SRST);
     for (uint64_t until = clock_after(STOP_NS); !(sd_read8(h, SD_CTL) & CTL_SRST) && clock_now_ns() < until;) pause();
     sd_write8(h, SD_CTL, 0);
@@ -593,6 +570,7 @@ static int hda_open(struct audio_output *output, const struct n_audio_device_for
     h->ring = phys_to_virt(phys);
     iommu_cache_flush(h->ring, pages * PAGE_SIZE);
     h->ring_phys = phys;
+    h->ring_bus = hal_dma_address(h->hal, phys);
     h->ring_pages = pages;
     h->ring_object = memory;
     hda_output_select(o->out, word);
@@ -716,6 +694,7 @@ static bool sink_add(struct hda *h, struct hda_codec *codec, struct hda_output *
     kprintf("audio: HD Audio codec %u pin %u: \"%s\" (%s)\n", codec->address, out->pin->nid, o->label,
             !out->senses ? "no jack sense" : out->plugged ? "plugged in" : "nothing plugged in");
     audio_output_add(&o->output);
+    hal_offer(h->hal, N_OFFER_AUDIO, (uint32_t)codec->address << 8 | out->pin->nid, o->label);
     return true;
 }
 
@@ -747,7 +726,7 @@ static void probe(struct hda *h) {
     }
     h->probed = true;
     kprintf("audio: HD Audio at %04x:%02x:%02x.%x (%04x:%04x): codecs %x, %u outputs, %s\n", PCI_ADDRESS_ARGS(h->pci->address),
-            h->pci->vendor, h->pci->device, present, found, h->messages ? "message interrupts" : h->line ? "INTx" : "timed refill");
+            h->pci->vendor, h->pci->device, present, found, h->quiet ? "timed refill" : "interrupts");
 }
 
 /* state held: the outputs of the codecs told, and with look those that do not announce themselves. */
@@ -801,8 +780,8 @@ static void hda_thread(void *arg) {
 
 /* ---- power, and a claim of its group ---- */
 
-static bool hda_quiesce(void *arg) {
-    struct hda *h = arg;
+static bool hda_quiesce(struct hal_device *d) {
+    struct hda *h = d->driver_data;
     uint64_t f = spin_lock(&h->engine);
     bool stopped = h->stopped;
     if (!stopped) link_stop(h);
@@ -812,11 +791,10 @@ static bool hda_quiesce(void *arg) {
     return link_down(h);
 }
 
-static bool hda_resume(void *arg) {
-    struct hda *h = arg;
+static bool hda_resume(struct hal_device *d) {
+    struct hda *h = d->driver_data;
     if (__atomic_load_n(&h->stopped, __ATOMIC_RELAXED)) return true;
     bool ok = link_up(h);
-    hal_restarted(&h->pci->hal, hda_driver.name, ok);
     __atomic_store_n(&h->restore, true, __ATOMIC_SEQ_CST);
     signal(h);
     tell_open(h);
@@ -851,12 +829,12 @@ static void hda_guest_start(struct iommu_domain *dom, void *ctx) {
             kprintf("audio: HD Audio at %04x:%02x:%02x.%x: its memory cannot be mapped in its group's domain\n", PCI_ADDRESS_ARGS(h->pci->address));
         } else {
             h->guest_dom = dom;
-            pci_enable_busmaster(h->pci);
+            hal_enable(h->hal, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA);
             uint64_t f = spin_lock(&h->engine);
             h->stopped = false;
             spin_unlock(&h->engine, f);
             if (link_up(h)) {
-                irq_on(h, !dom);
+                irq_on(h);
                 __atomic_store_n(&h->restore, true, __ATOMIC_SEQ_CST);
                 for (struct hda_sink *o = h->sinks; o; o = o->next) audio_output_available(&o->output, true);
             } else kprintf("audio: HD Audio at %04x:%02x:%02x.%x does not come out of reset\n", PCI_ADDRESS_ARGS(h->pci->address));
@@ -868,32 +846,37 @@ static void hda_guest_start(struct iommu_domain *dom, void *ctx) {
 
 /* ---- finding them ---- */
 
-static int hda_attach(struct pci_device *d) {
-    uint64_t base = pci_bar_address(d, 0), size = pci_bar_size(d, 0);
-    if (!base || !size) return -N_ERR_NOT_FOUND;
+static int hda_attach(struct hal_device *hal) {
+    struct pci_device *d = pci_device_of(hal);
+    if (!hal_resource(hal, N_HAL_MEMORY, 0)) return -N_ERR_NOT_FOUND;
     struct hda *h = kzalloc(sizeof *h);
-    /* below 4 GiB, which every controller can reach (64OK is optional, 3.3.2) */
-    uint64_t dma = h ? pmm_alloc_contig(DMA_PAGES, 32) : 0;
-    volatile uint8_t *regs = dma ? vmm_map_mmio(base, size) : NULL;
-    if (!regs) {
+    if (!h) {
         kprintf("audio: HD Audio at %04x:%02x:%02x.%x found, but no memory for it\n", PCI_ADDRESS_ARGS(d->address));
-        if (dma) pmm_free_contig(dma, DMA_PAGES);
-        if (h) kfree(h);
         return -N_ERR_NO_MEMORY;
     }
+    volatile uint8_t *regs = hal_map(hal, 0);
+    /* below 4 GiB, which every controller can reach (64OK is optional, 3.3.2) */
+    uint64_t bus;
+    uint8_t *memory = regs ? hal_dma_alloc(hal, DMA_PAGES * PAGE_SIZE, 32, &bus) : NULL;
+    if (!memory) {
+        kprintf("audio: HD Audio at %04x:%02x:%02x.%x found, but no memory for it\n", PCI_ADDRESS_ARGS(d->address));
+        kfree(h);
+        return -N_ERR_NO_MEMORY;
+    }
+    hal->driver_data = h;
     h->link.verb = link_verb;
     h->pci = d;
+    h->hal = hal;
     h->regs = regs;
-    h->dma_phys = dma;
-    uint8_t *memory = phys_to_virt(dma);
-    memset(memory, 0, DMA_PAGES * PAGE_SIZE);
+    h->dma_bus = bus;
+    h->dma_phys = hhdm_virt_to_phys(memory);
     iommu_cache_flush(memory, DMA_PAGES * PAGE_SIZE);
     h->corb = (uint32_t *)memory;
     h->rirb = (volatile uint64_t *)(memory + PAGE_SIZE / 2);
     h->bdl = (struct bdl_entry *)(memory + RINGS_PAGES * PAGE_SIZE);
     h->frame_bytes = 4; /* until a format is open */
     alarm_init(&h->tick, hda_tick);
-    pci_enable_busmaster(d);
+    hal_enable(hal, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA);
     bool up = link_up(h);
     uint32_t caps = up ? read16(h, GCAP) : 0;
     if (!up || (!GCAP_OSS(caps) && !GCAP_BSS(caps))) {
@@ -903,24 +886,37 @@ static int hda_attach(struct pci_device *d) {
         link_stop(h);
         spin_unlock(&h->engine, f);
         link_down(h);
-        pci_disable_busmaster(d, NULL);
-        d->kernel_owned = false;
-        pmm_free_contig(dma, DMA_PAGES);
+        hal->driver_data = NULL;
         kfree(h);
-        return up ? PCI_NOT_MINE : -N_ERR_IO;
+        return up ? HAL_DECLINE : -N_ERR_IO;
     }
-    irq_on(h, true);
+    irq_on(h);
     h->guest = (struct iommu_guest){.stop = hda_guest_stop, .start = hda_guest_start, .ctx = h};
     d->guest = &h->guest;
-    h->pm = (struct pm_device){.name = "hda", .stage = PM_STAGE_IO, .quiesce = hda_quiesce, .resume = hda_resume, .ctx = h};
-    pm_register(&h->pm);
     h->thread = kthread_create("hda", hda_thread, h);
     if (!h->thread) {
         kprintf("audio: HD Audio at %04x:%02x:%02x.%x: no memory for its thread\n", PCI_ADDRESS_ARGS(d->address));
+        d->guest = NULL;
+        irq_off(h);
+        uint64_t f = spin_lock(&h->engine);
+        link_stop(h);
+        spin_unlock(&h->engine, f);
+        link_down(h);
+        hal->driver_data = NULL;
+        kfree(h);
         return -N_ERR_NO_MEMORY;
     }
     return 0;
 }
 
-static const struct n_pci_match hda_matches[] = {N_PCI_CLASS(0x04, 0x03)};
-const struct pci_driver hda_driver = {"hda", hda_matches, ARRAY_SIZE(hda_matches), hda_attach};
+/* Every PCI function of the audio class: a chipset's, a graphics card's. */
+static const struct n_hal_rule hda_rules[] = {N_PCI_CLASS(0x04, 0x03)};
+static const struct hal_driver hda_driver = {
+    .name = "hda",
+    .rules = hda_rules,
+    .rule_count = ARRAY_SIZE(hda_rules),
+    .attach = hda_attach,
+    .quiesce = hda_quiesce,
+    .resume = hda_resume,
+};
+HAL_DRIVER(hda_driver);

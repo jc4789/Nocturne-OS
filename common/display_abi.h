@@ -37,7 +37,7 @@ struct desktop_settings {
 };
 
 /* A screen as the kernel knows it: SYS_SCREEN_INFO with its third argument SCREEN_MODES_GET and its
-   second sizeof(struct screen_modes). The modes are the display driver's (n_pci_screen_modes,
+   second sizeof(struct screen_modes). The modes are the display driver's (n_screen_offer_modes,
    abi.h). The kernel chooses none of them: until the display service (N_CAP_DISPLAY,
    SYS_SCREEN_MODE_APPLY) asks for one, the screen shows what it shows. Without a display driver's
    modes (count 0) the screen keeps the mode it has, offered then says which (the monitor and its name

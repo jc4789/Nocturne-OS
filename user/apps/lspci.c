@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include "nocturne.h"
 static const char *cls(int c, int s) {
     switch (c) {
@@ -25,10 +26,19 @@ static const char *vendor(int v) {
     }
 }
 int main(void) {
-    struct n_pciinfo p[64];
-    int n = pcilist(p, 64);
-    for (int i = 0; i < n; i++)
-        printf("%04x:%02x:%02x.%x %s: %s [%04x:%04x]\n", p[i].segment, p[i].bus, p[i].dev, p[i].func, cls(p[i].cls, p[i].subcls),
-               vendor(p[i].vendor), p[i].vendor, p[i].device);
+    struct n_hal_snapshot ledger = {0};
+    if (n_hal_snapshot(&ledger) < 0) return 1;
+    const struct n_hal_device *d = ledger.first;
+    for (uint32_t i = 0; i < ledger.count; i++, d = n_hal_device_next(d)) {
+        uint64_t vendor_id, device_id, class_code, address;
+        if (!n_hal_device_number(d, N_PROP_PCI_VENDOR, &vendor_id) || !n_hal_device_number(d, N_PROP_PCI_DEVICE, &device_id) ||
+            !n_hal_device_number(d, N_PROP_PCI_CLASS, &class_code) || !n_hal_device_number(d, N_PROP_PCI_ADDRESS, &address))
+            continue;
+        printf("%04x:%02x:%02x.%x %s: %s [%04x:%04x]\n", (unsigned)N_PCI_TARGET_SEGMENT(address),
+               (unsigned)N_PCI_TARGET_BUS(address), (unsigned)N_PCI_TARGET_DEV(address),
+               (unsigned)N_PCI_TARGET_FUNC(address), cls((int)(class_code >> 16), (int)(class_code >> 8 & 0xFF)),
+               vendor((int)vendor_id), (unsigned)vendor_id, (unsigned)device_id);
+    }
+    free((void *)ledger.first);
     return 0;
 }

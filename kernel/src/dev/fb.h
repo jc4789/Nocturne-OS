@@ -35,6 +35,11 @@ bool fb_dither_able(void);
    (the boot console and the panic screen draw there; the desktop draws through frames, below).
    It runs on the boot CPU alone before the scheduler, and in threads after. */
 void fb_present(const uint32_t *src, int src_pitch, int x, int y, int w, int h);
+/* The firmware's screen as a device of the machine (hal/hal.h). It has no way back from a sleep:
+   the firmware set its mode, and nothing sets it again; it is as it was after the next boot. A driver
+   that can show it again and has its own resume takes it over with fb_boot_release. */
+void fb_publish(void);
+void fb_boot_release(void);
 /* A display driver rebuilding how the CPU reaches the boot framebuffer (NVIDIA's RM switches the
    BAR it lies in to virtual mode during its start and stop) holds it: nothing is written there
    until the last release; no time limit ends a hold. fb_hold returns once no write is under way.
@@ -52,7 +57,7 @@ void fb_present_last(const uint32_t *src, int src_pitch, int w, int h);
    A screen is one display the desktop is shown on: a mode (width x height at a refresh, or at a
    variable refresh within the monitor's range) and 1 to N_SCREEN_BUFFERS_MAX buffers of that mode
    the display engine shows one of. Screen 0 is the firmware's framebuffer at boot; a display
-   driver gives a screen its own buffers (dev/pciuser.c for a driver in an app, vm/vbe.c for an
+   driver gives a screen its own buffers (dev/screen_driver.c for a driver in an app, vm/vbe.c for an
    emulator's display) and takes them away again. A screen never goes away: one whose driver left
    is off until a driver gives it buffers again. The number of screens has no limit.
 
@@ -92,7 +97,7 @@ struct scanout *fb_buffer_map(const uint64_t *frames, size_t pages, uint64_t typ
 struct scanout *fb_buffer_at(uint8_t *addr, uint32_t width, uint32_t height, uint32_t pitch, uint32_t format);
 void fb_buffer_unmap(struct scanout *o);
 /* What a display engine may show in a buffer's place (an app's image shown directly,
-   dev/pciuser.c): the panic screen is drawn into it too. fb_image_remove returns once nothing
+   dev/screen_driver.c): the panic screen is drawn into it too. fb_image_remove returns once nothing
    writes there any more; the caller unmaps it after. */
 void fb_image_add(struct scanout *o);
 void fb_image_remove(struct scanout *o);
@@ -103,7 +108,7 @@ struct screen *screen_get(unsigned id); /* NULL: no such screen */
 unsigned screen_count(void);
 unsigned screen_id(const struct screen *s);
 
-/* What shows the screens to the user. The drivers of the screens (dev/pciuser.c) say what they do
+/* What shows the screens to the user. The drivers of the screens (dev/screen_driver.c) say what they do
    here and do not know who hears it; gui/ sets it at its start, before any app runs. */
 struct n_screen_modes;
 struct n_screen_state;
@@ -166,3 +171,37 @@ struct screen_times {
     uint64_t asked_serial; /* the last flip asked (screen_frame_end) */
 };
 void screen_times(struct screen *s, struct screen_times *out);
+
+/* ---- a display driver in an app (dev/screen_driver.c, docs/nocturne-native-abi.md §9) ----
+   Every call takes the handle of a claim (hal/hal.h) the caller holds, in a thread that may sleep,
+   holding no spinlock; b, v, m, out are kernel copies.
+   screen_driver_give: the output's buffers (NULL: given back) become what its screen is drawn into;
+   returns the serial of the output's last flip before them.
+   screen_driver_flips: the flips the screens ask of the claim's outputs, waiting until deadline
+   (sys/wait.h) for one; out has room for max. screen_driver_vblank: a vertical blank of an output,
+   with the flip it shows. screen_driver_state: what the output's screen should show (gui/wm.c
+   keeps it). screen_driver_modes: the monitor on an output, the modes the driver can show there
+   and what it showed, for the system to choose from (gui/screenmode.c); count 0 withdraws them.
+   screen_driver_image: a surface the display engine may show in the output's buffers' place,
+   which the panic screen is drawn into too; returns its number. screen_driver_image_end: that one
+   no longer. The output's buffers given back, or given without N_SCANOUT_DIRECT, end them all.
+   screen_driver_hold: only for the claim of the device whose memory the boot screen is drawn
+   through, or one whose buffers a screen is drawn into; given back when the claim ends.
+   screen_driver_boot_slot: the memory resource (slot) of d the boot screen is drawn through, or -1. */
+struct handle;
+struct hal_claim;
+struct hal_device;
+struct n_scanout;
+struct n_screen_buffers;
+struct n_screen_flip;
+struct n_screen_vblank;
+int64_t screen_driver_give(struct handle *h, uint32_t output, const struct n_screen_buffers *b);
+int64_t screen_driver_flips(struct handle *h, struct n_screen_flip *out, size_t max, uint64_t deadline);
+int64_t screen_driver_vblank(struct handle *h, const struct n_screen_vblank *v);
+int64_t screen_driver_state(struct handle *h, uint32_t output, uint64_t seen, struct n_screen_state *out,
+                            uint64_t deadline);
+int64_t screen_driver_modes(struct handle *h, uint32_t output, const struct n_screen_modes *m);
+int64_t screen_driver_image(struct handle *h, uint32_t output, struct handle *surface, const struct n_scanout *desc);
+int64_t screen_driver_image_end(struct handle *h, int64_t number);
+int64_t screen_driver_hold(struct hal_claim *c, bool hold);
+int screen_driver_boot_slot(const struct hal_device *d);

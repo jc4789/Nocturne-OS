@@ -234,13 +234,39 @@ static void pcie_identify(struct pci_device *d) {
     d->pcie_v2 = (caps & 0xF) >= 2;
 }
 
-/* 台帳へ。親の橋を先に載せる。 */
-static void device_list(struct pci_device *d) {
-    if (d->hal.listed) return;
-    if (d->upstream) device_list(d->upstream);
-    d->hal.info.at.pci = (struct n_pciinfo){d->address.segment, d->address.bus, d->address.dev, d->address.func,
-                                            d->cls, d->subcls, d->progif, d->vendor, d->device};
-    hal_add(&d->hal, d->upstream ? d->upstream->hal.info.id : 0, N_HAL_BUS_PCI);
+/* The function in the device tree, below the bridge it is behind (published first). Its properties
+   are what a rule names (hal_buses.h); a resource is a BAR, its slot the BAR's number. */
+static void function_publish(struct pci_device *d) {
+    if (d->published) return;
+    d->published = true;
+    if (d->upstream) function_publish(d->upstream);
+    struct pci_address a = d->address;
+    struct hal_device *h = &d->hal;
+    hal_device_init(h, N_BUS_PCI, &pci_bus_ops);
+    uint32_t revision = pci_read32(a, 8) & 0xFF;
+    hal_prop_number(h, N_PROP_PCI_VENDOR, d->vendor);
+    hal_prop_number(h, N_PROP_PCI_DEVICE, d->device);
+    hal_prop_number(h, N_PROP_PCI_CLASS, N_PCI_CLASS_CODE(d->cls, d->subcls, d->progif));
+    hal_prop_number(h, N_PROP_PCI_REVISION, revision);
+    if (pci_bar_count(d) == 6) { /* header type 0: the subsystem IDs are in the header */
+        uint32_t sub = pci_read32(a, 0x2C);
+        hal_prop_number(h, N_PROP_PCI_SUBSYSTEM_VENDOR, sub & 0xFFFF);
+        hal_prop_number(h, N_PROP_PCI_SUBSYSTEM, sub >> 16);
+    }
+    hal_prop_number(h, N_PROP_PCI_ADDRESS, N_PCI_TARGET(a.segment, a.bus, a.dev, a.func));
+    unsigned bars = pci_bar_count(d);
+    for (unsigned b = 0; b < bars; b++) {
+        if (!d->bar_size[b]) continue;
+        if (d->bar[b] & 1) hal_resource_add(h, N_HAL_PORT, b, 0, d->bar[b] & ~3u, d->bar_size[b]);
+        else hal_resource_add(h, N_HAL_MEMORY, b, d->bar[b] & 8 ? N_HAL_PREFETCHABLE : 0, pci_bar_address(d, b),
+                              d->bar_size[b]);
+        if (!(d->bar[b] & 1) && (d->bar[b] & 6) == 4) b++;
+    }
+    char where[24];
+    ksnprintf(where, sizeof where, "%04x:%02x:%02x.%x", PCI_ADDRESS_ARGS(a));
+    hal_location(h, where);
+    h->node = d->node;
+    hal_publish(d->upstream ? &d->upstream->hal : NULL, h);
 }
 
 /* The function found at a with this ID on the list. */
@@ -323,7 +349,7 @@ void pci_init(void) {
                 break;
             }
     }
-    for (size_t i = 0; i < ndevices; i++) device_list(&devices[i]);
+    for (size_t i = 0; i < ndevices; i++) function_publish(&devices[i]);
 }
 
 void pci_enable_busmaster(struct pci_device *d) {
@@ -377,7 +403,22 @@ uint64_t pci_bar_address(const struct pci_device *d, unsigned bar) {
    writes and read all-ones. This CPU's interrupts stay off for the probe, so none of its own
    handlers reaches the function then; the console on another CPU still may (dev/fbcon.c), and
    its pixels drawn meanwhile are lost. */
+static uint64_t io_bar_probe(const struct pci_device *d, unsigned bar) {
+    uint8_t off = 0x10 + bar * 4;
+    uint32_t cmd = pci_read32(d->address, 4) & 0xFFFF;
+    uint64_t f = irq_save();
+    pci_write32(d->address, 4, cmd & ~1u); /* I/O decoding off while the BAR is written */
+    pci_write32(d->address, off, 0xFFFFFFFFu);
+    uint32_t mask = pci_read32(d->address, off) & ~3u;
+    pci_write32(d->address, off, d->bar[bar]);
+    pci_write32(d->address, 4, cmd);
+    irq_restore(f);
+    mask |= 0xFFFF0000u; /* a port's address is 16 bits (a BAR that implements fewer says so in its top bits) */
+    return (~mask + 1) & 0xFFFFFFFFu;
+}
+
 static uint64_t bar_probe(const struct pci_device *d, unsigned bar) {
+    if (d->bar[bar] & 1) return d->bar[bar] & ~3u ? io_bar_probe(d, bar) : 0;
     if (!pci_bar_address(d, bar)) return 0;
     bool wide = (d->bar[bar] & 6) == 4;
     uint8_t off = 0x10 + bar * 4;
@@ -743,6 +784,68 @@ static bool transactions_pending(const struct pci_device *d) {
 bool pci_requests_done(const struct pci_device *d) {
     return present(d) && (!d->pcie_cap || !transactions_pending(d));
 }
+
+/* ---- the bus operations of the device tree (hal/hal.h) ---- */
+/* A message where the function has one (MSI-X, then MSI) and may send it, else its INTx: the one
+   specs[0]'s handler answers, the line shared with whatever else sits on it. */
+static unsigned bus_irq_enable(struct hal_device *h, const struct irq_spec *specs, unsigned count, struct irq **irqs) {
+    struct pci_device *d = pci_device_of(h);
+    unsigned n = d->no_messages ? 0 : pci_irq_enable(d, specs, count, irqs);
+    if (n) return n;
+    uint32_t gsi;
+    if (!count || d->intx || !acpi_pci_gsi(d, &gsi)) return 0;
+    pci_write16(d->address, PCI_COMMAND, pci_read16(d->address, PCI_COMMAND) & ~PCI_COMMAND_INTX_DISABLE);
+    d->intx = irq_request_gsi(&specs[0], gsi);
+    if (!d->intx) {
+        intx_disable(d);
+        return 0;
+    }
+    if (irqs) irqs[0] = d->intx;
+    return 1;
+}
+
+static bool bus_irq_disable(struct hal_device *h) {
+    struct pci_device *d = pci_device_of(h);
+    if (d->intx) {
+        intx_disable(d);
+        irq_free(d->intx);
+        d->intx = NULL;
+    }
+    return d->msi_count || d->msix_irqs ? pci_irq_disable(d) : true;
+}
+
+static unsigned bus_irq_max(struct hal_device *h) {
+    struct pci_device *d = pci_device_of(h);
+    unsigned most = d->no_messages ? 0 : pci_msix_max_vectors(d);
+    if (!most && !d->no_messages) most = pci_msi_max_vectors(d);
+    return most ? most : 1;
+}
+
+static void bus_enable(struct hal_device *h, unsigned what) {
+    struct pci_device *d = pci_device_of(h);
+    d->kernel_owned = true;
+    uint16_t cmd = pci_read16(d->address, PCI_COMMAND);
+    if (what & HAL_ENABLE_MEMORY) cmd |= PCI_COMMAND_MEMORY;
+    if (what & HAL_ENABLE_PORTS) cmd |= PCI_COMMAND_IO;
+    if (what & HAL_ENABLE_DMA) cmd |= PCI_COMMAND_MASTER;
+    pci_write16(d->address, PCI_COMMAND, cmd);
+}
+
+/* No new request from the function, and none of its non-posted ones outstanding (pci_requests_done). */
+static bool bus_stop(struct hal_device *h) {
+    struct pci_device *d = pci_device_of(h);
+    return pci_disable_busmaster(d, NULL) && pci_requests_done(d);
+}
+
+const struct hal_bus_ops pci_bus_ops = {
+    .irq_enable = bus_irq_enable,
+    .irq_disable = bus_irq_disable,
+    .irq_max = bus_irq_max,
+    .enable = bus_enable,
+    .stop = bus_stop,
+    .claim = &pci_claim_ops,
+};
+
 
 /* RRS Software Visibility (Root Control, 7.5.3.12): with it on, a Vendor ID read of a function
    still initializing completes with FFFF0001h (2.3.2) instead of the Root Complex retrying it

@@ -42,7 +42,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 - カーネル資源はすべて**種類つきハンドル**（`n_handle`、非負の `int32_t`）で表す。
 - 種類：`N_KIND_DOCUMENT`、`N_KIND_FOLDER`、`N_KIND_CHANNEL`、`N_KIND_WINDOW`、
   `N_KIND_SHARED`、`N_KIND_APP`、`N_KIND_EVENTS`、`N_KIND_DEVICE`（開いた音の出口。§17）、
-  `N_KIND_CONNECTION`（TCP／UDP）、`N_KIND_PCI`、`N_KIND_PAGER`、`N_KIND_WATCH`（見張り。下）、
+  `N_KIND_CONNECTION`（TCP／UDP）、`N_KIND_HAL_CLAIM`、`N_KIND_PAGER`、`N_KIND_WATCH`（見張り。下）、
   `N_KIND_CAPABILITY`（能力。§13）、`N_KIND_CONSOLE`（コンソール。§4）。12 は欠番（§10）。
 - 汎用操作は `n_handle_close(h)` と `n_handle_kind(h)` だけ。読み書きは種類ごとの
   専用関数で行い、種類の違うハンドルを渡すと `N_ERR_WRONG_KIND`。
@@ -521,8 +521,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 
 ## 9. 装置
 
-- 音声、PCI一覧、カーネルログ等の `/dev` ファイルは、種類つきハンドルと専用の関数へ移す。
-  ファイルとして読み書きしない。
+- 音声、装置の台帳、カーネルログはファイルではない。種類つきハンドルと専用の関数で扱う。
 - CPU：`cpu_info(struct n_cpuinfo *)`（`SYS_CPU_INFO`）。`detected_cpus` はファームウェアが
   示す CPU の数、`online_cpus` は動いている数、`scheduler_cpus` はアプリの thread を走らせる数で、
   動いている全部。`flags` は全 CPU が持つ機能（`N_CPU_SSE2`・`N_CPU_AVX`・`N_CPU_USER_THREADS`）。
@@ -532,31 +531,51 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 - システムログ：`n_system_log(buf, cap)` か `n_system_log_open()` のハンドルの
   `n_channel_receive` で読み、そのハンドルへ `n_channel_send` で書く（§4）。
 - アプリの中の装置ドライバー（例：NVIDIA の資源管理 `C:\Nocturne\System\nvrm`、`docs/records/nvidia/LEDGER.md`）：
-  - 機能の住所は `N_PCI_TARGET(segment, bus, dev, func)` で、`uint32_t` の全部が住所である。`N_PCI_SELF`
-    は `n_pci_config_read` の `target` で「claim した機能そのもの」を言い、32 bit の外にある。`struct n_pciinfo`
-    と `struct n_pci_function` は `segment` を持つ。上にブリッジがある機能は `N_PCI_HAS_UPSTREAM` が立ち、
+  - 装置は台帳（下の「装置の台帳」）の `id` で指す。どのバスの装置も同じ呼出しで claim でき、バスごとの呼出しは
+    `n_hal_bus_call` を通る。`N_PCI_TARGET(segment, bus, dev, func)` は PCI の機能の住所（`uint32_t` の全部）で、
+    台帳では `N_PROP_PCI_ADDRESS` の値である。`N_PCI_SELF` は `struct n_hal_pci_config` の `target` で
+    「claim した機能そのもの」を言い、32 bit の外にある。上にブリッジがある機能は `N_PCI_HAS_UPSTREAM` が立ち、
     `upstream` がその住所である。
-  - `n_pci_claim(cap, target)` は PCI 機能を動かす権利（`N_KIND_PCI`）を返す。`target` は `N_PCI_TARGET`。`cap` は
-    `N_CAP_PCI_CLAIM`（§13）で、サービスの管理者が宣言のあるドライバーアプリにだけ渡す。カーネルのドライバーが使う
-    機能と、既に権利のある機能は `N_ERR_BUSY`。同じ group の機能をカーネルのドライバーが使って
-    いても、それが手放せるもの（`struct iommu_guest`：GPU の音の機能）なら、その機能は止まり、
-    権利ができた後に domain の中で動き直す。権利が終わると、次の権利まで止まったまま。
-    最後のハンドルが閉じると、カーネルは
-    (1) その権利の BAR オブジェクトの写像を全アプリから外し（その範囲は予約のまま、触れると
-    全 1 が読める読取り専用のページ。バスから消えた装置と同じ）、(2) 割り込みとバスマスターを
-    止め、(3) IOMMUの遮断を確認する。終了処理内で装置の回復を待たず、FLRもしない。
+  - `n_hal_claim(cap, device)` は台帳の装置 `device`（`id`）を動かす権利（`N_KIND_HAL_CLAIM`）を返す。`cap` は
+    `N_CAP_HAL_CLAIM`（§13）で、サービスの管理者が宣言のあるドライバーアプリにだけ渡す。持っている実装がある装置
+    （カーネルのドライバーが動かしているもの）と、既に権利のある装置は `N_ERR_BUSY`。プロセスの実装を許さない
+    装置（PCI のブリッジ）は `N_ERR_UNSUPPORTED`。同じ group の機能をカーネルのドライバーが使っていても、それが
+    手放せるもの（`struct iommu_guest`：GPU の音の機能）なら、その機能は止まり、権利ができた後に domain の中で
+    動き直す。権利が終わると、次の権利まで止まったまま。
+    権利を持つ間、台帳のその装置は `N_HAL_RUNNING` で、`driver` はアプリの名になる。権利は
+    最後のハンドルが閉じたとき（アプリの終わりを含む）と、装置がバスから去ったときに終わる。
+    終わるとカーネルは (1) その権利の写像（`n_hal_map`）を全アプリから外し（その範囲は予約のまま、触れると
+    全 1 が読める読取り専用のページ。バスから消えた装置と同じ）、(2) 割り込みとバスマスターを止め、
+    (3) IOMMUの遮断を確認し、(4) 提供（`n_hal_offer`）を台帳から外す。終了処理内で装置の回復を待たず、FLRもしない。
     IOMMUなしでは、clean closeでも汎用PCI読出しだけでDMA停止を保証できないため残存DMAページを保全する。
     PCIeのTransactions Pendingはnon-posted要求だけであり、全TC・RO・IDOのposted DMAの終了を
     一般に証明しない（PCIe 6.0 §6.4、§7.5.3.5）。
     終わったと確かめられない権利の DMA 用メモリは、解放せずに隔離する。アプリの終了時は
-    権利のハンドルを他のハンドルとマッピングより先に閉じる。BAR オブジェクトのビュー・写像・
+    権利のハンドルを他のハンドルとマッピングより先に閉じる。写像のビュー・
     DMA アドレスの照会は、権利が終わった後は `N_ERR_CLOSED`。
     異常終了した装置の再claimには隔離が必要。非画面機能は次claimでFLRを試し、未準備・取消なら
     保存状態を装置に保持し、次回に復元を再開する。完了までハンドルを返さない。
     起動画面GPUはgeneric FLRをせず、`N_PCI_NEEDS_RECOVERY`でnative driverへ回復責務を渡す。
     フレームバッファー描画の再開はscanoutの復旧保証ではなく、FLR成功も旧DMAのdrain証明ではない。
-  - `n_pci_info` は ID、BAR、MSI／MSI-X の数、上流のブリッジ、起動時の画面がその機能の BAR に
-    あるならその位置（ドライバーはそこを壊さない）を返す。
+  - 権利の呼出し（`N_CAP_HAL_CLAIM` を持つアプリが、持った権利に対して使う）：
+    - `n_hal_claim_resources(claim, out, max)`：装置が持つ資源（`struct n_hal_resource`：メモリ、ポート、GSI）の
+      一覧を書き、全部の数を返す。`slot` はバスが決める番号で、PCI は BAR の番号である。
+    - `n_hal_map(claim, slot)`：メモリの資源を装置メモリの共有オブジェクト（既定は非キャッシュ、プリフェッチ可能なら
+      書込み結合も許す）にする。1 ページ未満や境界の合わない資源、ポートは `N_ERR_UNSUPPORTED`。
+    - `n_hal_interrupts(claim, count)`・`n_hal_interrupt_take(claim, bits, words, deadline)`：下の割り込み。
+    - `n_hal_bus_call(claim, op, in, in_size, out, out_size)`：バスの持つ呼出し。`op` と `in`・`out` の形はバスの
+      見出し（`common/hal_buses.h`）が決め、入力は 128 KiB、出力は 1 MiB まで。バスが持たなければ `N_ERR_UNSUPPORTED`。
+      PCI の呼出しは `n_hal_pci_info`・`n_hal_pci_config_read`・`n_hal_pci_config_write`・`n_hal_pci_hold_screen`・
+      `n_hal_pci_acpi_eval`・`n_hal_pci_acpi_notify_take`（libc の包み）で、以降の項がその意味を言う。
+    - `n_hal_offer(claim, kind, instance, label)`・`n_hal_offer_withdraw(claim, kind, instance)`：この権利の実装が
+      装置で提供するもの（`N_OFFER_GPU`、`N_OFFER_SCREEN` など）を台帳に載せ、外す。同じ `kind` と `instance` は
+      `N_ERR_EXISTS`。権利が終わると全部外れる。
+    - `n_hal_power_wait(claim, deadline)`・`n_hal_power_done(claim, ok)`：眠りと休止（dev/pm.c）の前に、権利を持つ
+      アプリへ止める時を知らせる。`n_hal_power_wait` は眠りの手順が始まるまで待ち（期限は §8）、`N_HAL_POWER_SUSPEND`
+      か `N_HAL_POWER_RESUME` を返す。アプリは装置を止め終えたら `n_hal_power_done` で知らせる。止めない実装は
+      `n_hal_power_wait` を呼ばず、その権利がある間、眠りと休止は始まらない（NVIDIA の `nvrm` は呼ばない）。
+  - `n_hal_pci_info`（`N_PCI_CALL_INFO`）は ID、BAR、MSI／MSI-X の数、上流のブリッジ、起動時の画面がその機能の BAR に
+    あるならその位置（ドライバーはそこを壊さない）を返す（`struct n_hal_pci_info`）。
   - 構成空間：読みはホストから自分までの経路だけ。自分と同じ装置の他の機能、上流の各ブリッジと
     その装置の他の機能（ルートポートが機能 1 以降で、機能 0 がホストブリッジの機械がある。
     ドライバーは機能 0 が答えない装置を飛ばす）、ホストブリッジ（チップセットの識別）。無関係な装置は
@@ -612,7 +631,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     作る）、回復が必要な機能として残す。primaryが戻らない場合と、回復不能・取消・未準備・
     起動画面のpeerは`N_ERR_NOT_READY`としてgroupを再遮断する。
     native driverへの回復委任は新primaryだけであり、未知peerの回復を暗黙に委ねない。
-  - `n_pci_hold_screen(pci, hold)`：起動時の画面がその機能の BAR にあるとき、ドライバーが
+  - `n_hal_pci_hold_screen(claim, hold)`：起動時の画面がその機能の BAR にあるとき、ドライバーが
     CPU から画面への経路を作り直す間（NVIDIA の RM は GSP が BAR1 を仮想モードにする間）、
     システムは画面へ書かない。`true` は書込み中のものが終わってから戻り、入れ子にできる。最後の
     `false`（または claim の終わり）で画面全体を描き直す。時間切れで描画を再開することはない
@@ -622,15 +641,17 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     再開する（scanout の復旧保証ではない。時間の既定は無し：RM の待ちは次々に続き、上限を
     決められない。遅いだけのドライバーを止めると GPU が使えなくなる）。
     画面が別の所なら `N_ERR_NOT_FOUND`。パニック画面は保持に関係なく描く。
-    `n_pci_give_screen` で画面を自分の面へ移したドライバーも、同じく保持できる（画面 0 の面）。
-  - 画面と出力：表示機能（PCI クラス 03）のドライバーは出力（コネクター・head・表示エンジンの
+    `n_screen_give` で画面を自分の面へ移したドライバーも、同じく保持できる（画面 0 の面）。
+  - 画面の呼出し（`n_screen_give`・`n_screen_flips`・`n_screen_report_vblank`・`n_screen_offer_modes`・
+    `n_screen_read_state`・`n_screen_image_add`・`n_screen_image_end`、`SYS_SCREEN_*`）は claim の handle を取り、
+    その claim の装置の画面を扱う。画面を出す装置のドライバーは出力（コネクター・head・表示エンジンの
     pipe など、ドライバー自身の番号）ごとに画面を一つ出す。起動時の画面が通る機能の出力 0 が
     画面 0（タスクバーのある画面）で、ほかの出力はそれぞれ自分の画面を持つ。同じ機能の同じ出力は、
     どのドライバーが駆動しても同じ画面になる。画面の数に上限は無く、画面は消えない（ドライバーが
     去った画面は、次に面を渡されるまで消えている）。画面ごとにモード・リフレッシュ・可変
     リフレッシュの範囲・垂直帰線・フリップを持ち、合成も画面ごとのスレッドがその画面の周期の
     締切で行う。
-  - `n_pci_give_screen(pci, output, buffers)`：ドライバーが出力の scanout を組んだら、その面
+  - `n_screen_give(claim, output, buffers)`：ドライバーが出力の scanout を組んだら、その面
     （`struct n_screen_buffers`：一つのモードと形式の面を `count` 枚、1〜`N_SCREEN_BUFFERS_MAX`）を
     システムへ渡す。戻った時からその出力の画面は渡した面へ描かれ、その大きさになり、画面 0 なら
     起動時の画面（GOP）へは書かない（`buffers` に NULL を渡して返すか claim の終わりまで）。
@@ -643,7 +664,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     どれか。幅と高さは表示エンジンが出すモードのもの（ドライバーがモードを出した後はシステムが
     選んだモード、`struct n_screen_state` の `mode`。各 65535 まで）で、画面はその大きさに
     なり、その画面の全画面・最大化の窓も従う。システムはコマを、出力が表示していない面へだけ描き、
-    描き終えたらその面のフリップを求める（`n_pci_screen_flips`、下）。表示中の面へ CPU が書くことは
+    描き終えたらその面のフリップを求める（`n_screen_flips`、下）。表示中の面へ CPU が書くことは
     無い。一枚だけなら、ほかに面が無いので表示中の面へ描き、書いたとおりに映る（フリップの知らせは
     届くが、待たずに表示されたものとする）。戻り値は、その出力の前の面への最後のフリップの番号
     （無ければ 0）：その番号までのフリップは前の面のもので、まだ取っていないものは消える。
@@ -653,18 +674,18 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     全体を描き直す。システムログに 1 行。0 枚・`N_SCREEN_BUFFERS_MAX` 超・0 や 65535 超の大きさ・
     未知の形式・面に収まらない範囲・返す面が無いことは `N_ERR_INVALID`、その大きさの画面が
     メモリーに収まらなければ `N_ERR_NO_MEMORY`（画面はそのまま）、ほかの claim のオブジェクト・
-    表示機能でない claim は `N_ERR_DENIED`。claim の終わり（クラッシュを含む）では、装置を止めて
+    claim の終わり（クラッシュを含む）では、装置を止めて
     から画面を消し、画面 0 は起動時の画面へ戻して描き直す。ただしドライバーが表示エンジンを
     組み替えていれば、その画面は実際には映らないことがある（戻す処理は無い。ログにもそう書く）。
     保持はこれまでどおり全部の書込みを止め、パニック画面はすべての画面の面と、
-    `n_pci_screen_image`（下）で登録された面のすべてへ描く。スリープと休止は、claim のある間
+    `n_screen_image_add`（下）で登録された面のすべてへ描く。スリープと休止は、claim のある間
     始まらない（dev/pm.c）ので、ドライバーの面が表示中に起きることはない。
-  - `n_pci_screen_flips(pci, out, max, deadline)`：claim の出力の画面が求めるフリップ
+  - `n_screen_flips(claim, out, max, deadline)`：claim の出力の画面が求めるフリップ
     （`struct n_screen_flip`：出力、面の番号、出力ごとに 1 から数える `serial`）を `max` 件まで
     読む。無ければ期限（§8）まで待ち、期限で 0。取る前の出力のフリップは、
     その出力の次のフリップに置き換わる。ドライバーはその面を次の垂直帰線から出し、表示した帰線を
-    `n_pci_screen_vblank` の `flip_serial` で知らせる。画面の次のコマはその知らせを待つ。
-  - `n_pci_screen_vblank(pci, vblank)`：渡した面の出力の垂直帰線（`struct n_screen_vblank`）を
+    `n_screen_report_vblank` の `flip_serial` で知らせる。画面の次のコマはその知らせを待つ。
+  - `n_screen_report_vblank(claim, vblank)`：渡した面の出力の垂直帰線（`struct n_screen_vblank`）を
     知らせる。`count` はドライバーの帰線番号、`time_ns` は表示エンジンが測った帰線の始まりを
     システムの単調時計（§8、ナノ秒）へ直したもの、`buffer` はその帰線から表示中の
     面、`flip_serial` はその帰線が表示する最後のフリップ（無ければ 0）。フリップを表示する帰線は
@@ -673,7 +694,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     `N_ERR_DENIED`。
   - モニターのモード（解像度、リフレッシュレート、色の深さと形式、可変リフレッシュ）：選ぶのはサービス `display` と利用者、
     列挙・検証・設定はドライバー。カーネル（gui/screenmode.c）は一覧と望みを運ぶだけで、選ばない。起動の時は
-    ファームウェアの面で動き、望みが来るまでそのまま。`n_pci_screen_modes(pci, output, modes)` で表示機能のドライバーが、
+    ファームウェアの面で動き、望みが来るまでそのまま。`n_screen_offer_modes(claim, output, modes)` で画面を出す装置のドライバーが、
     出力ごとに、駆動するモニター（`struct n_screen_modes` の `monitor`：EDID の製造者・製品・製造番号から作る
     識別子、`name`：EDID のモニター名）と、そこで出せるモード（最大 `N_SCREEN_MODES_MAX`。EDID の
     推奨モードに `N_SCREEN_MODE_PREFERRED`、可変リフレッシュで出すモードに `N_SCREEN_MODE_VRR`。
@@ -682,13 +703,12 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     `n_screen_mode_apply(cap, screen, mode)`（`SYS_SCREEN_MODE_APPLY`、`N_CAP_DISPLAY`）が望みを渡す：提供に無いモードは
     `N_ERR_INVALID`、提供が無ければ `N_ERR_NOT_FOUND`、全部 0 は望みなし。カーネルはこれを `struct n_screen_state` の
     `mode` と `mode_serial`（望むたびに進む。同じモードでも）でドライバーへ伝える。ドライバーは
-    それを出し（その大きさで `n_pci_give_screen`）、`done` に `mode_serial`、`shown` に出せたモードを
+    それを出し（その大きさで `n_screen_give`）、`done` に `mode_serial`、`shown` に出せたモードを
     入れて知らせ直す。望まれたものと違えば、カーネルは `refused_serial` にその番号を入れて報告するだけで、次を決めるのは
     サービス。`done` 0（開始時、モニターの変化・接続時）は `offer_serial` を進める。`count` 0 は、動いた
     ままモニターを駆動しなくなったこと、claim の終わりはドライバーが止まったこと。面を返した
     （`buffers` NULL）ドライバーがモードを出したままなら、次の望みで
-    `mode_serial` が進むので、それを見てもう一度モードを出せる。表示機能でなければ
-    `N_ERR_DENIED`、件数・0 の大きさやリフレッシュ・65535 超は `N_ERR_INVALID`。
+    `mode_serial` が進むので、それを見てもう一度モードを出せる。件数・0 の大きさやリフレッシュ・65535 超は `N_ERR_INVALID`。
   - 誰でも `SYS_SCREEN_INFO` の第3引数 `SCREEN_MODES_GET`（`n_screen_modes_get`、`struct screen_modes`：モニター、
     モード、表示中と望まれたモード、ドライバーが出せなかった最後の望み `refused_serial`（モニターが来てから無ければ 0）、
     画面の出所 `source`、画面の数 `screens`、デスクトップの中の位置と大きさ、`placed`、`primary`、`scale_percent`）で読む
@@ -729,18 +749,18 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
   - コマの拍：合成は画面ごとに、その画面のリフレッシュの周期を締切にしたスレッドで描く
     （`sched_deadline`）。周期はドライバーが出しているモード（`shown`）か、起動時の画面なら
     EDID のそのモードのタイミングから取る。二枚以上の面の画面では、フリップの表示（上の
-    `n_pci_screen_vblank`）ごとに 1 枚を描き始める。フリップがすぐ表示される画面（一枚の面）では、
+    `n_screen_report_vblank`）ごとに 1 枚を描き始める。フリップがすぐ表示される画面（一枚の面）では、
     周期の次の時刻より前には描かない。可変リフレッシュの画面は描けしだい 1 枚、最も速い
     リフレッシュまで。周期が分からない画面は、絵が変わったときに描く。どれで刻んでいるかは
     `wm: screen` の行が言う。
-  - 直接表示：`n_pci_give_screen` の `format` に `N_SCANOUT_DIRECT` を足したドライバーは、
+  - 直接表示：`n_screen_give` の `format` に `N_SCANOUT_DIRECT` を足したドライバーは、
     全画面の窓の絵を合成を通さずに自分で映せる（デスクトップの合成はこれまでどおり渡した面へ
     続く。ドライバーは映す面を切り替えるだけ）。窓は `win_direct(win, true)` で望み、
     全画面・表示中・入力を持つ窓で、メニュー・音量・通知・大きさ変更の枠・遠隔の利用者が
     無い間だけ許される。許可の出入りは窓へ `EV_DIRECT`（key 1 許可、0 取消し）、今の状態は
     `win_state` の `WIN_STATE_DIRECT`。取り消された窓へは描き直しの損傷も送るので、
     窓は自分の通常の面へ描き直す。
-  - `n_pci_screen_state(pci, output, seen, out, deadline)`：出力の画面をこの claim の面へ描かせているか、
+  - `n_screen_read_state(claim, output, seen, out, deadline)`：出力の画面をこの claim の面へ描かせているか、
     モードを出したドライバーが、出すべきモード（`mode`、`mode_serial`。上）と、直接表示を受け持つ
     なら許可された窓（`struct n_screen_state` の `app`。無ければ 0）と、その間ドライバーが
     描くポインター（位置・表示の有無・32×32 の ARGB 画像とその要点、画像が変わると
@@ -749,21 +769,21 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     （過ぎた期限は待たない。`N_ERR_TIMEOUT` でも今の状態を書く）。画面がこの claim の面でなく、
     モードも出していなければ `N_ERR_DENIED`。claim の終わりと起動時の
     画面への返却で直接表示は終わり、許可も取り消す。
-  - `n_pci_screen_image(pci, output, surface, desc)`／`n_pci_screen_image_end(pci, image)`：直接表示を
+  - `n_screen_image_add(claim, output, surface, desc)`／`n_screen_image_end(claim, image)`：直接表示を
     受け持つドライバーが、出力に渡した面の代わりに表示エンジンへ出すことのある面（アプリの絵）を
     登録する。カーネルが止まると、表示エンジンは最後にフリップされた面を出し続け、渡した面へ
     戻すドライバーはもう動かない。そのためパニック画面は、渡した面と登録された面のすべてへ
     描く。システムがそこへ描くのはこの時だけ。`surface` と `desc`（`struct n_scanout`：幅・高さ・
-    `pitch`・形式と、面の中の最初の行の `offset`）は `n_pci_give_screen` の一枚と
+    `pitch`・形式と、面の中の最初の行の `offset`）は `n_screen_give` の一枚と
     同じ条件（`format` に `N_SCANOUT_DIRECT` は付けない。大きさは面自身のもので、表示エンジンが
     モードの大きさへ拡大縮小してよい。パニック画面はその大きさで描く）で、カーネルは同じく型を固定して
-    写す。正の番号を返し、`n_pci_screen_image_end` にその番号を渡すと登録を外す（ドライバーは
+    写す。正の番号を返し、`n_screen_image_end` にその番号を渡すと登録を外す（ドライバーは
     面の memory を解放する前に外す）。`N_SCANOUT_DIRECT` 無しで渡し直すこと、起動時の画面への
     返却、claim の終わりで、登録はすべて外れる。出力の画面がこの claim の `N_SCANOUT_DIRECT` の面で
-    ない、またはオブジェクトが `n_pci_give_screen` の受け付けないものなら `N_ERR_DENIED`、0 や
+    ない、またはオブジェクトが `n_screen_give` の受け付けないものなら `N_ERR_DENIED`、0 や
     65535 超の大きさ・未知の形式・面に収まらない範囲、または外す番号が無ければ `N_ERR_INVALID`。登録できない絵は表示エンジンへ
     出さないこと（パニック画面が見えなくなる）。
-  - `n_pci_acpi_eval(pci, node, name, args, nargs, data, data_size, out, out_size)`：claim した
+  - `n_hal_pci_acpi_eval(claim, node, name, args, nargs, data, data_size, out, out_size)`：claim した
     機能に属する ACPI の名前を一つ評価する（カーネルの AML 解釈器で）。`node` は
     `N_ACPI_SELF`（その機能の装置：ホストブリッジの `_SEG`／`_BBN` から `_ADR` をたどる）、
     `N_ACPI_CHILD(i)`（その装置の i 番目の子装置）、`N_ACPI_UPSTREAM`（上流のブリッジ、
@@ -806,18 +826,16 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
       上流のブリッジの独自の名前はその下の全機能（ホストブリッジなら機械全体）に効くので、そこ
       では全部断る。RM（ports/nvidia/os_acpi.c）が使う、自分の装置と上流の `_DSM`、自分の装置の
       `_ROM`・`_DOD`、子の `_ADR`・`_DDC`・`MXDS`・`MXDM` はどれも断る方法に当たらない。
-  - `n_pci_acpi_notify_take(pci, deadline)`：その機能の装置へ届いた ACPI の Notify を一つ
+  - `n_hal_pci_acpi_notify_take(claim, deadline)`：その機能の装置へ届いた ACPI の Notify を一つ
     取り出し、値を返す（最初の呼出しで受取りを始め、claim の終わりまで続く。32 個まで溜め、
     溢れたら古いものから捨てる）。期限（§8）まで届かなければ `N_ERR_TIMEOUT`、装置が
     無ければ `N_ERR_NOT_FOUND`。
-  - `n_pci_bar(pci, i)` はメモリ BAR を装置メモリの共有オブジェクト（既定は非キャッシュ）にする。
-    1 ページ未満や境界の合わない BAR、I/O ポートは扱わない。
-  - `n_pci_interrupts(pci, count)` は MSI-X（無ければ MSI）を、機能と系が出せる本数まで
+  - `n_hal_interrupts(claim, count)` は MSI-X（無ければ MSI）を、機能と系が出せる本数まで
     つなぎ、本数を返す。INTx はアプリへ渡さない。届いた割り込みは番号のビットを立て、ビットが
-    ある間ハンドルは `N_EVENT_RECEIVABLE`。`n_pci_interrupt_take(pci, bits, words, deadline)` は
+    ある間ハンドルは `N_EVENT_RECEIVABLE`。`n_hal_interrupt_take(claim, bits, words, deadline)` は
     先頭 `64 × words` 本のどれかが届くまで待ち（期限は §8）、それらのビットを `bits` へ書いて
     消し、書いた語の数を返す。番号 n は `bits[n / 64]` のビット `n % 64`。後ろの番号のビットは残る。
-  - `n_dma_create(pci, bytes, flags)` は装置が DMA で読み書きできる 0 埋めの RAM（共有
+  - `n_dma_create(claim, bytes, flags)` は装置が DMA で読み書きできる 0 埋めの RAM（共有
     オブジェクト）。`N_DMA_CONTIGUOUS` は物理的に一続き、`N_DMA_32BIT` は 4GiB 未満。
     `n_dma_addresses` が各ページのバスアドレスを返す（物理アドレス。IOMMU が隔離していても
     同じ番地に写すので変わらない）。
@@ -877,7 +895,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
       表で動いたまま）。TSC周波数が不明なら推測周波数を使わず、即座にreadyと確認できない操作を失敗にする。
     - 限界：AMD-Vi の装置表は SMI を止められない（SMI フィルターはファームウェアの SMI も止め
       うるので使わない）。claim した装置が SMI のメッセージを送れば SMM へ届く。
-    隔離されている装置は `n_pci_info` の `flags` に `N_PCI_ISOLATED`。IOMMU が無い機械、起動
+    隔離されている装置は `n_hal_pci_info` の `flags` に `N_PCI_ISOLATED`。IOMMU が無い機械、起動
     オプション `noiommu`、隔離できない装置は既定でclaimを拒否する。`appdrivers-unisolated`を明示した
     非隔離claimは全メモリへ届くため、その危険をログに残す。対応幅を超す物理アドレスをPTEへ切り詰めず拒否し、
     DMA確保は実際の変換幅内へ制限する。IVMDのaccess=0/ROをDMAオブジェクトが拡大せず、解放で予約を消さない。
@@ -924,13 +942,15 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
 
 ### 装置の台帳
 
-`SYS_HAL_LIST`（`n_hal_list(out, max)`）は、機械で見つかった物の一覧 `struct n_hal_device` を写す。戻りは写した数でなく全部の数である。PCI の機能、USB の装置、VMBus の channel、固定のポートの制御器が載る。`n_hal_snapshot(&list)` は全部を malloc の領域へ写す。
+`SYS_HAL_LIST`（`n_hal_list(out, bytes)`）は、機械で見つかった物の木を `struct n_hal_device` の並びで `out` へ写し、全部の大きさを返す。`bytes` が足りなければ何も写さずに要る大きさだけを返す。親の下に子が続く順で、先頭は根である。装置の木は、バスの制御器と、その下の装置（PCI の機能、USB の装置、VMBus の channel、ACPI の装置、固定のポートの制御器など）からなる。`n_hal_snapshot(&snapshot)` は全部を malloc の領域へ写し、`first` と `count` を書いて件数を返す。`first` は呼ぶ者が `free` する。
 
-`id` は起動の間、二度と使わない。`parent` は親の `id` で、0 は親なしである。`state` は `N_HAL_UNBOUND`（持っている実装が無い）、`N_HAL_RUNNING`（`driver` が持っている）、`N_HAL_FAILED`（`driver` が持てなかった。理由は `reason`）。`name` は装置が言う名で、言わないなら空である。`at` は `bus` ごとの身元である。
+記録は `struct n_hal_device` の後ろに、性質（`n_hal_prop`）、提供（`n_hal_offer`）、依存先の `id`、性質のバイトの区画が続く。読む口は `n_hal_device_props`・`n_hal_device_offers`・`n_hal_device_depends`・`n_hal_device_number`・`n_hal_device_next`。`id` は起動の間、二度と使わない。`parent` は親の `id` で、根の `parent` は 0 である。`bus` は `N_HAL_PROP_BUS` と同じ名で、台帳はバスの名の意味を知らない。性質の鍵はバスが決める（`common/hal_buses.h`）：PCI の機能は `N_PROP_PCI_VENDOR`・`N_PROP_PCI_DEVICE`・`N_PROP_PCI_CLASS`・`N_PROP_PCI_ADDRESS` などを持つ。
 
-`SYS_HAL_WATCH`（`n_hal_watch()`）は、一覧が変わると知らせる見張りの handle を返す（`n_watch_take`）。
+`state` は `N_HAL_UNBOUND`（持っている実装が無い）、`N_HAL_ATTACHING`（実装が立ち上げている）、`N_HAL_RUNNING`（`driver` が持っている）、`N_HAL_FAILED`（`driver` が持てなかった、または止まった。理由は `reason`）。`name` は装置が言う名で、言わないなら空である。`location` はバスの中の場所の字で、バスが書く。`driver` は持っている実装の名で、プロセスの実装ではプログラムの名である。提供（`n_hal_offer`）は、実装がその装置で出すもの（ディスク、網、音の出口、入力、画面、GPU）の種類 `kind`、番号 `instance`、人に見せる名 `label` である。
 
-`pcilist(out, max)` は台帳から PCI の機能だけを `struct n_pciinfo` へ写す libc の関数である。戻りは写した数である。
+規則 `struct n_hal_rule` は項（`struct n_hal_term`）の並びで、全部の項が装置の性質に合えば合う。`n_hal_device_rule_score(device, rule)` は合えば項の数、合わなければ 0 を返す。サービスの管理者は、サービスの宣言の規則に合う `N_HAL_UNBOUND` の装置ごとに実例を一つ起こし、実例の引数に装置の `id` を 16 進数で渡す。
+
+`SYS_HAL_WATCH`（`n_hal_watch()`）は、台帳が変わると知らせる見張りの handle を返す（`n_watch_take`）。
 
 ## 10. 番号と、ほかの節に無い呼出し
 
@@ -1303,7 +1323,7 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
   `n_app_open`、`proclist`、`clipboard_get` がこの規則に従う。
 - 能力（`N_KIND_CAPABILITY`）は特権を一つ持つハンドル。持つことが権限の証明で、渡すことが委譲。
   起動の表か、メッセージの添付で渡す。
-  - 種類：`N_CAP_ROOT`、`N_CAP_SERVICE_ROOT`、`N_CAP_IDENTITY_GRANT`、`N_CAP_PCI_CLAIM`、`N_CAP_POWER`、
+  - 種類：`N_CAP_ROOT`、`N_CAP_SERVICE_ROOT`、`N_CAP_IDENTITY_GRANT`、`N_CAP_HAL_CLAIM`、`N_CAP_POWER`、
     `N_CAP_SCREEN_READ`、`N_CAP_SETTINGS_APPLY`、`N_CAP_STORE_PRIVATE`、`N_CAP_SHELL`、`N_CAP_NETWORK`、`N_CAP_CLOCK`、`N_CAP_DISPLAY`、`N_CAP_AUDIO_DEVICE`。
   - カーネルが作るのは `N_CAP_ROOT` を一つだけで、最初のプロセスがハンドル `N_INITIAL_ROOT_HANDLE`
     （3）で受ける。最初のプロセスの身元は `user` 0、`session` 0、`N_CLASS_SYSTEM`、`program` 0。
@@ -1315,7 +1335,7 @@ Escape を一覧が取り、ほかのキーは KEY としてアプリへ届く�
 
 | 呼出し | 要るもの |
 |---|---|
-| `n_pci_claim` | `N_CAP_PCI_CLAIM` |
+| `n_hal_claim` | `N_CAP_HAL_CLAIM` |
 | `poweroff`、`reboot`、`n_power_request`、`n_power_events`、`n_power_events_watch`、`n_power_windows`、`n_power_windows_watch`、`n_power_say` | `N_CAP_POWER` |
 | `n_screen_mode_apply`、`n_screen_arrange` | `N_CAP_DISPLAY` |
 | `screen_grab` | `N_CAP_SCREEN_READ` |

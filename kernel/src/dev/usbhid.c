@@ -7,6 +7,7 @@
 #include "arch/spin.h"
 #include "dev/input.h"
 #include "dev/usb.h"
+#include "hal/hal.h"
 #include "mm/heap.h"
 #include "sys/alarm.h"
 #include "sys/clock.h"
@@ -37,8 +38,8 @@ struct keyfield {
    reports and its key repeat alarm; the rest is set at attach and stays. */
 struct hid {
     struct hid *next;     /* in hids */
-    struct hid *sibling;  /* the device's other HID interfaces (its worker's) */
     struct usb_device *dev;
+    struct usb_interface *node; /* the HAL node it is bound to */
     struct input_device input;
     char *input_id;
     struct spinlock lock;
@@ -55,7 +56,7 @@ struct hid {
     bool leds;            /* has an output report with the Caps Lock LED (HID 7.2.2, HUT 11) */
     uint8_t led_report;   /* its ID, 0 without */
     uint32_t led_bit, led_len; /* the LED's bit in the report's data, and the data's bytes */
-    unsigned leds_seen;   /* the leds_gen its lights show (its worker's) */
+    unsigned leds_seen;   /* the leds_gen its lights show (the worker's) */
     unsigned longest;     /* bytes of its longest input report, with the ID; 0: not known */
     uint16_t report_bytes[256]; /* of each input report by its ID, with the ID; 0: not known */
     /* Under lock, what has come of a report that takes more than one packet: a USB transfer holds one
@@ -198,7 +199,7 @@ static bool key_report(struct hid *h, uint8_t report, const uint8_t *data, unsig
     return caps;
 }
 
-/* Caps lock changed: every keyboard's worker lights it (usbhid_work). */
+/* Caps lock changed: every keyboard's worker lights it (hid_work). */
 static void caps_toggled(void) {
     __atomic_fetch_add(&leds_gen, 1, __ATOMIC_RELEASE);
     uint64_t f = spin_lock(&hids_lock);
@@ -555,35 +556,39 @@ static void boot_keyboard(struct hid *h) {
     h->led_len = 1;
 }
 
-/* On the worker, after the device's last report (usb_remove): its held keys and buttons let go. */
-static void usbhid_detach(struct usb_device *d) {
-    while (d->state[USB_DRIVER_HID]) {
-        struct hid *h = d->state[USB_DRIVER_HID];
-        d->state[USB_DRIVER_HID] = h->sibling;
-        uint64_t f = spin_lock(&hids_lock);
-        for (struct hid **pp = &hids; *pp; pp = &(*pp)->next)
-            if (*pp == h) {
-                *pp = h->next;
-                break;
-            }
-        spin_unlock(&hids_lock, f);
-        f = spin_lock(&h->lock);
-        h->repeat_usage = 0; /* or a repeat that is firing sets itself again */
-        spin_unlock(&h->lock, f);
-        alarm_cancel(&h->repeat);
-        uint64_t now = clock_now_ns();
-        for (unsigned u = 0; u < 256; u++)
-            if (is_down(h->down, u)) send_usage(h, u, false, now);
-        if (h->mouse && h->buttons) {
-            struct mouse_event e = {.time_ns = now};
-            input_mouse(&h->input, &e);
+/* Its held keys and buttons let go, its input device removed, its state freed. No report comes any more:
+   the device was removed (usb_remove), or its reports never started. */
+static void hid_drop(struct hid *h) {
+    uint64_t f = spin_lock(&hids_lock);
+    for (struct hid **pp = &hids; *pp; pp = &(*pp)->next)
+        if (*pp == h) {
+            *pp = h->next;
+            break;
         }
-        if (h->input_id) input_device_remove(&h->input);
-        kfree(h->input_id);
-        kfree(h->keys);
-        kfree(h->partial);
-        kfree(h);
+    spin_unlock(&hids_lock, f);
+    f = spin_lock(&h->lock);
+    h->repeat_usage = 0; /* or a repeat that is firing sets itself again */
+    spin_unlock(&h->lock, f);
+    alarm_cancel(&h->repeat);
+    uint64_t now = clock_now_ns();
+    for (unsigned u = 0; u < 256; u++)
+        if (is_down(h->down, u)) send_usage(h, u, false, now);
+    if (h->mouse && h->buttons) {
+        struct mouse_event e = {.time_ns = now};
+        input_mouse(&h->input, &e);
     }
+    if (h->input_id) input_device_remove(&h->input);
+    kfree(h->input_id);
+    kfree(h->keys);
+    kfree(h->partial);
+    kfree(h);
+}
+
+/* On the worker, after the device's last report (usb_remove). */
+static void hid_detach(struct hal_device *hal) {
+    usb_work_set(usb_interface_of(hal), NULL);
+    hid_drop(hal->driver_data);
+    hal->driver_data = NULL;
 }
 
 static uint32_t fnv(uint32_t hash, const void *data, size_t n) {
@@ -611,13 +616,21 @@ static void input_identify(struct hid *h) {
     input_device_add(&h->input);
 }
 
-static bool usbhid_claims(const struct usb_interface_desc *intf) { return intf->cls == 3; }
+static void hid_work(struct usb_interface *node);
 
-static int interface_attach(struct usb_device *d, const struct usb_interface_desc *intf, const uint8_t *extra,
-                             unsigned extra_len, const struct usb_endpoint_desc *ep) {
+/* A HID interface that has an interrupt IN endpoint and a keyboard or pointer in its reports. */
+static int hid_attach(struct hal_device *hal) {
+    struct usb_interface *node = usb_interface_of(hal);
+    struct usb_device *d = node->dev;
+    const struct usb_interface_desc *intf = node->desc;
+    const uint8_t *extra;
+    unsigned extra_len;
+    const struct usb_endpoint_desc *ep;
+    if (!usb_interface_interrupt(node, &extra, &extra_len, &ep)) return HAL_DECLINE;
     struct hid *h = kzalloc(sizeof *h);
     if (!h) return -N_ERR_NO_MEMORY;
     h->dev = d;
+    h->node = node;
     alarm_init(&h->repeat, repeat_fire);
     h->interface = intf->number;
     bool boot = intf->subcls == 1;
@@ -658,18 +671,16 @@ static int interface_attach(struct usb_device *d, const struct usb_interface_des
     if (!h->keyboard && !h->mouse) {
         kfree(h->keys);
         kfree(h);
-        return USB_NOT_MINE;
+        return HAL_DECLINE;
     }
     usb_control(d, 0x21, HID_SET_IDLE, 0, h->interface, NULL, 0); /* report changes only */
     h->leds_seen = __atomic_load_n(&leds_gen, __ATOMIC_ACQUIRE) - 1; /* its lights set on the worker's next look */
-    h->sibling = d->state[USB_DRIVER_HID];
-    d->state[USB_DRIVER_HID] = h;
+    hal->driver_data = h;
     uint64_t f = spin_lock(&hids_lock);
     h->next = hids;
     hids = h;
     spin_unlock(&hids_lock, f);
     input_identify(h);
-    if (h->keyboard) usb_note_work(d);
     kprintf("usbhid: slot %u interface %u is a %s%s%s%s\n", d->slot, h->interface,
             h->keyboard ? "keyboard" : "", h->keyboard && h->mouse ? " and " : "",
             h->mouse ? (h->x.relative ? "mouse" : "absolute pointer") : "", h->wheel.present ? " with wheel" : "");
@@ -678,43 +689,47 @@ static int interface_attach(struct usb_device *d, const struct usb_interface_des
     h->partial = h->packet ? kmalloc(h->longest + h->packet) : NULL;
     if (!h->partial || !usb_interrupt_start(d, ep, 1, hid_report, h)) {
         kprintf("usbhid: slot %u reports could not start\n", d->slot);
-        return h->partial ? -N_ERR_IO : -N_ERR_NO_MEMORY;
+        int why = h->partial ? -N_ERR_IO : -N_ERR_NO_MEMORY;
+        hid_drop(h);
+        hal->driver_data = NULL;
+        return why;
     }
+    if (h->input_id) hal_offer(hal, N_OFFER_INPUT, 0, h->input.name);
+    usb_work_set(node, hid_work);
+    if (h->keyboard) usb_note_work(d);
     return 0;
-}
-
-/* interface の答えの一番小さいものを返す：失敗があれば失敗、一つでも持てば 0。 */
-static int usbhid_attach(struct usb_device *d, const uint8_t *cfg, unsigned total) {
-    int result = USB_NOT_MINE;
-    const struct usb_interface_desc *intf;
-    const struct usb_endpoint_desc *ep;
-    const uint8_t *extra;
-    unsigned extra_len;
-    for (unsigned at = 0; !__atomic_load_n(&d->removed, __ATOMIC_ACQUIRE) &&
-                          usb_next_interrupt_interface(cfg, total, &at, &intf, &extra, &extra_len, &ep);)
-        if (usbhid_claims(intf)) {
-            int r = interface_attach(d, intf, extra, extra_len, ep);
-            if (r < result) result = r;
-        }
-    return result;
 }
 
 /* On the worker: the device's keyboards light caps lock as it is now: Set_Report of its output
    report (HID 7.2.2), led_bit in the data, after the ID if the report has one. */
-static void usbhid_work(struct usb_device *d) {
-    for (struct hid *h = d->state[USB_DRIVER_HID]; h; h = h->sibling) {
-        unsigned gen = __atomic_load_n(&leds_gen, __ATOMIC_ACQUIRE);
-        if (!h->keyboard || !h->leds || h->leds_seen == gen) continue;
-        h->leds_seen = gen;
-        unsigned at = h->ids ? 1 : 0, len = at + h->led_len;
-        uint8_t *report = kzalloc(len);
-        if (!report) continue;
-        if (h->ids) report[0] = h->led_report;
-        if (input_caps_on()) report[at + (h->led_bit >> 3)] |= (uint8_t)(1u << (h->led_bit & 7));
-        usb_control(h->dev, 0x21, HID_SET_REPORT, (uint16_t)(0x0200 | h->led_report), h->interface, report, (uint16_t)len);
-        kfree(report);
-    }
+static void hid_work(struct usb_interface *node) {
+    struct hid *h = node->hal.driver_data;
+    unsigned gen = __atomic_load_n(&leds_gen, __ATOMIC_ACQUIRE);
+    if (!h->keyboard || !h->leds || h->leds_seen == gen) return;
+    h->leds_seen = gen;
+    unsigned at = h->ids ? 1 : 0, len = at + h->led_len;
+    uint8_t *report = kzalloc(len);
+    if (!report) return;
+    if (h->ids) report[0] = h->led_report;
+    if (input_caps_on()) report[at + (h->led_bit >> 3)] |= (uint8_t)(1u << (h->led_bit & 7));
+    usb_control(h->dev, 0x21, HID_SET_REPORT, (uint16_t)(0x0200 | h->led_report), h->interface, report, (uint16_t)len);
+    kfree(report);
 }
 
-const struct usb_driver usbhid_driver = {.name = "usbhid", .claims = usbhid_claims, .attach = usbhid_attach,
-                                         .detach = usbhid_detach, .work = usbhid_work};
+/* A sleep removes every device and enumerates them again (the controller's resume), so a keyboard comes
+   back as a new interface: nothing of its own to bring back. */
+static bool hid_resume(struct hal_device *hal) {
+    (void)hal;
+    return true;
+}
+
+static const struct n_hal_rule hid_rules[] = {N_USB_INTERFACE_CLASS(3)};
+static const struct hal_driver hid_driver = {
+    .name = "usbhid",
+    .rules = hid_rules,
+    .rule_count = ARRAY_SIZE(hid_rules),
+    .attach = hid_attach,
+    .detach = hid_detach,
+    .resume = hid_resume,
+};
+HAL_DRIVER(hid_driver);

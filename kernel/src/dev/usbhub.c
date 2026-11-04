@@ -2,9 +2,11 @@
  * port power, connect, reset and the devices behind them. Keyboards often carry a hub, and boards
  * wire front panels and some rear ports through one. A USB 3 hub is two hubs in one package; its
  * SuperSpeed half shows up on a USB 3 root port and its USB 2.0 half on a USB 2 one. Everything
- * here runs on the hub's controller worker but hub_report, which runs in the drain (dev/usb.h). */
+ * here runs on the hub's controller worker but hub_attach, which runs in its interface's attach
+ * thread, and hub_report, which runs in the drain (dev/usb.h). */
 #include "kernel.h"
 #include "dev/usb.h"
+#include "hal/hal.h"
 #include "mm/heap.h"
 #include "sys/clock.h"
 #include "sys/wait.h"
@@ -53,6 +55,7 @@ struct hub {
     unsigned ports, power_ms;
     bool ss;         /* Enhanced SuperSpeed hub */
     bool hub_change; /* atomic: bit 0 of the status change report, the hub's own status changed */
+    bool bound;      /* atomic: an interface of the device took the hub: a device is one hub */
     bool reporting;  /* its status change endpoint runs: a port change comes as a report */
     /* it does not, or a change acknowledged waits for it to answer again: its ports are read each
        second, by no document's time */
@@ -248,16 +251,46 @@ bool usbhub_set_depth(struct usb_device *d) {
     return false;
 }
 
-void usbhub_attach(struct usb_device *d, const struct usb_endpoint_desc *ep) {
+/* The hub interface: its device was configured as a hub (usbhub_prepare). A second hub interface of
+   the device would share its state, so the first to come takes it. */
+static int hub_attach(struct hal_device *hal) {
+    struct usb_interface *i = usb_interface_of(hal);
+    struct usb_device *d = i->dev;
     struct hub *h = d->hub;
-    if (!h) return;
+    const uint8_t *extra;
+    unsigned extra_len;
+    const struct usb_endpoint_desc *ep;
+    if (!h || !usb_interface_interrupt(i, &extra, &extra_len, &ep)) return HAL_DECLINE;
+    if (__atomic_exchange_n(&h->bound, true, __ATOMIC_ACQ_REL)) return HAL_DECLINE;
     h->report_ep = ep->address;
     if (hub_status_read(h)) h->hub_held = false; /* whether it has local power, and its ports can have any */
     if (!h->off) power_ports(h);
     kprintf("usbhub: slot %u %shub with %u ports\n", d->slot, h->ss ? "SuperSpeed " : "", h->ports);
     h->reporting = usb_interrupt_start(d, ep, (h->ports + 8) / 8, hub_report, h); /* a bit a port, and the hub's */
     if (!h->reporting) usbhub_reports_lost(d, ep->address);
+    return 0;
 }
+
+/* The devices behind the hub go with it (usb_remove), each by its own hub's worker. */
+static void hub_detach(struct hal_device *hal) { usbhub_detach(usb_interface_of(hal)->dev); }
+
+/* A sleep removes every device and enumerates them again (the controller's resume): the hub has nothing
+   of its own to bring back. */
+static bool hub_resume(struct hal_device *hal) {
+    (void)hal;
+    return true;
+}
+
+static const struct n_hal_rule hub_rules[] = {N_USB_INTERFACE_CLASS(9)};
+static const struct hal_driver hub_driver = {
+    .name = "usbhub",
+    .rules = hub_rules,
+    .rule_count = ARRAY_SIZE(hub_rules),
+    .attach = hub_attach,
+    .detach = hub_detach,
+    .resume = hub_resume,
+};
+HAL_DRIVER(hub_driver);
 
 /* A change is known by the status change endpoint alone (USB 2.0 11.12.1): without it, the ports are asked. */
 void usbhub_reports_lost(struct usb_device *d, uint8_t address) {

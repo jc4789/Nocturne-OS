@@ -201,7 +201,7 @@ void acpi_links_save(void);
 void acpi_links_forget(void);
 bool acpi_reset(void);
 
-/* ---- a PCI function's part of the namespace (n_pci_acpi_eval, dev/pciuser.c) ----
+/* ---- a PCI function's part of the namespace (n_hal_pci_acpi_eval, dev/pciuser.c) ----
    A device node is uACPI's, opaque here. acpi_pci_node: the function's node, found from the host
    bridge of its segment (_SEG) and root bus (_BBN) down its bridges by _ADR; acpi_pci_host: that host bridge's. NULL
    when the firmware describes none, or AML is off. acpi_node_child: the node's device child

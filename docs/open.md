@@ -8,7 +8,6 @@
 
 ## 決めたこと（未着手）
 
-- HAL：形は `docs/hal.md`。台帳、バスの表、CPU の分割は動いている。残りの順は同じ文書の「試す順」にある。
 - 窓の管理と合成：カーネルの外のサービスへ移す。カーネルに GPU の汎用の層を置く。
 - 網：TCP/IP を権限の無いサービスへ移す。NIC の実装はカーネルに残し、輪でつなぐ。ソケットは object にする。網の権限は能力の handle で渡す。
 - GPU：virgl と `nvrm` は同じ継ぎ目の後ろの実装にする。試験の門を外す。契約は次の設計 `docs/gpu.md` で決める。
@@ -68,6 +67,8 @@
 
 ## 既知の欠陥
 
+- `tests/pcitest.c`：`vbe` を外したカーネルで、画面の手渡しの試験のうち 5 件（二つ目の緩衝へ描く、DMA の緩衝へ描く、起動の画面へ戻す、ポインター、手放しを設定が聞く）が通らない。`vbe` が VGA を持つ製品のカーネルでは走らない経路で、前の版との比べは無い。
+- `kernel/src/dev/xhci.c`：detach の後に割り込みが止まるので、controller の記録を返さない。
 - MCE：UC と PCC の bank を飛ばす（`kernel/src/arch/cpu.c:338`）。
 - TSC：AMD の判定が family だけ（`kernel/src/arch/tsc_rate.h:43`）。
 - TSC：`LockTscToCurrentP0` を見ない（`kernel/src/arch/tsc_rate.h:28`）。

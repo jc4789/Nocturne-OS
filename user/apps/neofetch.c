@@ -1,5 +1,6 @@
 /* System summary with a little moon */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "nocturne.h"
 #include "display.h"
@@ -27,8 +28,16 @@ int main(void) {
     unsigned long up = si.uptime_ns / N_NS_PER_S;
     int sw = 0, sh = 0;
     screen_size(&sw, &sh);
-    struct n_pciinfo pci[32];
-    int npci = pcilist(pci, 32);
+    struct n_hal_snapshot ledger = {0};
+    int npci = 0;
+    if (n_hal_snapshot(&ledger) >= 0) {
+        const struct n_hal_device *d = ledger.first;
+        for (uint32_t i = 0; i < ledger.count; i++, d = n_hal_device_next(d)) {
+            uint64_t address;
+            if (n_hal_device_number(d, N_PROP_PCI_ADDRESS, &address)) npci++;
+        }
+        free((void *)ledger.first);
+    }
     snprintf(lines[n++], 128, "\033[1;35mroot\033[0m@\033[1;35mnocturne\033[0m");
     snprintf(lines[n++], 128, "-------------");
     snprintf(lines[n++], 128, "\033[1;35mOS\033[0m: Nocturne 0.9 x86_64");

@@ -17,12 +17,11 @@
 #include "arch/cpu.h"
 #include "dev/fb.h"
 #include "dev/pci.h"
-#include "dev/pm.h"
+#include "hal/hal.h"
 #include "mm/heap.h"
 #include "mm/vmalloc.h"
 #include "mm/vmm.h"
 #include "sys/clock.h"
-#include "vm/devices.h"
 
 #define VBE_INDEX  0x1CE
 #define VBE_DATA   0x1CF
@@ -37,8 +36,7 @@ enum { VBE_ID, VBE_XRES, VBE_YRES, VBE_BPP, VBE_ENABLE, VBE_BANK, VBE_VIRT_WIDTH
 #define MMIO_BYTES    0x1000
 
 struct vbe {
-    struct pci_device *d;
-    volatile uint8_t *mmio; /* BAR 2, NULL: the legacy ports */
+    volatile uint8_t *mmio; /* BAR 2 (hal_map), NULL: the legacy ports */
     uint8_t *vram;          /* both buffers, write-combined */
     size_t vram_pages;
     struct screen *screen;
@@ -46,9 +44,7 @@ struct vbe {
     unsigned count;
     uint32_t height;
     uint16_t saved[VBE_REGS];
-    struct vbe *next;
 };
-static struct vbe *displays;
 
 static uint16_t vbe_read(struct vbe *v, unsigned reg) {
     if (v->mmio) return mmio_read16(v->mmio + MMIO_VBE + reg * 2);
@@ -111,16 +107,19 @@ static void vbe_monitor(struct vbe *v, struct screen_mode_desc *m, uint32_t *pre
 
 /* One display: its registers, its mode (the firmware's for the one it showed, else the EDID's
    preferred), its buffers, and a screen for them (screen 0 for the firmware's). */
-static int vbe_attach(struct pci_device *d) {
+static int vbe_attach(struct hal_device *d) {
+    struct pci_device *pci = pci_device_of(d);
+    const struct n_hal_resource *memory = hal_resource(d, N_HAL_MEMORY, 0);
+    if (!memory) return -N_ERR_UNSUPPORTED;
     struct vbe *v = kzalloc(sizeof *v);
     if (!v) return -N_ERR_NO_MEMORY;
     int why = -N_ERR_UNSUPPORTED;
-    bool legacy_only = d->vendor == 0x80EE;
-    v->d = d;
-    uint64_t vram = pci_bar_address(d, 0), vram_size = pci_bar_size(d, 0);
+    bool legacy_only = pci->vendor == 0x80EE;
+    uint64_t vram = memory->base, vram_size = memory->size;
     bool firmware = fb.addr && fb.phys >= vram && fb.phys < vram + vram_size;
-    if (!legacy_only && pci_bar_size(d, 2) >= MMIO_BYTES) {
-        v->mmio = vmalloc_map_phys(pci_bar_address(d, 2), MMIO_BYTES / PAGE_SIZE, PTE_W | PTE_PCD | PTE_PWT | PTE_NX);
+    const struct n_hal_resource *registers = hal_resource(d, N_HAL_MEMORY, 2);
+    if (!legacy_only && registers && registers->size >= MMIO_BYTES) {
+        v->mmio = hal_map(d, 2);
         if (!v->mmio) {
             why = -N_ERR_NO_MEMORY;
             goto fail;
@@ -129,7 +128,7 @@ static int vbe_attach(struct pci_device *d) {
     if (!v->mmio && !firmware) goto fail; /* only the shown one is reached through the ports */
     uint16_t id = vbe_read(v, VBE_ID);
     if (id < 0xB0C0 || id > 0xB0CF) goto fail;
-    pci_write16(d->address, 4, pci_read16(d->address, 4) | 2); /* memory space */
+    hal_enable(d, HAL_ENABLE_MEMORY);
     struct screen_mode_desc m = {0};
     uint32_t pref_w, pref_h;
     if (firmware) {
@@ -177,51 +176,44 @@ static int vbe_attach(struct pci_device *d) {
     vbe_write(v, VBE_Y_OFFSET, 0);
     v->screen = firmware ? screen_get(0) : screen_new();
     if (!v->screen) goto fail;
-    d->kernel_owned = true; /* the kernel drives it: no app claims it */
-    v->next = displays;
-    displays = v;
-    kprintf("video: emulated display %04x:%02x:%02x.%x: %ux%u at %u.%03u Hz, %u buffer%s, screen %u%s%s\n", PCI_ADDRESS_ARGS(d->address), m.width, m.height, m.refresh_mhz / 1000, m.refresh_mhz % 1000, v->count, v->count > 1 ? "s" : "",
+    d->driver_data = v;
+    kprintf("video: emulated display %04x:%02x:%02x.%x: %ux%u at %u.%03u Hz, %u buffer%s, screen %u%s%s\n", PCI_ADDRESS_ARGS(pci->address), m.width, m.height, m.refresh_mhz / 1000, m.refresh_mhz % 1000, v->count, v->count > 1 ? "s" : "",
             screen_id(v->screen), m.name[0] ? ", monitor " : "", m.name);
     screen_set_buffers(v->screen, &vbe_ops, v, &m, v->buf, v->count, 0);
+    if (firmware) fb_boot_release(); /* this driver sets the mode again after a sleep: the firmware's screen has no way back */
     return 0;
 fail:
     for (unsigned i = 0; i < 2; i++) fb_buffer_unmap(v->buf[i]);
     if (v->vram) vunmap(v->vram, v->vram_pages);
-    if (v->mmio) vunmap((void *)v->mmio, MMIO_BYTES / PAGE_SIZE);
     kfree(v);
     return why;
 }
 
-static const struct n_pci_match vbe_matches[] = {N_PCI_ID_CLASS(0x1234, 0x1111, 0x03, 0x00), N_PCI_ID_CLASS(0x80EE, 0xBEEF, 0x03, 0x00)};
-const struct pci_driver vbe_driver = {"vbe", vbe_matches, ARRAY_SIZE(vbe_matches), vbe_attach};
-
-static bool vbe_quiesce(void *arg) {
-    (void)arg;
-    for (struct vbe *v = displays; v; v = v->next)
-        for (unsigned r = 1; r < VBE_REGS; r++) v->saved[r] = vbe_read(v, r);
-    return true; /* scanout only: no DMA to stop */
-}
-
-static bool vbe_resume(void *arg) {
-    (void)arg;
-    bool ok = true;
-    for (struct vbe *v = displays; v; v = v->next) {
-        vbe_write(v, VBE_ENABLE, 0);
-        for (unsigned r = 1; r < VBE_REGS; r++)
-            if (r != VBE_ENABLE) vbe_write(v, r, v->saved[r]);
-        vbe_write(v, VBE_ENABLE, v->saved[VBE_ENABLE] | VBE_NO_CLEAR); /* back on, without clearing the memory */
-        vbe_unblank(v);
-        ok &= (vbe_read(v, VBE_ENABLE) & (VBE_ENABLED | VBE_LFB)) == (VBE_ENABLED | VBE_LFB) &&
-              vbe_read(v, VBE_XRES) == v->saved[VBE_XRES] && vbe_read(v, VBE_YRES) == v->saved[VBE_YRES];
-    }
-    return ok;
-}
-
-/* The display comes back from a sleep only where every display's mode can be set again: one
-   these registers reach. */
-bool vbe_display_pm(struct pm_device *display) {
-    if (!displays) return false;
-    display->quiesce = vbe_quiesce;
-    display->resume = vbe_resume;
+/* A sleep: the registers are kept, and set again after (scanout only: no DMA to stop). */
+static bool vbe_quiesce(struct hal_device *d) {
+    struct vbe *v = d->driver_data;
+    for (unsigned r = 1; r < VBE_REGS; r++) v->saved[r] = vbe_read(v, r);
     return true;
 }
+
+static bool vbe_resume(struct hal_device *d) {
+    struct vbe *v = d->driver_data;
+    vbe_write(v, VBE_ENABLE, 0);
+    for (unsigned r = 1; r < VBE_REGS; r++)
+        if (r != VBE_ENABLE) vbe_write(v, r, v->saved[r]);
+    vbe_write(v, VBE_ENABLE, v->saved[VBE_ENABLE] | VBE_NO_CLEAR); /* back on, without clearing the memory */
+    vbe_unblank(v);
+    return (vbe_read(v, VBE_ENABLE) & (VBE_ENABLED | VBE_LFB)) == (VBE_ENABLED | VBE_LFB) &&
+           vbe_read(v, VBE_XRES) == v->saved[VBE_XRES] && vbe_read(v, VBE_YRES) == v->saved[VBE_YRES];
+}
+
+static const struct n_hal_rule vbe_rules[] = {N_PCI_ID_CLASS(0x1234, 0x1111, 0x03, 0x00),
+                                              N_PCI_ID_CLASS(0x80EE, 0xBEEF, 0x03, 0x00)};
+const struct hal_driver vbe_driver = {
+    .name = "vbe",
+    .rules = vbe_rules,
+    .rule_count = ARRAY_SIZE(vbe_rules),
+    .attach = vbe_attach,
+    .quiesce = vbe_quiesce,
+    .resume = vbe_resume,
+};

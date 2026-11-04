@@ -118,7 +118,6 @@ static NORETURN void kmain_scheduled(void *unused) {
     prof_init();      /* before the other CPUs: each starts its samples as it comes up */
     smp_init();
     sti();
-    input_init();
 
     kmain_late();
     sched_idle(); /* the boot context is CPU 0's idle thread */

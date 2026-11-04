@@ -362,7 +362,7 @@ struct wscreen {
     bool direct_able;
     struct window *direct_win;
     uint32_t direct_pointer;  /* the pointer_serial of the image in state, 0 for none */
-    struct n_screen_state state; /* what its driver reads (n_pci_screen_state) */
+    struct n_screen_state state; /* what its driver reads (n_screen_read_state) */
     struct wait_queue state_wq;
     /* The compositor thread's own; the picture under back_lock (a frame, a copy for a grab or a
        remote viewer, a change of size): */
@@ -402,7 +402,7 @@ struct wscreen {
      parts and states, the remote viewers, the clipboard, the hot keys. A sleeping lock, any CPU, held briefly:
      never while a frame is drawn or written, nor across a copy of a window's pixels. Reentrant: a
      window handle's last close comes from inside a WM call. gui/screenmode.c's lock,
-     and dev/pciuser.c's screen lock come before it;
+     and dev/screen_driver.c's screen lock come before it;
    - a surface's lock (the kernel's copy of a window presented by rectangles);
    - then one of a window's ev_lock and in_lock (the input ring): spinlocks, never two of them at
      once;
@@ -2407,7 +2407,7 @@ static void moved_with_part(int cx, int cy, int *x, int *y) {
    the main screen, its scale. Windows and the pointer move with the part they are on. */
 int64_t wm_screen_arrange(unsigned id, const struct n_screen_arrange *a) {
     if (!wm_running()) return -N_ERR_UNSUPPORTED;
-    /* a part is at most UINT16_MAX wide and high (pci_user_screen_modes): its end must fit an int */
+    /* a part is at most UINT16_MAX wide and high (screen_driver_modes): its end must fit an int */
     if ((a->flags & ~(N_ARRANGE_PLACED | N_ARRANGE_PRIMARY)) || a->x < 0 || a->y < 0 || a->x > INT32_MAX - UINT16_MAX ||
         a->y > INT32_MAX - UINT16_MAX || !a->scale_percent)
         return -N_ERR_INVALID;

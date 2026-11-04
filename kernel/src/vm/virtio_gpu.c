@@ -9,8 +9,7 @@
 #include "dev/gpu.h"
 #include "vm/vm.h"
 #include "dev/pci.h"
-#include "dev/pm.h"
-#include "vm/devices.h"
+#include "hal/hal.h"
 #include "arch/cpu.h"
 #include "arch/irq.h"
 #include "mm/pmm.h"
@@ -64,6 +63,9 @@ struct used_entry { volatile uint32_t id, len; } PACKED;
 struct used { volatile uint16_t flags, idx; struct used_entry ring[QSIZE]; } PACKED;
 struct header { uint32_t type, flags; uint64_t fence; uint32_t ctx; uint8_t ring, pad[3]; } PACKED;
 
+/* The one device this file drives (gpu_attach), and its bus addresses for what the device reads. */
+static struct hal_device *gpu_device;
+static uint64_t bus(uint64_t phys) { return hal_dma_address(gpu_device, phys); }
 static struct virtio_common *common;
 static volatile uint16_t *notify;
 static struct descriptor *desc;
@@ -118,15 +120,16 @@ static void completion_nap(uint64_t deadline) {
 }
 
 static inline void barrier(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
-static uint32_t config32(struct pci_device *d, unsigned off) {
-    return pci_read32(d->address, (uint8_t)off);
+static uint32_t config32(struct hal_device *d, unsigned off) {
+    return pci_read32(pci_device_of(d)->address, (uint8_t)off);
 }
-static uint8_t config8(struct pci_device *d, unsigned off) {
+static uint8_t config8(struct hal_device *d, unsigned off) {
     return (uint8_t)(config32(d, off & ~3u) >> ((off & 3u) * 8));
 }
-static void *cap_map(struct pci_device *d, unsigned cap, uint32_t *length) {
+static void *cap_map(struct hal_device *d, unsigned cap, uint32_t *length) {
     unsigned bar = config8(d, cap + 4);
-    uint64_t base = pci_bar_address(d, bar);
+    const struct n_hal_resource *memory = hal_resource(d, N_HAL_MEMORY, bar);
+    uint64_t base = memory ? memory->base : 0;
     uint32_t off = config32(d, cap + 8), len = config32(d, cap + 12);
     /* Fixed caps only, not a guest-mappable host-memory aperture. */
     if (!base || !len || len > 65536 || off > (64u << 20) || base + off < base) return NULL;
@@ -134,7 +137,7 @@ static void *cap_map(struct pci_device *d, unsigned cap, uint32_t *length) {
     return vmm_map_mmio(base + off, len);
 }
 
-static bool transport_init(struct pci_device *d) {
+static bool transport_init(struct hal_device *d) {
     uint8_t cap = config8(d, 0x34) & ~3u;
     volatile uint8_t *notify_base = NULL;
     uint32_t notify_length = 0, notify_multiplier = 0;
@@ -162,7 +165,7 @@ static bool transport_init(struct pci_device *d) {
         cap = (uint8_t)next;
     }
     if (!common || !notify_base) return false;
-    pci_enable_busmaster(d);
+    hal_enable(d, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA);
     mmio_write8(&common->device_status, 0);
     uint64_t deadline = clock_after(100 * NS_PER_MS); /* the reset reads 0 once it is done */
     while (mmio_read8(&common->device_status)) {
@@ -194,7 +197,7 @@ static bool transport_init(struct pci_device *d) {
     if (mmio_read16(&common->queue_size) < QSIZE || mmio_read16(&common->queue_enable)) return false;
     mmio_write16(&common->queue_size, QSIZE);
     mmio_write16(&common->queue_msix_vector, 0xFFFF);
-    const uint64_t rings[3] = {ring_phys, ring_phys + 256, ring_phys + 512};
+    const uint64_t rings[3] = {bus(ring_phys), bus(ring_phys) + 256, bus(ring_phys) + 512};
     volatile uint32_t *ring_regs[3] = {common->queue_desc, common->queue_driver, common->queue_device};
     for (unsigned i = 0; i < 3; i++) {
         mmio_write32(ring_regs[i], (uint32_t)rings[i]);
@@ -204,11 +207,11 @@ static bool transport_init(struct pci_device *d) {
     if (notify_length < 2 || notify_off > notify_length - 2) return false;
     notify = (volatile uint16_t *)(notify_base + notify_off);
     /* the queue's MSI-X entry 0 (virtio 1.x, 4.1.4.3): a device without MSI-X is read again instead */
-    if(pci_msix_max_vectors(d) &&
-       pci_irq_enable(d,&(struct irq_spec){.name="virtio-gpu",.handler=gpu_isr,.node=-1},1,NULL)){
+    if(hal_irq_max(d) &&
+       hal_irq_enable(d,&(struct irq_spec){.name="virtio-gpu",.handler=gpu_isr,.node=-1},1,NULL)){
         mmio_write16(&common->queue_msix_vector, 0);
         if(mmio_read16(&common->queue_msix_vector)==0){completion_irq=true;avail->flags=0;}
-        else pci_irq_disable(d);
+        else hal_irq_disable(d);
     }
     mmio_write16(&common->queue_enable, 1);
     mmio_write8(&common->device_status, 1 | 2 | 8 | 4);
@@ -226,8 +229,8 @@ static bool exchange(const void *request, size_t len, uint32_t response_type) {
     struct header *h = (struct header *)packets;
     h->flags = FENCE; h->fence = next_fence++;
     memset(packets + PAGE_SIZE, 0, PAGE_SIZE);
-    desc[0] = (struct descriptor){packets_phys, (uint32_t)len, 1, 1};
-    desc[1] = (struct descriptor){packets_phys + PAGE_SIZE, PAGE_SIZE, 2, 0};
+    desc[0] = (struct descriptor){bus(packets_phys), (uint32_t)len, 1, 1};
+    desc[1] = (struct descriptor){bus(packets_phys) + PAGE_SIZE, PAGE_SIZE, 2, 0};
     unsigned at = avail->idx % QSIZE;
     avail->ring[at] = 0;
     barrier();
@@ -294,7 +297,7 @@ static bool resource(uint32_t id, uint32_t target_kind, uint32_t format, uint32_
         id,target_kind,format,bind,create.flags,w,h,phys,bytes);
     if (!exchange(&create, sizeof create, OK_NODATA)) return false;
     struct { struct header h; uint32_t id, n; uint64_t phys; uint32_t len, pad; } PACKED attach = {
-        .h=hdr(CMD_ATTACH,false), .id=id, .n=1, .phys=phys, .len=bytes};
+        .h=hdr(CMD_ATTACH,false), .id=id, .n=1, .phys=bus(phys), .len=bytes};
     if (!exchange(&attach, sizeof attach, OK_NODATA)) return false;
     struct { struct header h; uint32_t id, pad; } PACKED ctx = {.h=hdr(CMD_CTX_ATTACH,true), .id=id};
     return exchange(&ctx, sizeof ctx, OK_NODATA);
@@ -571,21 +574,21 @@ static bool pixel_test(void) {
     return ok;
 }
 
-static int gpu_attach(struct pci_device *d) {
-    if (test_flag("nogpu")) return PCI_NOT_MINE;
+static int gpu_attach(struct hal_device *d) {
+    if (test_flag("nogpu")) return HAL_DECLINE;
     if (!test_flag("gpu-enable") && !test_flag("gpu-slow-test")) {
         kprintf("gpu: optional virgl device present; gpu-enable required (cold host fences can be slow)\n");
-        return PCI_NOT_MINE;
+        return HAL_DECLINE;
     }
     if (common) return -N_ERR_BUSY; /* one device: its state is this file's */
+    gpu_device = d;
     if (!transport_init(d)) {
         if (common) mmio_write8(&common->device_status, mmio_read8(&common->device_status) | 128); /* FAILED */
         kprintf("gpu: virgl transport unavailable; boot framebuffer unchanged\n");
         return -N_ERR_IO;
     }
-    /* its queues and resources would be gone after a sleep: no sleep while it is in use */
-    static struct pm_device gpu_pm = {.name = "virtio-gpu", .stage = PM_STAGE_IO};
-    pm_register(&gpu_pm);
+    /* its queues and resources would be gone after a sleep: the driver has no resume, so the machine
+       does not sleep while it is bound */
     /* Read only the fixed prefix of growable capset2, not host pointers or
      * arbitrary resources. virgl_caps_v1 is 77 dwords, then capability_bits
      * is v2 word 98 (byte392). All formats/limits needed by this finite
@@ -735,5 +738,10 @@ int gpu_blit(const struct n_gpu_blit *r,const uint32_t *pixels,size_t source_byt
     return result;
 }
 
-static const struct n_pci_match gpu_matches[] = {N_PCI_ID(0x1af4, 0x1050)};
-const struct pci_driver virtio_gpu_driver = {"virtio-gpu", gpu_matches, ARRAY_SIZE(gpu_matches), gpu_attach};
+static const struct n_hal_rule gpu_rules[] = {N_PCI_ID(0x1af4, 0x1050)};
+const struct hal_driver virtio_gpu_driver = {
+    .name = "virtio-gpu",
+    .rules = gpu_rules,
+    .rule_count = ARRAY_SIZE(gpu_rules),
+    .attach = gpu_attach,
+};

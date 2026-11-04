@@ -34,9 +34,10 @@
 | `sys/log.c`・`panic.c`・`stream.c`・`prof.c` | log の ring buffer、panic の報告、console（文字を出し、窓の管理が無い機械のキーの押下を渡す）と system log の stream、profiler。 |
 | `sys/settings.c` | 設定の門。領域と鍵の番号の表で持ち主へ渡す（`SYS_SETTINGS_*`、番号は `common/settings_abi.h`）。カーネルは保存しない。 |
 | `fs/` | C: の store の実行側。mount とパスの操作とパスの権限は `store.c`、開いた文書と私的な領域は `document.c`、block cache は `cache.c`、変更の watch は `watch.c`、起動の記録 `settings.rec` は `bootrecord.c`。書式のエンジンは `common/store/`。 |
-| `dev/hal.c` | 台帳：機械で見つかった物の一覧と、持っている実装と、失敗の理由（`SYS_HAL_LIST`、`SYS_HAL_WATCH`）。形は `docs/hal.md`。 |
-| `dev/pci_drivers.c`・`usb_drivers.c` | バスごとの実装の表。VM の実装は `vm_pci_drivers()`。 |
-| `dev/` | PCI と `pciuser`（アプリのドライバー）、ACPI（uACPI）、AHCI、NVMe、xHCI と USB、IOMMU、音の出口（`audio` が一覧と一つの open、`hda`・`hda_codec` が High Definition Audio。混合と選択はサービス `audio`）、`fb`（画面ごとの面・フリップ・垂直帰線）と `fbcon`、入力（`input` が装置の一覧と装置ごとの値、速さと向きの適用。`usbhid` は HID の usage を渡す）、`serial`、`refclock`（HPET か ACPI PM timer と、RTC）、電源と hibernate。 |
+| `hal/` | HAL。`hal.h` が唯一の口。`device.c`（装置の木、性質、台帳の読出し）、`bind.c`（実装の一覧、規則の照合、装置ごとの attach の thread、電源の門）、`resource.c`（資源、割り込み、DMA のメモリー）、`power.c`（木の順の止めると戻す）、`claim.c`（プロセスの実装）。形は `docs/hal.md`。 |
+| `dev/acpi_devices.c` | ACPI の名前空間の装置を HAL のバスにする（`_HID`、`_CID`、`_CRS`、`_DEP`）。 |
+| `dev/screen_driver.c` | 画面を持つドライバーの口（`SYS_SCREEN_*`）。バスを知らない。 |
+| `dev/` | PCI（バスの実装）と `pciuser`（PCI のプロセスの実装の持ち方）、ACPI（uACPI）、AHCI、NVMe、xHCI と USB、IOMMU、音の出口（`audio` が一覧と一つの open、`hda`・`hda_codec` が High Definition Audio。混合と選択はサービス `audio`）、`fb`（画面ごとの面・フリップ・垂直帰線）と `fbcon`、入力（`input` が装置の一覧と装置ごとの値、速さと向きの適用。`usbhid` は HID の usage を渡す）、`serial`、`refclock`（HPET か ACPI PM timer と、RTC）、電源と hibernate。 |
 | `net/` | `net.c`（Ethernet から IP、UDP、TCP まで。adapter の一覧と経路の表）と `rtl8125.c`（実機の NIC）。住所の決め方と名前引きはサービス `network`。 |
 | `gui/` | `wm.c`（窓管理、画面ごとの合成のスレッド、シェルの口 `SYS_SHELL_*`、画面の配置の適用 `SYS_SCREEN_ARRANGE`）、`pointer.c`（ポインターの絵）、`screenmode.c`（画面ごとのモードの一覧と望みを運ぶ。選ばない）。文を言わず、タスクバーも壁紙も持たない。 |
 | `vm/` | VM だけの処理。下の「境界」を見る。 |
@@ -45,7 +46,8 @@
 
 | 場所 | 役目 |
 |---|---|
-| `abi.h` | syscall の番号 `SYS_*`、結果 `N_ERR_*`、入口の溝、公開の呼出し `N_PUBLIC_CALLS`、台帳の記録 `struct n_hal_device`、世代と刻印、スレッドの区画。仕様は `docs/nocturne-native-abi.md`。 |
+| `abi.h` | syscall の番号 `SYS_*`、結果 `N_ERR_*`、入口の溝、公開の呼出し `N_PUBLIC_CALLS`、世代と刻印、スレッドの区画。仕様は `docs/nocturne-native-abi.md`。 |
+| `hal_abi.h`・`hal_buses.h` | HAL の ABI（性質、規則、資源、台帳の記録 `struct n_hal_device`）と、知られたバスの名前と性質の鍵と規則の形。 |
 | `clock_data.h` | 像の中の時計のデータの形。カーネルと `kernel/entry/clock.c` だけが読む。 |
 | `authority_abi.h` | 身元 `struct n_identity`、級 `enum n_class`、能力 `enum n_cap`、サービスの要求の形。 |
 | `services_abi.h` | 管理者・`accounts`・`session`・`machine` の口の型。 |
@@ -110,7 +112,7 @@
 ## 境界
 
 - syscall の番号と型は `common/abi.h`。画面と GPU は `display_abi.h` と `gpu_abi.h`。
-- アプリのドライバーは `SYS_PCI_*`・`SYS_DMA_*` から `dev/pciuser.c` へ。claim は `N_CAP_PCI_CLAIM` の能力で行う。`user/apps/services.c` の `gpu` の項目が、台帳の空いた PCI の機能のうち宣言のデータ（`struct n_pci_match`）に合うものごとに `nvrm` を起こし、`nvrm` が自分で claim する。
+- プロセスのドライバーは `SYS_HAL_*`・`SYS_DMA_*` から `hal/claim.c` へ。バスだけの操作は `n_hal_bus_call` から `struct hal_claim_ops`（PCI は `dev/pciuser.c`）へ。claim は `N_CAP_HAL_CLAIM` の能力で行う。`user/apps/services.c` の `gpu` の項目が、台帳の空いた装置のうち宣言の規則（`struct n_hal_rule`）に合うものごとに `nvrm` を起こし、`nvrm` が自分で claim する。
 - 特権は能力の handle か身元の級で確かめる（`sys/authority.h`）。境界の検査は `tests/check_boundaries.py`。
 - VM の処理は `kernel/src/vm/vm.h` が唯一の入口。実機では何もせずに戻る。裏に `hyperv.c`、`hv/`（VMBus、storvsc、netvsc）、`rdp.c`、VM の装置（ata、ac97、e1000、tulip、vbe）、`virtio_gpu.c` がある。`vm/` の外は `vm/vm.h` だけを include する。
 - syscall の道：

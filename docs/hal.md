@@ -36,7 +36,7 @@ HAL は、機械の全部の装置を一つの木に持ち、実装に結びつ�
 - `attach` の答えは三つ：0 は持った。`HAL_DECLINE` は持たず次の実装へ回す。負は持てなかった理由で `N_HAL_FAILED` になる。
 - 0 以外なら HAL が割り込みを切り、DMA を止め、DMA のメモリーを返す。止まったと確かめられないメモリーは返さない。
 - 動いた後に死んだら `hal_failed`。立ち上げ直して戻ったら `hal_recovered`。
-- `hal_remove` は実装の `detach` を待ってから戻る。出した者が先に子を消す。
+- `hal_remove` は実装の `detach`、動き出した `attach` の thread、走っている claim の呼出しの終わりを待ってから戻る。戻った後、バスは記録を消してよい。出した者が先に子を消す。
 - 実装の thread が装置に触る間は `hal_busy_begin`・`hal_busy_end`。電源の変化はこれを待つ。
 - 実装が `attach` の後も探している間は `hal_looking_begin`・`hal_looking_end`。C: を探す `store_init` が `hal_settled` で見る。
 
@@ -55,7 +55,7 @@ HAL は、機械の全部の装置を一つの木に持ち、実装に結びつ�
 
 ## 台帳を読む
 
-`n_hal_snapshot` が全部の記録を一つの時点で写す。記録は可変の長さで、`n_hal_device_next` で次へ進む。変化は `n_hal_watch` で知る。読み手は設定の窓の「装置」の頁と、サービスの管理者である。
+`n_hal_snapshot` が全部の記録を一つの時点で写す。記録は可変の長さで、`n_hal_device_next` で次へ進む。変化は `n_hal_watch` で知る。読み手は設定の窓の「装置」の頁と、サービスの管理者である。設定の窓は、名も級も提供も無く失敗もしていない節（firmware の記述やバスの内部の節）を行にしない。
 
 ## 載らないもの
 

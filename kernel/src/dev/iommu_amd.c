@@ -918,7 +918,6 @@ static void event_interrupts_enable(void) {
         for (size_t j = i; j < nunits; j++)
             if (units[j].fn == fn) top = MAX(top, units[j].msi_num);
         pci_enable_busmaster(fn);
-        hal_bound(&fn->hal, "iommu");
         unsigned messages = pci_irq_enable(fn, specs, top + 1, NULL);
         for (size_t j = i; j < nunits; j++) {
             struct unit *u = &units[j];

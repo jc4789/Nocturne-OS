@@ -93,38 +93,25 @@
 
 /* ------------------------------------------------------------------ session */
 
-/* Take an owned PCI snapshot; discovery errors are not an empty GPU list. */
+/* Take an owned snapshot of the device ledger; discovery errors are not an empty GPU list. */
 static uint32_t
-pci_snapshot(struct n_pciinfo **out, uint32_t *count)
+ledger_snapshot(struct n_hal_snapshot *out)
 {
-   struct n_pciinfo *list = NULL;
-   size_t capacity = 1;
-   uint32_t status = NV_ERR_INSUFFICIENT_RESOURCES;
-   for (;;) {
-      if (capacity > INT_MAX || capacity > SIZE_MAX / sizeof(*list))
-         break;
-      struct n_pciinfo *next = realloc(list, capacity * sizeof(*list));
-      if (next == NULL) {
-         status = NV_ERR_NO_MEMORY;
-         break;
-      }
-      list = next;
-      n_result len = pcilist(list, (int)capacity);
-      if (len < 0) {
-         status = len == -N_ERR_NO_MEMORY ? NV_ERR_NO_MEMORY : NV_ERR_OPERATING_SYSTEM;
-         break;
-      }
-      if ((size_t)len < capacity) {
-         *out = list;
-         *count = len;
-         return NV_OK;
-      }
-      if (capacity > SIZE_MAX / 2)
-         break;
-      capacity *= 2;
-   }
-   free(list);
-   return status;
+   n_result count = n_hal_snapshot(out);
+   if (count == -N_ERR_NO_MEMORY)
+      return NV_ERR_NO_MEMORY;
+   return count < 0 ? NV_ERR_OPERATING_SYSTEM : NV_OK;
+}
+
+/* The device's PCI address (N_PCI_TARGET), the identity NVK keeps for it. */
+static bool
+gpu_target(const struct n_hal_device *device, uint32_t *target)
+{
+   uint64_t address;
+   if (!nvrm_is_gpu(device) || !n_hal_device_number(device, N_PROP_PCI_ADDRESS, &address))
+      return false;
+   *target = (uint32_t)address;
+   return true;
 }
 
 struct nnrm {
@@ -523,9 +510,9 @@ query_gpu(struct nnrm *n, const char **step)
 }
 
 static uint32_t
-connect_device(uint32_t target, struct nvrm **out)
+connect_device(uint32_t device, struct nvrm **out)
 {
-   int64_t status = nvrm_connect_device_status(target, out);
+   int64_t status = nvrm_connect_device_status(device, out);
    switch (status) {
    case 0:
       /* RM registers probed IDs before adapter initialization finishes. A
@@ -545,28 +532,59 @@ connect_device(uint32_t target, struct nvrm **out)
    }
 }
 
+/* The ledger's id of the GPU at a PCI address: the name nvrm's service carries. */
+static uint32_t
+device_of_target(uint32_t target, uint32_t *device)
+{
+   struct n_hal_snapshot ledger;
+   uint32_t st = ledger_snapshot(&ledger);
+   if (st != NV_OK)
+      return st;
+   st = NV_ERR_OBJECT_NOT_FOUND;
+   const struct n_hal_device *d = ledger.first;
+   for (uint32_t i = 0; i < ledger.count; i++, d = n_hal_device_next(d)) {
+      uint32_t at;
+      if (gpu_target(d, &at) && at == target) {
+         *device = d->id;
+         st = NV_OK;
+         break;
+      }
+   }
+   free((void *)ledger.first);
+   return st;
+}
+
+static uint32_t
+connect_target(uint32_t target, struct nvrm **out)
+{
+   uint32_t device;
+   uint32_t st = device_of_target(target, &device);
+   return st == NV_OK ? connect_device(device, out) : st;
+}
+
 uint32_t
 nnrm_enumerate_gpus(uint32_t **targets_out, uint32_t *count_out)
 {
    *targets_out = NULL;
    *count_out = 0;
-   struct n_pciinfo *list = NULL;
-   uint32_t count;
-   uint32_t st = pci_snapshot(&list, &count);
+   struct n_hal_snapshot ledger;
+   uint32_t st = ledger_snapshot(&ledger);
    if (st != NV_OK)
       return st;
+   uint32_t count = ledger.count;
    uint32_t *targets = count ? malloc((size_t)count * sizeof(*targets)) : NULL;
    if (count && targets == NULL) {
-      free(list);
+      free((void *)ledger.first);
       return NV_ERR_NO_MEMORY;
    }
    uint32_t found = 0;
-   for (uint32_t i = 0; i < count; i++) {
-      if (!nvrm_pci_is_gpu(list[i].vendor, list[i].cls, list[i].subcls, list[i].progif))
+   const struct n_hal_device *d = ledger.first;
+   for (uint32_t i = 0; i < count; i++, d = n_hal_device_next(d)) {
+      uint32_t target;
+      if (!gpu_target(d, &target))
          continue;
-      uint32_t target = N_PCI_TARGET(list[i].segment, list[i].bus, list[i].dev, list[i].func);
       struct nvrm *rm = NULL;
-      st = connect_device(target, &rm);
+      st = connect_device(d->id, &rm);
       if (st == NV_ERR_OBJECT_NOT_FOUND)
          continue;
       if (st != NV_OK)
@@ -587,13 +605,13 @@ nnrm_enumerate_gpus(uint32_t **targets_out, uint32_t *count_out)
          goto fail;
       targets[found++] = target;
    }
-   free(list);
+   free((void *)ledger.first);
    *targets_out = targets;
    *count_out = found;
    return NV_OK;
 fail:
    free(targets);
-   free(list);
+   free((void *)ledger.first);
    return st;
 }
 
@@ -606,7 +624,7 @@ nnrm_open_device(uint32_t target, struct nnrm **out, struct nnrm_gpu_info *info,
    const char **step = failed_step ? failed_step : &unused_step;
    *step = NULL;
    struct nvrm *rm = NULL;
-   uint32_t st = connect_device(target, &rm);
+   uint32_t st = connect_target(target, &rm);
    if (st != NV_OK)
       return failed_at(step, "the connection to nvrm", st);
 

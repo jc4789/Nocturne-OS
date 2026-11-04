@@ -1,6 +1,6 @@
 /* pcitest: drivers in apps (docs/nocturne-native-abi.md §9) on QEMU's "edu" device (-device edu,dma_mask=0xffffffff,
    1234:11e8): the claim, config space, a BAR as a shared object and its views, MSI, and DMA memory
-   the device copies through. It claims with the N_CAP_PCI_CLAIM capability the test disk gives it; compiled inside
+   the device copies through. It claims with the N_CAP_HAL_CLAIM capability the test disk gives it; compiled inside
    Nocturne with tcc. Prints "pcitest: N failed". */
 #include <stdio.h>
 #include <stdint.h>
@@ -23,6 +23,36 @@ static int failed;
         }                                                                                                              \
     } while (0)
 
+/* A PCI function of the ledger. */
+struct pci_function {
+    uint32_t id;
+    uint16_t segment, vendor, device;
+    uint8_t bus, dev, func, cls, subcls, progif;
+};
+
+/* The PCI functions of the ledger, at most max; the count written, or a negative result. */
+static int pci_functions(struct pci_function *out, int max) {
+    struct n_hal_snapshot ledger = {0};
+    n_result total = n_hal_snapshot(&ledger);
+    if (total < 0) return (int)total;
+    int written = 0;
+    const struct n_hal_device *d = ledger.first;
+    for (uint32_t i = 0; i < ledger.count && written < max; i++, d = n_hal_device_next(d)) {
+        uint64_t vendor, device, code, address;
+        if (!n_hal_device_number(d, N_PROP_PCI_VENDOR, &vendor) || !n_hal_device_number(d, N_PROP_PCI_DEVICE, &device) ||
+            !n_hal_device_number(d, N_PROP_PCI_CLASS, &code) || !n_hal_device_number(d, N_PROP_PCI_ADDRESS, &address))
+            continue;
+        out[written++] = (struct pci_function){.id = d->id, .segment = N_PCI_TARGET_SEGMENT(address), .vendor = (uint16_t)vendor,
+                                               .device = (uint16_t)device, .bus = N_PCI_TARGET_BUS(address),
+                                               .dev = N_PCI_TARGET_DEV(address), .func = N_PCI_TARGET_FUNC(address),
+                                               .cls = (uint8_t)(code >> 16), .subcls = (uint8_t)(code >> 8), .progif = (uint8_t)code};
+    }
+    free((void *)ledger.first);
+    return written;
+}
+
+static n_handle claim_function(const struct pci_function *f) { return n_hal_claim(n_cap_find(N_CAP_HAL_CLAIM), f->id); }
+
 /* edu's registers (BAR 0) */
 #define EDU_IDENT 0x00
 #define EDU_LIVENESS 0x04
@@ -44,7 +74,7 @@ static n_result waiter_result;
 static int interrupt_waiter(void *arg) {
     atomic_store(&waiter_started,1);
     uint64_t bits;
-    waiter_result=n_pci_interrupt_take((n_handle)(intptr_t)arg,&bits,1,N_CLOCK_NEVER);
+    waiter_result=n_hal_interrupt_take((n_handle)(intptr_t)arg,&bits,1,N_CLOCK_NEVER);
     return 0;
 }
 static uint32_t rd32(uint32_t at) { return *(volatile uint32_t *)(regs + at); }
@@ -58,7 +88,7 @@ static int dma(n_handle pci, uint64_t ram, uint32_t count, int to_ram) {
     wr64(EDU_DMA_COUNT, count);
     wr64(EDU_DMA_CMD, 1 | (to_ram ? 2 : 0) | 4); /* start, direction, interrupt when done */
     uint64_t bits = 0;
-    n_result got = n_pci_interrupt_take(pci, &bits, 1, n_clock_after(2000 * N_NS_PER_MS));
+    n_result got = n_hal_interrupt_take(pci, &bits, 1, n_clock_after(2000 * N_NS_PER_MS));
     uint32_t why = rd32(EDU_IRQ_STATUS);
     wr32(EDU_IRQ_ACK, why);
     return got == 1 && bits && (why & 0x100);
@@ -214,56 +244,56 @@ static void composition_cases(const char *program) {
    The screen's pages are write-combined for as long as the system runs, and any device page has
    one memory type while something maps it. A driver may hold the screen while it rebuilds how
    the CPU reaches it; the claim's end gives back what it still holds. */
-static int find_vga(const struct n_pciinfo *list, int n) {
+static int find_vga(const struct pci_function *list, int n) {
     for (int i = 0; i < n; i++)
         if (list[i].vendor == 0x1234 && list[i].device == 0x1111) return i;
     return -1;
 }
 
-/* The claim's part of the ACPI namespace (n_pci_acpi_eval). The VGA sits on QEMU's root bus, so
+/* The claim's part of the ACPI namespace (n_hal_pci_acpi_eval). The VGA sits on QEMU's root bus, so
    its upstream node is the host bridge (PNP0A08 on q35, whose _PRT is a package of packages);
    whether the VGA has a node of its own depends on QEMU's tables, and when it has one its _ADR
    is its device and function. */
-static void acpi_cases(n_handle vga, const struct n_pciinfo *at) {
+static void acpi_cases(n_handle vga, const struct pci_function *at) {
     static uint64_t out[8192]; /* a root bus's _PRT has 128 routes of 5 values */
     struct n_acpi_value *v = (struct n_acpi_value *)out;
-    n_result r = n_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_HID", NULL, 0, NULL, 0, out, sizeof out);
+    n_result r = n_hal_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_HID", NULL, 0, NULL, 0, out, sizeof out);
     bool integer_hid = r >= (n_result)sizeof *v && v[0].type == N_ACPI_INTEGER;
     bool string_hid = r >= (n_result)sizeof *v && v[0].type == N_ACPI_STRING && v[0].length == 7 &&
                       v[0].value + 7 <= (uint64_t)r && !memcmp((char *)out + v[0].value, "PNP0A0", 6);
     CHECK((integer_hid && (v[0].value == 0x080AD041 || v[0].value == 0x030AD041)) || string_hid,
           "the host bridge's _HID: %s", r < 0 ? n_result_text(r) : "not a PCI host bridge");
-    r = n_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_PRT", NULL, 0, NULL, 0, out, sizeof out);
+    r = n_hal_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_PRT", NULL, 0, NULL, 0, out, sizeof out);
     size_t values = r > 0 ? (size_t)r / sizeof *v : 0;
     bool routes = values > 1 && v[0].type == N_ACPI_PACKAGE && v[0].length > 0 && v[0].value == 1 &&
                   v[1].type == N_ACPI_PACKAGE && v[1].length == 4;
     CHECK(routes, "the host bridge's _PRT is a package of 4-element packages: %s",
           r < 0 ? n_result_text(r) : "another layout");
-    CHECK(n_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_PRT", NULL, 0, NULL, 0, out, sizeof *v) == -N_ERR_TOO_LARGE,
+    CHECK(n_hal_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_PRT", NULL, 0, NULL, 0, out, sizeof *v) == -N_ERR_TOO_LARGE,
           "a result larger than the room is refused");
     /* QEMU's tables give the host bridge no _ROM (its own names, as "NONE", are refused:
        acpi_refused_cases) */
-    CHECK(n_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_ROM", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_NOT_FOUND,
+    CHECK(n_hal_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_ROM", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_NOT_FOUND,
           "a missing name");
-    CHECK(n_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "\\_SB", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_INVALID &&
-              n_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_SB_.PCI0", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_INVALID,
+    CHECK(n_hal_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "\\_SB", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_INVALID &&
+              n_hal_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_SB_.PCI0", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_INVALID,
           "paths outside the claim's nodes are refused");
     struct n_acpi_value too_many[8] = {{0}};
-    CHECK(n_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_PRT", too_many, 8, NULL, 0, out, sizeof out) == -N_ERR_INVALID,
+    CHECK(n_hal_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_PRT", too_many, 8, NULL, 0, out, sizeof out) == -N_ERR_INVALID,
           "more than 7 arguments");
     struct n_acpi_value outside = {N_ACPI_BUFFER, 16, 0};
-    CHECK(n_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_PRT", &outside, 1, "short", 5, out, sizeof out) == -N_ERR_INVALID,
+    CHECK(n_hal_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_PRT", &outside, 1, "short", 5, out, sizeof out) == -N_ERR_INVALID,
           "an argument past its data");
-    r = n_pci_acpi_eval(vga, N_ACPI_SELF, "_ADR", NULL, 0, NULL, 0, out, sizeof out);
+    r = n_hal_pci_acpi_eval(vga, N_ACPI_SELF, "_ADR", NULL, 0, NULL, 0, out, sizeof out);
     if (r == -N_ERR_NOT_FOUND) {
-        CHECK(n_pci_acpi_eval(vga, N_ACPI_CHILD(0), "_ADR", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_INVALID,
+        CHECK(n_hal_pci_acpi_eval(vga, N_ACPI_CHILD(0), "_ADR", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_INVALID,
               "no children without a node of its own");
-        CHECK(n_pci_acpi_notify_take(vga, 0) == -N_ERR_NOT_FOUND, "no notifications without a node");
+        CHECK(n_hal_pci_acpi_notify_take(vga, 0) == -N_ERR_NOT_FOUND, "no notifications without a node");
     } else {
         CHECK(r >= (n_result)sizeof *v && v[0].type == N_ACPI_INTEGER &&
                   v[0].value == ((uint64_t)at->dev << 16 | at->func),
               "the VGA's own _ADR: %s", r < 0 ? n_result_text(r) : "another value");
-        CHECK(n_pci_acpi_notify_take(vga, 0) == -N_ERR_TIMEOUT, "no notification waiting");
+        CHECK(n_hal_pci_acpi_notify_take(vga, 0) == -N_ERR_TIMEOUT, "no notification waiting");
     }
 }
 
@@ -273,7 +303,7 @@ static void acpi_cases(n_handle vga, const struct n_pciinfo *at) {
    refused too. On the bridge above it (q35's host bridge, whose _OSC exists: without the refusal
    it would answer N_ERR_IO, the AML wanting 4 arguments) the firmware's own names are refused as
    well. The names a driver uses (RM's) answer as they did. */
-static void acpi_refused_cases(n_handle pci, const struct n_pciinfo *at) {
+static void acpi_refused_cases(n_handle pci, const struct pci_function *at) {
     static uint64_t out[512];
     struct n_acpi_value *v = (struct n_acpi_value *)out;
     static const char *const system_methods[] = {
@@ -283,26 +313,26 @@ static void acpi_refused_cases(n_handle pci, const struct n_pciinfo *at) {
     static const uint32_t nodes[] = {N_ACPI_SELF, N_ACPI_UPSTREAM, N_ACPI_CHILD(0), N_ACPI_CHILD(1000)};
     for (size_t i = 0; i < sizeof system_methods / sizeof *system_methods; i++)
         for (size_t k = 0; k < sizeof nodes / sizeof *nodes; k++) {
-            n_result r = n_pci_acpi_eval(pci, nodes[k], system_methods[i], NULL, 0, NULL, 0, out, sizeof out);
+            n_result r = n_hal_pci_acpi_eval(pci, nodes[k], system_methods[i], NULL, 0, NULL, 0, out, sizeof out);
             CHECK(r == -N_ERR_DENIED, "%s on node %x is the system's: %s", system_methods[i], nodes[k],
                   n_result_text(r));
         }
-    n_result r = n_pci_acpi_eval(pci, N_ACPI_UPSTREAM, "NONE", NULL, 0, NULL, 0, out, sizeof out);
+    n_result r = n_hal_pci_acpi_eval(pci, N_ACPI_UPSTREAM, "NONE", NULL, 0, NULL, 0, out, sizeof out);
     CHECK(r == -N_ERR_DENIED, "the bridge's own names are the platform's: %s", n_result_text(r));
-    r = n_pci_acpi_eval(pci, N_ACPI_UPSTREAM, "\\_SB", NULL, 0, NULL, 0, out, sizeof out);
+    r = n_hal_pci_acpi_eval(pci, N_ACPI_UPSTREAM, "\\_SB", NULL, 0, NULL, 0, out, sizeof out);
     CHECK(r == -N_ERR_INVALID, "a malformed name stays malformed on the bridge: %s", n_result_text(r));
     /* as before the refusals */
-    r = n_pci_acpi_eval(pci, N_ACPI_SELF, "NONE", NULL, 0, NULL, 0, out, sizeof out);
+    r = n_hal_pci_acpi_eval(pci, N_ACPI_SELF, "NONE", NULL, 0, NULL, 0, out, sizeof out);
     CHECK(r == -N_ERR_NOT_FOUND, "the function's own names are not refused: %s", n_result_text(r));
-    r = n_pci_acpi_eval(pci, N_ACPI_SELF, "_ROM", NULL, 0, NULL, 0, out, sizeof out);
+    r = n_hal_pci_acpi_eval(pci, N_ACPI_SELF, "_ROM", NULL, 0, NULL, 0, out, sizeof out);
     CHECK(r == -N_ERR_NOT_FOUND, "edu has no _ROM: %s", n_result_text(r));
-    r = n_pci_acpi_eval(pci, N_ACPI_SELF, "_ADR", NULL, 0, NULL, 0, out, sizeof out);
+    r = n_hal_pci_acpi_eval(pci, N_ACPI_SELF, "_ADR", NULL, 0, NULL, 0, out, sizeof out);
     CHECK(r == -N_ERR_NOT_FOUND || (r >= (n_result)sizeof *v && v[0].type == N_ACPI_INTEGER &&
                                     v[0].value == ((uint64_t)at->dev << 16 | at->func)),
           "edu's own _ADR, when it has a node: %s", r < 0 ? n_result_text(r) : "another value");
-    r = n_pci_acpi_eval(pci, N_ACPI_CHILD(0), "_ADR", NULL, 0, NULL, 0, out, sizeof out);
+    r = n_hal_pci_acpi_eval(pci, N_ACPI_CHILD(0), "_ADR", NULL, 0, NULL, 0, out, sizeof out);
     CHECK(r == -N_ERR_INVALID, "edu has no child devices: %s", n_result_text(r));
-    r = n_pci_acpi_eval(pci, N_ACPI_UPSTREAM, "_ROM", NULL, 0, NULL, 0, out, sizeof out);
+    r = n_hal_pci_acpi_eval(pci, N_ACPI_UPSTREAM, "_ROM", NULL, 0, NULL, 0, out, sizeof out);
     CHECK(r == -N_ERR_NOT_FOUND, "a predefined name the host bridge lacks: %s", n_result_text(r));
     /* RM's names on the nodes it uses them on (those that take arguments get none here, so no AML
        of theirs runs: whatever the answer, it is not a refusal) */
@@ -311,28 +341,28 @@ static void acpi_refused_cases(n_handle pci, const struct n_pciinfo *at) {
         {N_ACPI_CHILD(0), "_ADR"}, {N_ACPI_CHILD(0), "_DDC"}, {N_ACPI_CHILD(0), "MXDS"}, {N_ACPI_CHILD(0), "MXDM"},
     };
     for (size_t i = 0; i < sizeof rm / sizeof *rm; i++) {
-        r = n_pci_acpi_eval(pci, rm[i].node, rm[i].name, NULL, 0, NULL, 0, out, sizeof out);
+        r = n_hal_pci_acpi_eval(pci, rm[i].node, rm[i].name, NULL, 0, NULL, 0, out, sizeof out);
         CHECK(r != -N_ERR_DENIED, "RM's %s on node %x is not refused", rm[i].name, rm[i].node);
     }
 }
 
-static void screen_cases(const struct n_pciinfo *list, int n) {
+static void screen_cases(const struct pci_function *list, int n) {
     int at = find_vga(list, n);
     if (at < 0) {
         printf("FAIL: no standard VGA (run QEMU with -vga std)\n");
         failed++;
         return;
     }
-    n_handle vga = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(list[at].segment, list[at].bus, list[at].dev, list[at].func));
+    n_handle vga = claim_function(&list[at]);
     CHECK(vga >= 0, "claim the VGA: %s", n_result_text(vga));
     if (vga < 0) return;
-    struct n_pci_function info;
-    CHECK(n_pci_info(vga, &info) == 0, "VGA info");
+    struct n_hal_pci_info info;
+    CHECK(n_hal_pci_info(vga, &info) == 0, "VGA info");
     CHECK(info.framebuffer_bar == 0 && (info.bar[0].flags & N_PCI_BAR_PREFETCH), "the screen is in prefetchable BAR 0: %u %x",
           info.framebuffer_bar, info.bar[0].flags);
     uint64_t screen = (info.framebuffer_address - info.bar[0].address) & ~4095ull;
     uint64_t past = (info.framebuffer_address - info.bar[0].address + info.framebuffer_size + 4095) & ~4095ull;
-    n_handle bar = n_pci_bar(vga, 0);
+    n_handle bar = n_hal_map(vga, 0);
     CHECK(bar >= 0, "VGA BAR: %s", n_result_text(bar));
     if (bar >= 0 && info.framebuffer_bar == 0) {
         void *none;
@@ -372,15 +402,15 @@ static void screen_cases(const struct n_pciinfo *list, int n) {
         if (wc >= 0) n_handle_close(wc);
     }
     if (bar >= 0) n_handle_close(bar);
-    CHECK(n_pci_hold_screen(vga, true) == 0 && n_pci_hold_screen(vga, true) == 0, "holds of the screen nest");
-    CHECK(n_pci_hold_screen(vga, false) == 0 && n_pci_hold_screen(vga, false) == 0, "and are released one by one");
-    CHECK(n_pci_hold_screen(vga, false) == -N_ERR_INVALID, "a release without a hold");
-    CHECK(n_pci_hold_screen(vga, true) == 0, "a hold the claim's end gives back");
+    CHECK(n_hal_pci_hold_screen(vga, true) == 0 && n_hal_pci_hold_screen(vga, true) == 0, "holds of the screen nest");
+    CHECK(n_hal_pci_hold_screen(vga, false) == 0 && n_hal_pci_hold_screen(vga, false) == 0, "and are released one by one");
+    CHECK(n_hal_pci_hold_screen(vga, false) == -N_ERR_INVALID, "a release without a hold");
+    CHECK(n_hal_pci_hold_screen(vga, true) == 0, "a hold the claim's end gives back");
     acpi_cases(vga, &list[at]);
     n_handle_close(vga);
 }
 
-/* The VGA as a display driver uses it to show screen 0 from its own buffer (n_pci_give_screen):
+/* The VGA as a display driver uses it to show screen 0 from its own buffer (n_screen_give):
    BAR 0 is its memory, the boot screen at its start, and BAR 2 has the Bochs display registers
    (index i at 0x500 + 2i), whose Y offset is the row of that memory the display starts at. The
    driver draws a second buffer past the boot screen, gives it to the system and shows it, then
@@ -407,21 +437,21 @@ static void show_row(volatile uint16_t *dispi, uint32_t row) {
 }
 
 /* The driver's output 0 (the boot screen's, screen 0) shown from one buffer: d's place in
-   surface (n_pci_give_screen), or given back. */
+   surface (n_screen_give), or given back. */
 static n_result give(n_handle vga, n_handle surface, const struct n_scanout *d) {
     struct n_screen_buffers b = {.width = d->width, .height = d->height, .pitch = d->pitch, .format = d->format,
                                  .count = 1, .buffer = {{.surface = surface, .offset = d->offset}}};
-    n_result r = n_pci_give_screen(vga, 0, &b);
+    n_result r = n_screen_give(vga, 0, &b);
     return r < 0 ? r : 0; /* one buffer: no flip of the buffers before to tell apart */
 }
 static n_result give_back(n_handle vga) {
-    n_result r = n_pci_give_screen(vga, 0, NULL);
+    n_result r = n_screen_give(vga, 0, NULL);
     return r < 0 ? r : 0;
 }
 /* A vertical blank of output 0 that shows no flip. */
 static n_result vblank(n_handle vga, uint64_t count, uint64_t time_ns) {
     struct n_screen_vblank v = {.output = 0, .count = count, .time_ns = time_ns};
-    return n_pci_screen_vblank(vga, &v);
+    return n_screen_report_vblank(vga, &v);
 }
 
 static n_result vblanks(n_handle vga, uint64_t *count, unsigned frames) {
@@ -433,10 +463,10 @@ static n_result vblanks(n_handle vga, uint64_t *count, unsigned frames) {
     return r;
 }
 /* A surface given with N_SCANOUT_DIRECT: the system says which fullscreen window the driver may
-   show itself (n_pci_screen_state), and that window hears of it (EV_DIRECT, WIN_STATE_DIRECT). */
+   show itself (n_screen_read_state), and that window hears of it (EV_DIRECT, WIN_STATE_DIRECT). */
 static bool screen_app(n_handle vga, struct n_screen_state *st, uint32_t app) {
     for (uint64_t end = (n_clock_monotonic() / N_NS_PER_MS) + 2000; st->app != app && (n_clock_monotonic() / N_NS_PER_MS) < end;)
-        if (n_pci_screen_state(vga, 0, st->serial, st, n_clock_after(200 * N_NS_PER_MS)) == -N_ERR_DENIED) return false;
+        if (n_screen_read_state(vga, 0, st->serial, st, n_clock_after(200 * N_NS_PER_MS)) == -N_ERR_DENIED) return false;
     return st->app == app;
 }
 static bool direct_heard(window_t *win, int key) {
@@ -445,7 +475,7 @@ static bool direct_heard(window_t *win, int key) {
         if (win_event(win, &e, n_clock_after(200 * N_NS_PER_MS)) > 0 && e.type == EV_DIRECT && e.key == key) return true;
     return false;
 }
-/* The images such a driver shows in its scanout's place, the app's own (n_pci_screen_image): the
+/* The images such a driver shows in its scanout's place, the app's own (n_screen_image_add): the
    panic screen is drawn into them too, as no driver runs then to show the scanout again. They are
    in the format NVIDIA's are, red in the low byte. The last is in the second buffer (when there is
    room), apart from the scanout's own rows; with linger_s (and the Bochs registers) it is shown
@@ -457,30 +487,30 @@ static void direct_cases(n_handle vga, n_handle surface, const struct n_scanout 
     struct n_scanout direct = *d, image = *d, bad;
     direct.format |= N_SCANOUT_DIRECT;
     image.format = N_SCANOUT_XBGR8888;
-    CHECK(n_pci_screen_image(vga, 0, surface, &image) == -N_ERR_DENIED, "no image while the boot screen is shown");
+    CHECK(n_screen_image_add(vga, 0, surface, &image) == -N_ERR_DENIED, "no image while the boot screen is shown");
     n_result r = give(vga, surface, &direct);
     CHECK(r == 0, "a surface that can show fullscreen windows directly: %s", n_result_text(r));
     if (r) return;
     struct n_screen_state st = {0};
-    r = n_pci_screen_state(vga, 0, 0, &st, 0);
+    r = n_screen_read_state(vga, 0, 0, &st, 0);
     CHECK(r == 0 && st.serial != 0 && st.app == 0, "no window shown directly yet: %s app %u", n_result_text(r), st.app);
     uint64_t seen = st.serial, t0 = (n_clock_monotonic() / N_NS_PER_MS);
-    r = n_pci_screen_state(vga, 0, seen, &st, n_clock_after(100 * N_NS_PER_MS));
+    r = n_screen_read_state(vga, 0, seen, &st, n_clock_after(100 * N_NS_PER_MS));
     CHECK(r == -N_ERR_TIMEOUT && st.serial == seen && (n_clock_monotonic() / N_NS_PER_MS) - t0 >= 90, "the state waits for a change: %s",
           n_result_text(r));
     bad = image, bad.format |= N_SCANOUT_DIRECT;
-    CHECK(n_pci_screen_image(vga, 0, surface, &bad) == -N_ERR_INVALID, "an image is no scanout of its own");
+    CHECK(n_screen_image_add(vga, 0, surface, &bad) == -N_ERR_INVALID, "an image is no scanout of its own");
     bad = image, bad.width = 0;
-    CHECK(n_pci_screen_image(vga, 0, surface, &bad) == -N_ERR_INVALID, "an image of no width");
+    CHECK(n_screen_image_add(vga, 0, surface, &bad) == -N_ERR_INVALID, "an image of no width");
     bad = image, bad.format = 99;
-    CHECK(n_pci_screen_image(vga, 0, surface, &bad) == -N_ERR_INVALID, "an image of an unknown format");
+    CHECK(n_screen_image_add(vga, 0, surface, &bad) == -N_ERR_INVALID, "an image of an unknown format");
     if (edu_bar >= 0)
-        CHECK(n_pci_screen_image(vga, 0, edu_bar, &image) == -N_ERR_DENIED, "an image in another claim's BAR");
-    n_result one = n_pci_screen_image(vga, 0, surface, &image), two = n_pci_screen_image(vga, 0, surface, &image);
+        CHECK(n_screen_image_add(vga, 0, edu_bar, &image) == -N_ERR_DENIED, "an image in another claim's BAR");
+    n_result one = n_screen_image_add(vga, 0, surface, &image), two = n_screen_image_add(vga, 0, surface, &image);
     CHECK(one > 0 && two > 0 && one != two, "two images the panic screen is drawn into: %lld %lld", (long long)one,
           (long long)two);
-    r = n_pci_screen_image_end(vga, one);
-    CHECK(r == 0 && n_pci_screen_image_end(vga, one) == -N_ERR_INVALID && n_pci_screen_image_end(vga, 0) == -N_ERR_INVALID,
+    r = n_screen_image_end(vga, one);
+    CHECK(r == 0 && n_screen_image_end(vga, one) == -N_ERR_INVALID && n_screen_image_end(vga, 0) == -N_ERR_INVALID,
           "an image ended once: %s", n_result_text(r));
     window_t *win = NULL;
     if (!gui_available() || win_open(320, 200, "pcitest", 0, &win) < 0) {
@@ -503,11 +533,11 @@ static void direct_cases(n_handle vga, n_handle surface, const struct n_scanout 
         CHECK(screen_app(vga, &st, 0), "a closed window is no longer shown");
     }
     r = give(vga, surface, d);
-    CHECK(r == 0 && n_pci_screen_image_end(vga, two) == -N_ERR_INVALID,
+    CHECK(r == 0 && n_screen_image_end(vga, two) == -N_ERR_INVALID,
           "a scanout without N_SCANOUT_DIRECT ends the images: %s", n_result_text(r));
     r = give(vga, surface, &direct);
     if (second) image.offset = second;
-    one = r ? r : n_pci_screen_image(vga, 0, surface, &image);
+    one = r ? r : n_screen_image_add(vga, 0, surface, &image);
     CHECK(one > 0, "an image again%s: %s", second ? ", in the second buffer" : "", n_result_text(one));
     if (one > 0 && linger_s && dispi && second) {
         show_row(dispi, (uint32_t)(second / d->pitch));
@@ -517,12 +547,12 @@ static void direct_cases(n_handle vga, n_handle surface, const struct n_scanout 
         show_row(dispi, (uint32_t)(d->offset / d->pitch));
     }
     r = give_back(vga);
-    CHECK(r == 0 && n_pci_screen_state(vga, 0, 0, &st, 0) == -N_ERR_DENIED && n_pci_screen_image_end(vga, one) == -N_ERR_INVALID,
+    CHECK(r == 0 && n_screen_read_state(vga, 0, 0, &st, 0) == -N_ERR_DENIED && n_screen_image_end(vga, one) == -N_ERR_INVALID,
           "the boot screen back ends direct showing and its images");
     n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
 }
 
-/* The monitor's modes (n_pci_screen_modes): the driver offers what it can show, the display service
+/* The monitor's modes (n_screen_offer_modes): the driver offers what it can show, the display service
    wants the monitor's preferred mode, a mode applied (N_DISPLAY_MODE) is wanted, and a mode the driver
    could not show is refused. The driver shows each mode wanted: the Bochs registers (when they
    answer) set to its size, the rows as long as the boot screen's, and its surface given at that
@@ -575,7 +605,7 @@ static bool mode_kept(const struct n_screen_mode *m) {
 /* The next wish (a mode_serial after *serial) within ms. */
 static bool mode_wanted(n_handle vga, struct n_screen_state *st, uint64_t *serial, int64_t ms) {
     for (uint64_t end = (n_clock_monotonic() / N_NS_PER_MS) + (uint64_t)ms; st->mode_serial <= *serial && (n_clock_monotonic() / N_NS_PER_MS) < end;)
-        if (n_pci_screen_state(vga, 0, st->serial, st, n_clock_after(200 * N_NS_PER_MS)) == -N_ERR_DENIED) return false;
+        if (n_screen_read_state(vga, 0, st->serial, st, n_clock_after(200 * N_NS_PER_MS)) == -N_ERR_DENIED) return false;
     if (st->mode_serial <= *serial) return false;
     *serial = st->mode_serial;
     return true;
@@ -592,7 +622,7 @@ static n_result mode_show(n_handle vga, n_handle surface, const struct n_scanout
         if (!r) offer->shown = st->mode;
     }
     offer->done = st->mode_serial;
-    n_result told = n_pci_screen_modes(vga, 0, offer);
+    n_result told = n_screen_offer_modes(vga, 0, offer);
     return r ? r : told;
 }
 static bool desktop_width(int width) {
@@ -631,7 +661,7 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
     n_handle heard = n_events_create(), watch = n_screen_watch();
     CHECK(heard >= 0 && watch >= 0 && n_events_watch(heard, watch, N_EVENT_RECEIVABLE, 1) == 0, "a watch on the screen: %s",
           n_result_text(watch));
-    CHECK(n_pci_screen_state(vga, 0, 0, &st, 0) == -N_ERR_DENIED, "no screen state before modes are offered");
+    CHECK(n_screen_read_state(vga, 0, 0, &st, 0) == -N_ERR_DENIED, "no screen state before modes are offered");
     /* no driver running has offered modes (an earlier run's ended) */
     n_result r = modes_get(seen);
     CHECK(r == 0 && !seen->offered.count &&
@@ -639,16 +669,15 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
               seen->offered.shown.width == d->width && seen->offered.shown.height == d->height,
           "without modes Settings sees the boot screen's mode: source %u, %ux%u", seen->source, seen->offered.shown.width,
           seen->offered.shown.height);
-    if (edu >= 0) CHECK(n_pci_screen_modes(edu, 0, offer) == -N_ERR_DENIED, "edu offers no modes");
     offer->count = N_SCREEN_MODES_MAX + 1;
-    CHECK(n_pci_screen_modes(vga, 0, offer) == -N_ERR_INVALID, "more modes than N_SCREEN_MODES_MAX");
+    CHECK(n_screen_offer_modes(vga, 0, offer) == -N_ERR_INVALID, "more modes than N_SCREEN_MODES_MAX");
     offer->count = 4;
     offer->modes[3].refresh_mhz = 0;
-    CHECK(n_pci_screen_modes(vga, 0, offer) == -N_ERR_INVALID, "a mode without a refresh rate");
+    CHECK(n_screen_offer_modes(vga, 0, offer) == -N_ERR_INVALID, "a mode without a refresh rate");
     offer->modes[3] = small;
 
     /* the monitor's preferred mode first */
-    r = n_pci_screen_modes(vga, 0, offer);
+    r = n_screen_offer_modes(vga, 0, offer);
     CHECK(r == 0, "the VGA offers its monitor's modes: %s", n_result_text(r));
     if (r) {
         n_handle_close(watch), n_handle_close(heard);
@@ -657,12 +686,12 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
     }
     CHECK(screen_heard(heard, watch, 1000), "the screen's watch hears the modes offered");
     uint64_t serial = 0;
-    r = n_pci_screen_state(vga, 0, 0, &st, 0);
+    r = n_screen_read_state(vga, 0, 0, &st, 0);
     CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &native),
           "the display service wants the monitor's preferred mode: %ux%u at %u mHz", st.mode.width, st.mode.height, st.mode.refresh_mhz);
     r = mode_show(vga, surface, d, dispi, offer, &st, false);
     CHECK(r == 0, "the preferred mode shown: %s", n_result_text(r));
-    CHECK(n_pci_screen_state(vga, 0, st.serial, &st, n_clock_after(100 * N_NS_PER_MS)) == -N_ERR_TIMEOUT, "a mode shown as wanted changes nothing");
+    CHECK(n_screen_read_state(vga, 0, st.serial, &st, n_clock_after(100 * N_NS_PER_MS)) == -N_ERR_TIMEOUT, "a mode shown as wanted changes nothing");
     r = modes_get(seen);
     CHECK(r == 0 && seen->offered.count == 4 && !strcmp(seen->offered.monitor, "pcitest-vga") &&
               same_mode(&seen->offered.shown, &native) && same_mode(&seen->wanted, &native) && !seen->refused_serial &&
@@ -671,7 +700,7 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
     /* a mode the monitor does not offer is held and shows nothing */
     struct n_screen_mode odd = {800, 600, 60000, 0};
     r = mode_apply(&odd);
-    CHECK(r == 0 && n_pci_screen_state(vga, 0, st.serial, &st, n_clock_after(100 * N_NS_PER_MS)) == -N_ERR_TIMEOUT,
+    CHECK(r == 0 && n_screen_read_state(vga, 0, st.serial, &st, n_clock_after(100 * N_NS_PER_MS)) == -N_ERR_TIMEOUT,
           "a mode the monitor was not offered is not wanted: %s", n_result_text(r));
 
     /* a mode applied is wanted, and another after it */
@@ -690,14 +719,14 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
     CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000), "applied again: %s", n_result_text(r));
     mode_show(vga, surface, d, dispi, offer, &st, false);
     desktop_width(1024);
-    CHECK(n_pci_screen_state(vga, 0, st.serial, &st, n_clock_after(100 * N_NS_PER_MS)) == -N_ERR_TIMEOUT, "the mode stays");
+    CHECK(n_screen_read_state(vga, 0, st.serial, &st, n_clock_after(100 * N_NS_PER_MS)) == -N_ERR_TIMEOUT, "the mode stays");
     CHECK(mode_kept(&small), "the system reports the choice");
     offer->count = 0;
-    CHECK(n_pci_screen_modes(vga, 0, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && st.mode.width == 0,
+    CHECK(n_screen_offer_modes(vga, 0, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && st.mode.width == 0,
           "the modes withdrawn: no mode is wanted");
     offer->count = 4;
     offer->done = 0;
-    CHECK(n_pci_screen_modes(vga, 0, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &small),
+    CHECK(n_screen_offer_modes(vga, 0, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &small),
           "offered again, the monitor shows the mode kept: %ux%u", st.mode.width, st.mode.height);
     mode_show(vga, surface, d, dispi, offer, &st, false);
     CHECK(mode_kept(&small), "Settings sees the mode kept for this monitor");
@@ -715,7 +744,7 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
           "a mode the driver could not show: the next best comes, and Settings hears it");
     mode_show(vga, surface, d, dispi, offer, &st, false);
     offer->done = 0;
-    CHECK(n_pci_screen_modes(vga, 0, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &native),
+    CHECK(n_screen_offer_modes(vga, 0, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && same_mode(&st.mode, &native),
           "offered again: the mode shown stays wanted");
     offer->shown = (struct n_screen_mode){0}; /* the driver shows nothing */
     mode_show(vga, surface, d, dispi, offer, &st, true);
@@ -728,12 +757,12 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
 
     /* withdrawn, and the boot screen back at its size */
     offer->count = 0;
-    CHECK(n_pci_screen_modes(vga, 0, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && st.mode.width == 0 &&
+    CHECK(n_screen_offer_modes(vga, 0, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && st.mode.width == 0 &&
               modes_get(seen) == 0 && seen->offered.count == 0,
           "withdrawn: no modes and none wanted");
     bochs_mode(dispi, native.width, native.height, d->pitch, (uint32_t)(d->offset / d->pitch));
     r = give_back(vga);
-    CHECK(r == 0 && desktop_width((int)native.width) && n_pci_screen_state(vga, 0, 0, &st, 0) == -N_ERR_DENIED,
+    CHECK(r == 0 && desktop_width((int)native.width) && n_screen_read_state(vga, 0, 0, &st, 0) == -N_ERR_DENIED,
           "the boot screen back at its size: %s", n_result_text(r));
     r = modes_get(seen);
     CHECK(r == 0 && seen->source == SCREEN_SOURCE_HANDED_BACK && !seen->offered.count &&
@@ -745,7 +774,7 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
     offer->count = 4;
     offer->done = 0;
     offer->shown = (struct n_screen_mode){0};
-    CHECK(n_pci_screen_modes(vga, 0, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && modes_get(seen) == 0 &&
+    CHECK(n_screen_offer_modes(vga, 0, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && modes_get(seen) == 0 &&
               seen->source == SCREEN_SOURCE_HANDED_BACK && seen->offered.count == 4 &&
               seen->offered.shown.width == native.width && seen->offered.shown.height == native.height,
           "modes offered with the boot screen shown: listed, the boot screen's mode shown (source %u)", seen->source);
@@ -759,11 +788,11 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
     CHECK(r == 0 && mode_wanted(vga, &st, &serial, 1000), "the preferred mode again: %s", n_result_text(r));
     mode_show(vga, surface, d, dispi, offer, &st, false);
     offer->count = 0;
-    CHECK(n_pci_screen_modes(vga, 0, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && st.mode.width == 0,
+    CHECK(n_screen_offer_modes(vga, 0, offer) == 0 && mode_wanted(vga, &st, &serial, 1000) && st.mode.width == 0,
           "withdrawn again");
     bochs_mode(dispi, native.width, native.height, d->pitch, (uint32_t)(d->offset / d->pitch));
     r = give_back(vga);
-    CHECK(r == 0 && desktop_width((int)native.width) && n_pci_screen_state(vga, 0, 0, &st, 0) == -N_ERR_DENIED,
+    CHECK(r == 0 && desktop_width((int)native.width) && n_screen_read_state(vga, 0, 0, &st, 0) == -N_ERR_DENIED,
           "the boot screen back again: %s", n_result_text(r));
     n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
     n_handle_close(watch), n_handle_close(heard);
@@ -771,18 +800,18 @@ static void mode_cases(n_handle vga, n_handle edu, n_handle surface, const struc
 }
 
 /* linger_s: how long the second buffer is shown. */
-static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n, unsigned linger_s) {
+static void give_screen_cases(n_handle edu, const struct pci_function *list, int n, unsigned linger_s) {
     int at = find_vga(list, n);
     if (at < 0) {
         printf("FAIL: no standard VGA (run QEMU with -vga std)\n");
         failed++;
         return;
     }
-    n_handle vga = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(list[at].segment, list[at].bus, list[at].dev, list[at].func));
+    n_handle vga = claim_function(&list[at]);
     CHECK(vga >= 0, "claim the VGA to give the screen: %s", n_result_text(vga));
     if (vga < 0) return;
-    struct n_pci_function info;
-    if (n_pci_info(vga, &info) != 0 || info.framebuffer_bar != 0 || info.framebuffer_bpp != 32) {
+    struct n_hal_pci_info info;
+    if (n_hal_pci_info(vga, &info) != 0 || info.framebuffer_bar != 0 || info.framebuffer_bpp != 32) {
         CHECK(0, "the boot screen is a 32 bpp one in the VGA's BAR 0");
         n_handle_close(vga);
         return;
@@ -791,7 +820,7 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     uint64_t size = info.bar[0].size, boot = info.framebuffer_address - info.bar[0].address;
     uint64_t frame = (uint64_t)pitch * info.framebuffer_height, second = boot + frame;
     struct n_scanout d = {info.framebuffer_width, info.framebuffer_height, pitch, N_SCANOUT_XRGB8888, boot}, bad;
-    n_handle bar = n_pci_bar(vga, 0);
+    n_handle bar = n_hal_map(vga, 0);
     n_handle surface = bar >= 0 ? n_shared_view(bar, 0, size, N_CACHE_WRITE_COMBINE) : bar;
     void *whole = NULL;
     if (surface >= 0) n_shared_map(surface, size, N_MEMORY_READ_WRITE, &whole);
@@ -805,7 +834,7 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     volatile uint32_t *gop = (volatile uint32_t *)((uint8_t *)whole + boot + 100ull * pitch) + 100;
     volatile uint32_t *next = (volatile uint32_t *)((uint8_t *)whole + second + 100ull * pitch) + 100;
     /* The Bochs registers, when their ID answers */
-    n_handle regs_bar = info.bar[2].size >= 4096 ? n_pci_bar(vga, 2) : -1;
+    n_handle regs_bar = info.bar[2].size >= 4096 ? n_hal_map(vga, 2) : -1;
     void *regs_map = NULL;
     if (regs_bar >= 0) n_shared_map(regs_bar, 4096, N_MEMORY_READ_WRITE, &regs_map);
     volatile uint16_t *dispi = regs_map;
@@ -820,11 +849,11 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     /* refused */
     CHECK(vblank(vga, 1, 0) == -N_ERR_DENIED, "no vertical blank before a surface is given");
     CHECK(give_back(vga) == -N_ERR_INVALID, "nothing to give back yet");
-    n_handle edu_bar = edu >= 0 ? n_pci_bar(edu, 0) : -1;
+    n_handle edu_bar = edu >= 0 ? n_hal_map(edu, 0) : -1;
     if (edu >= 0) {
-        CHECK(give(edu, edu_bar, &d) == -N_ERR_DENIED, "edu is no display function");
+        CHECK(give(edu, edu_bar, &d) == -N_ERR_INVALID, "a scanout larger than edu's BAR");
         CHECK(give(vga, edu_bar, &d) == -N_ERR_DENIED, "another claim's BAR");
-        CHECK(n_pci_screen_image(edu, 0, edu_bar, &d) == -N_ERR_DENIED, "edu shows no images");
+        CHECK(n_screen_image_add(edu, 0, edu_bar, &d) == -N_ERR_DENIED, "edu shows no images");
     }
     bad = d, bad.width = 0;
     CHECK(give(vga, surface, &bad) == -N_ERR_INVALID, "no width");
@@ -853,16 +882,16 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     n_result r = give(vga, surface, &d);
     CHECK(r == 0, "the boot screen's memory as the driver's surface: %s", n_result_text(r));
     struct n_screen_state st;
-    r = n_pci_screen_state(vga, 0, 0, &st, 0);
+    r = n_screen_read_state(vga, 0, 0, &st, 0);
     CHECK(r == 0 && st.app == 0 && st.mode.width == 0, "without N_SCANOUT_DIRECT or modes offered, the state shows no window and wants no mode: %s",
           n_result_text(r));
-    CHECK(n_pci_screen_image(vga, 0, surface, &d) == -N_ERR_DENIED, "no image without N_SCANOUT_DIRECT");
+    CHECK(n_screen_image_add(vga, 0, surface, &d) == -N_ERR_DENIED, "no image without N_SCANOUT_DIRECT");
     n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
     CHECK(marks(gop) == 0, "all of the screen is drawn again: %d marks left", marks(gop));
     uint64_t count = 0;
     r = vblanks(vga, &count, 30);
     CHECK(r == 0, "vertical blanks of the surface shown: %s", n_result_text(r));
-    CHECK(n_pci_hold_screen(vga, true) == 0 && n_pci_hold_screen(vga, false) == 0, "the screen held and given back");
+    CHECK(n_hal_pci_hold_screen(vga, true) == 0 && n_hal_pci_hold_screen(vga, false) == 0, "the screen held and given back");
     n_sleep_until(n_clock_after(300 * N_NS_PER_MS)); /* the release draws all of the screen again: the marks below come after it */
 
     /* a second buffer past it, which the display then shows */
@@ -902,7 +931,7 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     CHECK(marks(gop) == 0, "the boot screen is drawn again: %d marks left", marks(gop));
     CHECK(give_back(vga) == -N_ERR_INVALID, "given back once");
     CHECK(vblank(vga, ++count, 0) == -N_ERR_DENIED, "no vertical blanks of the boot screen");
-    CHECK(n_pci_screen_state(vga, 0, 0, &st, 0) == -N_ERR_DENIED, "no screen state of the boot screen");
+    CHECK(n_screen_read_state(vga, 0, 0, &st, 0) == -N_ERR_DENIED, "no screen state of the boot screen");
     direct_cases(vga, surface, &d, edu_bar, second + frame <= size ? second : 0, dispi, linger_s);
     mode_cases(vga, edu, surface, &d, dispi);
 
@@ -910,7 +939,7 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     struct n_scanout direct = d;
     direct.format |= N_SCANOUT_DIRECT;
     r = give(vga, surface, &direct);
-    if (!r) r = n_pci_screen_image(vga, 0, surface, &d);
+    if (!r) r = n_screen_image_add(vga, 0, surface, &d);
     CHECK(r > 0, "a surface the claim's end gives back, with an image: %s", n_result_text(r));
     n_sleep_until(n_clock_after(300 * N_NS_PER_MS));
     mark(gop);
@@ -923,10 +952,10 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
     n_handle_close(surface);
     if (bar >= 0) n_handle_close(bar);
     n_handle_close(vga);
-    vga = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(list[at].segment, list[at].bus, list[at].dev, list[at].func));
+    vga = claim_function(&list[at]);
     CHECK(vga >= 0, "the VGA claimed again: %s", n_result_text(vga));
     if (vga < 0) return;
-    bar = n_pci_bar(vga, 0);
+    bar = n_hal_map(vga, 0);
     size_t peek = (size_t)(((boot & 4095) + 101ull * pitch + 4095) & ~4095ull); /* the marked row */
     n_handle view = bar >= 0 ? n_shared_view(bar, boot & ~4095ull, peek, N_CACHE_WRITE_COMBINE) : bar;
     void *again = NULL;
@@ -944,16 +973,16 @@ static void give_screen_cases(n_handle edu, const struct n_pciinfo *list, int n,
 
 /* A driver that holds the screen and never gives it back (run by stuck_holder_cases). */
 static int stuck_holder(void) {
-    struct n_pciinfo list[128];
-    int n = pcilist(list, 128), at = find_vga(list, n);
-    n_handle vga = at < 0 ? -1 : n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(list[at].segment, list[at].bus, list[at].dev, list[at].func));
-    if (vga < 0 || n_pci_hold_screen(vga, true) != 0) return 2;
+    struct pci_function list[128];
+    int n = pci_functions(list, 128), at = find_vga(list, n);
+    n_handle vga = at < 0 ? -1 : claim_function(&list[at]);
+    if (vga < 0 || n_hal_pci_hold_screen(vga, true) != 0) return 2;
     for (;;) n_sleep_until(n_clock_after(60000 * N_NS_PER_MS));
 }
 
 /* Booted with fbhold=<seconds>: the system stops a driver that holds the screen that long, and
    the end of its claim gives the screen back. Before the limit the hold stays, however long. */
-static void stuck_holder_cases(const char *program, const struct n_pciinfo *list, int n, uint64_t seconds) {
+static void stuck_holder_cases(const char *program, const struct pci_function *list, int n, uint64_t seconds) {
     int at = find_vga(list, n);
     if (at < 0) {
         printf("FAIL: no standard VGA (run QEMU with -vga std)\n");
@@ -971,7 +1000,7 @@ static void stuck_holder_cases(const char *program, const struct n_pciinfo *list
     n_result early = n_app_result(holder, n_clock_after((uint64_t)seconds * N_NS_PER_S / 2), &status);
     CHECK(early == -N_ERR_TIMEOUT, "the holder keeps the screen before the limit: %s status %d", n_result_text(early),
           status);
-    n_handle busy = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(list[at].segment, list[at].bus, list[at].dev, list[at].func));
+    n_handle busy = claim_function(&list[at]);
     CHECK(busy == -N_ERR_BUSY, "the VGA is still the holder's: %s", n_result_text(busy));
     if (busy >= 0) n_handle_close(busy);
     n_result ended = n_app_result(holder, n_clock_after(((uint64_t)seconds + 10) * N_NS_PER_S), &status);
@@ -979,22 +1008,22 @@ static void stuck_holder_cases(const char *program, const struct n_pciinfo *list
           n_result_text(ended), status);
     if (ended < 0) n_app_stop(holder, 0);
     n_handle_close(holder);
-    n_handle vga = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(list[at].segment, list[at].bus, list[at].dev, list[at].func));
+    n_handle vga = claim_function(&list[at]);
     CHECK(vga >= 0, "the VGA can be claimed again: %s", n_result_text(vga));
     if (vga < 0) return;
-    CHECK(n_pci_hold_screen(vga, true) == 0 && n_pci_hold_screen(vga, false) == 0, "and held and given back");
+    CHECK(n_hal_pci_hold_screen(vga, true) == 0 && n_hal_pci_hold_screen(vga, false) == 0, "and held and given back");
     n_handle_close(vga);
 }
 
 /* A virtio function's common configuration (virtio 1.x, vendor capability type 1): its BAR and
    the offset in it, false when it has none. */
 static int virtio_common(n_handle pci, uint32_t *bar, uint32_t *offset) {
-    for (n_result at = n_pci_config_read(pci, N_PCI_SELF, 0x34, 1) & 0xFC, hops = 0; at && hops < 48; hops++) {
-        n_result head = n_pci_config_read(pci, N_PCI_SELF, (uint32_t)at, 4);
+    for (n_result at = n_hal_pci_config_read(pci, N_PCI_SELF, 0x34, 1) & 0xFC, hops = 0; at && hops < 48; hops++) {
+        n_result head = n_hal_pci_config_read(pci, N_PCI_SELF, (uint32_t)at, 4);
         if (head < 0) return 0;
         if ((head & 0xFF) == 0x09 && ((head >> 24) & 0xFF) == 1) {
-            *bar = (uint32_t)n_pci_config_read(pci, N_PCI_SELF, (uint32_t)at + 4, 1);
-            *offset = (uint32_t)n_pci_config_read(pci, N_PCI_SELF, (uint32_t)at + 8, 4);
+            *bar = (uint32_t)n_hal_pci_config_read(pci, N_PCI_SELF, (uint32_t)at + 4, 1);
+            *offset = (uint32_t)n_hal_pci_config_read(pci, N_PCI_SELF, (uint32_t)at + 8, 4);
             return 1;
         }
         at = (head >> 8) & 0xFC;
@@ -1006,9 +1035,9 @@ static int virtio_common(n_handle pci, uint32_t *bar, uint32_t *offset) {
    be reached. A write of `set` first when set >= 0. */
 static int virtio_status(n_handle pci, int set) {
     uint32_t bar, offset;
-    struct n_pci_function info;
-    if (!virtio_common(pci, &bar, &offset) || bar > 5 || n_pci_info(pci, &info) != 0 || !info.bar[bar].size) return -1;
-    n_handle h = n_pci_bar(pci, bar);
+    struct n_hal_pci_info info;
+    if (!virtio_common(pci, &bar, &offset) || bar > 5 || n_hal_pci_info(pci, &info) != 0 || !info.bar[bar].size) return -1;
+    n_handle h = n_hal_map(pci, bar);
     void *whole = NULL;
     if (h >= 0) n_shared_map(h, info.bar[bar].size, N_MEMORY_READ_WRITE, &whole);
     volatile uint8_t *m = whole;
@@ -1026,7 +1055,7 @@ static int virtio_status(n_handle pci, int set) {
    isolated next claim performs FLR (QEMU: virtio-rng-pci behind a pcie-root-port). Its virtio
    device status reads 0, BARs are retained and BME stays off. A nonisolated next claim is refused:
    resetting the device alone is not permission to reuse the old driver's DMA memory. */
-static void reset_cases(const struct n_pciinfo *list, int n) {
+static void reset_cases(const struct pci_function *list, int n) {
     int at = -1;
     for (int i = 0; i < n && at < 0; i++)
         if (list[i].vendor == 0x1af4 && list[i].cls != 0x06) at = i;
@@ -1035,20 +1064,20 @@ static void reset_cases(const struct n_pciinfo *list, int n) {
         failed++;
         return;
     }
-    const struct n_pciinfo *v = &list[at];
-    n_handle pci = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(v->segment, v->bus, v->dev, v->func));
+    const struct pci_function *v = &list[at];
+    n_handle pci = claim_function(v);
     CHECK(pci >= 0, "claim the virtio function %04x:%02x:%02x.%x: %s", v->segment, v->bus, v->dev, v->func, n_result_text(pci));
     if (pci < 0) return;
-    struct n_pci_function info;
-    n_result described = n_pci_info(pci, &info);
+    struct n_hal_pci_info info;
+    n_result described = n_hal_pci_info(pci, &info);
     CHECK(described == 0, "describe the FLR function: %s", n_result_text(described));
     if (described < 0) { n_handle_close(pci); return; }
-    n_result bars[6], cmd = n_pci_config_read(pci, N_PCI_SELF, 4, 2);
-    for (int i = 0; i < 6; i++) bars[i] = n_pci_config_read(pci, N_PCI_SELF, 0x10 + 4 * (uint32_t)i, 4);
-    CHECK(cmd >= 0 && n_pci_config_write(pci, 4, 2, (uint32_t)cmd | 6) == 0, "command: memory and bus master");
+    n_result bars[6], cmd = n_hal_pci_config_read(pci, N_PCI_SELF, 4, 2);
+    for (int i = 0; i < 6; i++) bars[i] = n_hal_pci_config_read(pci, N_PCI_SELF, 0x10 + 4 * (uint32_t)i, 4);
+    CHECK(cmd >= 0 && n_hal_pci_config_write(pci, 4, 2, (uint32_t)cmd | 6) == 0, "command: memory and bus master");
     CHECK(virtio_status(pci, 1) == 1, "the virtio device status takes ACKNOWLEDGE");
     n_handle_close(pci); /* bus mastering still on: the driver did not stop it */
-    pci = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(v->segment, v->bus, v->dev, v->func));
+    pci = claim_function(v);
     if (!(info.flags & N_PCI_ISOLATED)) {
         CHECK(pci == -N_ERR_NOT_READY, "a crashed nonisolated function cannot be reopened: %s", n_result_text(pci));
         if (pci >= 0) n_handle_close(pci);
@@ -1056,17 +1085,17 @@ static void reset_cases(const struct n_pciinfo *list, int n) {
     }
     CHECK(pci >= 0, "claim it again: %s", n_result_text(pci));
     if (pci < 0) return;
-    CHECK(n_pci_info(pci, &info) == 0 && !(info.flags & N_PCI_NEEDS_RECOVERY),
+    CHECK(n_hal_pci_info(pci, &info) == 0 && !(info.flags & N_PCI_NEEDS_RECOVERY),
           "completed FLR cleared the recovery requirement");
-    cmd = n_pci_config_read(pci, N_PCI_SELF, 4, 2);
+    cmd = n_hal_pci_config_read(pci, N_PCI_SELF, 4, 2);
     CHECK(cmd >= 0 && !(cmd & 4), "bus mastering is off after the claim ended: command %llx", (long long)cmd);
     for (int i = 0; i < 6; i++)
-        CHECK(n_pci_config_read(pci, N_PCI_SELF, 0x10 + 4 * (uint32_t)i, 4) == bars[i], "BAR %d is as it was", i);
-    CHECK(cmd >= 0 && n_pci_config_write(pci, 4, 2, (uint32_t)cmd | 2) == 0, "command: memory");
+        CHECK(n_hal_pci_config_read(pci, N_PCI_SELF, 0x10 + 4 * (uint32_t)i, 4) == bars[i], "BAR %d is as it was", i);
+    CHECK(cmd >= 0 && n_hal_pci_config_write(pci, 4, 2, (uint32_t)cmd | 2) == 0, "command: memory");
     int status = virtio_status(pci, -1);
     CHECK(status == 0, "the reset cleared the virtio device status: %d", status);
-    cmd = n_pci_config_read(pci, N_PCI_SELF, 4, 2);
-    CHECK(cmd >= 0 && n_pci_config_write(pci, 4, 2, (uint32_t)cmd & ~4u) == 0,
+    cmd = n_hal_pci_config_read(pci, N_PCI_SELF, 4, 2);
+    CHECK(cmd >= 0 && n_hal_pci_config_write(pci, 4, 2, (uint32_t)cmd & ~4u) == 0,
           "the recovered driver leaves bus mastering off");
     n_handle_close(pci);
 }
@@ -1087,16 +1116,16 @@ static int dma_allocation_case(const char *text) {
           "dma=<10進バイト数>が不正: %s", n_result_text(-N_ERR_INVALID));
     if (!valid || !bytes || bytes > SIZE_MAX - (page - 1)) return 1;
     size_t rounded = (bytes + page - 1) & ~(page - 1), pages = rounded / page;
-    struct n_pciinfo edu = {0};
+    struct pci_function edu = {0};
     bool found = false;
-    /* pcilistは書き込んだ件数を返す。固定一覧上限を足さず、実一覧に合わせて拡張する。 */
+    /* pci_functionsは書き込んだ件数を返す。固定一覧上限を足さず、実一覧に合わせて拡張する。 */
     for (int capacity = 1; !found;) {
-        if ((size_t)capacity > SIZE_MAX / sizeof(struct n_pciinfo)) {
+        if ((size_t)capacity > SIZE_MAX / sizeof(struct pci_function)) {
             CHECK(0, "PCI一覧サイズ: %s", n_result_text(-N_ERR_TOO_LARGE)); return 1;
         }
-        struct n_pciinfo *list = malloc((size_t)capacity * sizeof *list);
+        struct pci_function *list = malloc((size_t)capacity * sizeof *list);
         if (!list) { CHECK(0, "PCI一覧確保: %s", n_result_text(-N_ERR_NO_MEMORY)); return 1; }
-        n_result n = pcilist(list, capacity);
+        n_result n = pci_functions(list, capacity);
         for (n_result i = 0; i < n && i < capacity; i++)
             if (list[i].vendor == 0x1234 && list[i].device == 0x11e8) { edu = list[i]; found = true; break; }
         free(list);
@@ -1109,13 +1138,13 @@ static int dma_allocation_case(const char *text) {
         }
         capacity *= 2;
     }
-    n_handle pci = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(edu.segment, edu.bus, edu.dev, edu.func)), mem = -1, views[2] = {-1, -1};
+    n_handle pci = claim_function(&edu), mem = -1, views[2] = {-1, -1};
     void *maps[2] = {NULL, NULL};
     uint64_t *addresses = NULL;
     CHECK(pci >= 0, "DMA診断のEDU claim: %s", n_result_text(pci));
     if (pci < 0) return 1;
-    struct n_pci_function info = {0};
-    n_result result = n_pci_info(pci, &info);
+    struct n_hal_pci_info info = {0};
+    n_result result = n_hal_pci_info(pci, &info);
     CHECK(result == 0 && (info.flags & N_PCI_ISOLATED), "DMA診断には隔離済みEDUが必要: %s flags=%x",
           n_result_text(result), info.flags);
     if (result < 0 || !(info.flags & N_PCI_ISOLATED)) goto done;
@@ -1172,15 +1201,15 @@ int main(int argc,char **argv) {
     if(argc>1 && !strcmp(argv[1],"stuck-holder"))return stuck_holder();
     if(argc>1 && !strncmp(argv[1],"dma=",4))return dma_allocation_case(argv[1]+4);
     if(argc>1 && !strcmp(argv[1],"flr")){
-        struct n_pciinfo list[128];
-        reset_cases(list, pcilist(list, 128));
+        struct pci_function list[128];
+        reset_cases(list, pci_functions(list, 128));
         printf("pcitest flr: %d failed\n", failed);
         return failed != 0;
     }
     /* pcitest fbhold=<seconds>: only the stopped-driver case, for a boot with that option */
     if(argc>1 && !strncmp(argv[1],"fbhold=",7)){
-        struct n_pciinfo list[128];
-        int n = pcilist(list, 128);
+        struct pci_function list[128];
+        int n = pci_functions(list, 128);
         uint64_t seconds = strtoull(argv[1] + 7, NULL, 10);
         if (seconds) stuck_holder_cases(argv[0], list, n, seconds);
         else { printf("FAIL: fbhold=<seconds> needs a number above 0\n"); failed++; }
@@ -1189,34 +1218,34 @@ int main(int argc,char **argv) {
     }
     /* pcitest screen=<seconds>: only the given scanout, its second buffer shown that long */
     if(argc>1 && !strncmp(argv[1],"screen=",7)){
-        struct n_pciinfo list[128];
-        int n = pcilist(list, 128);
+        struct pci_function list[128];
+        int n = pci_functions(list, 128);
         give_screen_cases(-1, list, n, (unsigned)strtoul(argv[1] + 7, NULL, 10));
         printf("pcitest screen: %d failed\n", failed);
         return failed != 0;
     }
-    struct n_pciinfo list[128];
-    int n = pcilist(list, 128), at = -1;
+    struct pci_function list[128];
+    int n = pci_functions(list, 128), at = -1;
     for (int i = 0; i < n; i++)
         if (list[i].vendor == 0x1234 && list[i].device == 0x11e8) at = i;
     if (at < 0) {
         printf("pcitest: no edu device (run QEMU with -device edu)\npcitest: 1 failed\n");
         return 1;
     }
-    struct n_pciinfo *e = &list[at];
-    n_handle pci = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(e->segment, e->bus, e->dev, e->func));
+    struct pci_function *e = &list[at];
+    n_handle pci = claim_function(e);
     CHECK(pci >= 0, "claim: %s", n_result_text(pci));
     if (pci < 0) {
         printf("pcitest: %d failed\n", failed);
         return 1;
     }
-    CHECK(n_handle_kind(pci) == N_KIND_PCI, "kind %d", (int)n_handle_kind(pci));
-    n_handle again = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(e->segment, e->bus, e->dev, e->func));
+    CHECK(n_handle_kind(pci) == N_KIND_HAL_CLAIM, "kind %d", (int)n_handle_kind(pci));
+    n_handle again = claim_function(e);
     CHECK(again == -N_ERR_BUSY, "second claim: %s", n_result_text(again));
     if (again >= 0) n_handle_close(again);
 
-    struct n_pci_function info;
-    CHECK(n_pci_info(pci, &info) == 0, "info");
+    struct n_hal_pci_info info;
+    CHECK(n_hal_pci_info(pci, &info) == 0, "info");
     CHECK(info.vendor == 0x1234 && info.device == 0x11e8, "ids %04x:%04x", info.vendor, info.device);
     CHECK((info.bar[0].flags & N_PCI_BAR_MEMORY) && info.bar[0].size == 1 << 20, "bar 0: flags %x size %llu",
           info.bar[0].flags, (unsigned long long)info.bar[0].size);
@@ -1224,34 +1253,34 @@ int main(int argc,char **argv) {
     CHECK(info.framebuffer_bar == N_PCI_NONE, "edu has no screen");
     printf("pcitest: isolated by an IOMMU: %s\n", info.flags & N_PCI_ISOLATED ? "yes" : "no");
 
-    n_result id = n_pci_config_read(pci, N_PCI_SELF, 0, 4);
+    n_result id = n_hal_pci_config_read(pci, N_PCI_SELF, 0, 4);
     CHECK(id == 0x11e81234, "config id %llx", (long long)id);
-    CHECK(n_pci_config_read(pci, N_PCI_SELF, 2, 2) == 0x11e8, "config 16-bit read");
-    CHECK(n_pci_config_read(pci, N_PCI_SELF, 1, 2) == -N_ERR_INVALID, "unaligned read is refused");
-    CHECK(n_pci_config_write(pci, 0x10, 4, 0) == -N_ERR_DENIED, "BAR write is refused");
-    n_result bar0 = n_pci_config_read(pci, N_PCI_SELF, 0x10, 4);
-    CHECK(bar0 > 0 && n_pci_config_write(pci, 0x10, 4, (uint32_t)bar0) == 0, "the BAR's own address can be put back");
-    CHECK(n_pci_config_write(pci, 0x10, 4, (uint32_t)bar0 ^ 0x100000u) == -N_ERR_DENIED, "moving the BAR is refused");
-    n_result cmd = n_pci_config_read(pci, N_PCI_SELF, 4, 2);
-    CHECK(cmd >= 0 && n_pci_config_write(pci, 4, 2, (uint32_t)cmd | 6) == 0, "command: memory and bus master");
-    CHECK((n_pci_config_read(pci, N_PCI_SELF, 4, 2) & 6) == 6, "command reads back");
+    CHECK(n_hal_pci_config_read(pci, N_PCI_SELF, 2, 2) == 0x11e8, "config 16-bit read");
+    CHECK(n_hal_pci_config_read(pci, N_PCI_SELF, 1, 2) == -N_ERR_INVALID, "unaligned read is refused");
+    CHECK(n_hal_pci_config_write(pci, 0x10, 4, 0) == -N_ERR_DENIED, "BAR write is refused");
+    n_result bar0 = n_hal_pci_config_read(pci, N_PCI_SELF, 0x10, 4);
+    CHECK(bar0 > 0 && n_hal_pci_config_write(pci, 0x10, 4, (uint32_t)bar0) == 0, "the BAR's own address can be put back");
+    CHECK(n_hal_pci_config_write(pci, 0x10, 4, (uint32_t)bar0 ^ 0x100000u) == -N_ERR_DENIED, "moving the BAR is refused");
+    n_result cmd = n_hal_pci_config_read(pci, N_PCI_SELF, 4, 2);
+    CHECK(cmd >= 0 && n_hal_pci_config_write(pci, 4, 2, (uint32_t)cmd | 6) == 0, "command: memory and bus master");
+    CHECK((n_hal_pci_config_read(pci, N_PCI_SELF, 4, 2) & 6) == 6, "command reads back");
     /* The bits that route, power or reset the function stay the system's: a write changing one is
        refused, a read-modify-write that keeps them goes through at its own width. */
-    cmd = n_pci_config_read(pci, N_PCI_SELF, 4, 2);
-    CHECK(n_pci_config_write(pci, 4, 2, (uint32_t)cmd ^ 1) == -N_ERR_DENIED, "command: I/O decode is the system's");
-    CHECK(n_pci_config_write(pci, 4, 2, (uint32_t)cmd ^ 0x400) == -N_ERR_DENIED, "command: INTx disable is the system's");
-    CHECK(n_pci_config_write(pci, 4, 2, (uint32_t)cmd) == 0, "command: unchanged guarded bits pass");
-    CHECK(n_pci_config_write(pci, 0x0F, 1, 0x40) == -N_ERR_DENIED, "BIST cannot be started");
-    n_result line = n_pci_config_read(pci, N_PCI_SELF, 0x3C, 1);
-    CHECK(line >= 0 && n_pci_config_write(pci, 0x3C, 1, (uint32_t)line ^ 0xFF) == -N_ERR_DENIED, "interrupt line is the system's");
-    CHECK(line >= 0 && n_pci_config_write(pci, 0x3C, 1, (uint32_t)line) == 0, "interrupt line written as it is");
-    if (n_pci_config_read(pci, N_PCI_SELF, 6, 2) & 0x10) /* a capability list: power management, if any */
-        for (n_result at = n_pci_config_read(pci, N_PCI_SELF, 0x34, 1) & 0xFC, hops = 0; at && hops < 48; hops++) {
-            n_result head = n_pci_config_read(pci, N_PCI_SELF, (uint32_t)at, 2);
+    cmd = n_hal_pci_config_read(pci, N_PCI_SELF, 4, 2);
+    CHECK(n_hal_pci_config_write(pci, 4, 2, (uint32_t)cmd ^ 1) == -N_ERR_DENIED, "command: I/O decode is the system's");
+    CHECK(n_hal_pci_config_write(pci, 4, 2, (uint32_t)cmd ^ 0x400) == -N_ERR_DENIED, "command: INTx disable is the system's");
+    CHECK(n_hal_pci_config_write(pci, 4, 2, (uint32_t)cmd) == 0, "command: unchanged guarded bits pass");
+    CHECK(n_hal_pci_config_write(pci, 0x0F, 1, 0x40) == -N_ERR_DENIED, "BIST cannot be started");
+    n_result line = n_hal_pci_config_read(pci, N_PCI_SELF, 0x3C, 1);
+    CHECK(line >= 0 && n_hal_pci_config_write(pci, 0x3C, 1, (uint32_t)line ^ 0xFF) == -N_ERR_DENIED, "interrupt line is the system's");
+    CHECK(line >= 0 && n_hal_pci_config_write(pci, 0x3C, 1, (uint32_t)line) == 0, "interrupt line written as it is");
+    if (n_hal_pci_config_read(pci, N_PCI_SELF, 6, 2) & 0x10) /* a capability list: power management, if any */
+        for (n_result at = n_hal_pci_config_read(pci, N_PCI_SELF, 0x34, 1) & 0xFC, hops = 0; at && hops < 48; hops++) {
+            n_result head = n_hal_pci_config_read(pci, N_PCI_SELF, (uint32_t)at, 2);
             if (head < 0) break;
             if ((head & 0xFF) == 0x01) {
-                n_result pmcsr = n_pci_config_read(pci, N_PCI_SELF, (uint32_t)at + 4, 2);
-                CHECK(pmcsr >= 0 && n_pci_config_write(pci, (uint32_t)at + 4, 2, ((uint32_t)pmcsr & ~3u) | 3) == -N_ERR_DENIED,
+                n_result pmcsr = n_hal_pci_config_read(pci, N_PCI_SELF, (uint32_t)at + 4, 2);
+                CHECK(pmcsr >= 0 && n_hal_pci_config_write(pci, (uint32_t)at + 4, 2, ((uint32_t)pmcsr & ~3u) | 3) == -N_ERR_DENIED,
                       "the function cannot be put into D3");
                 break;
             }
@@ -1259,19 +1288,19 @@ int main(int argc,char **argv) {
         }
     for (int i = 0; i < n; i++)
         if (list[i].cls == 0x06) {
-            n_handle bridge = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(list[i].segment, list[i].bus, list[i].dev, list[i].func));
+            n_handle bridge = claim_function(&list[i]);
             CHECK(bridge == -N_ERR_DENIED, "bridge %04x:%02x:%02x.%x cannot be claimed: %s", list[i].segment, list[i].bus, list[i].dev,
                   list[i].func, n_result_text(bridge));
             if (bridge >= 0) n_handle_close(bridge);
             break;
         }
     acpi_refused_cases(pci, e);
-    CHECK(n_pci_hold_screen(pci, true) == -N_ERR_NOT_FOUND, "edu has no screen to hold");
+    CHECK(n_hal_pci_hold_screen(pci, true) == -N_ERR_NOT_FOUND, "edu has no screen to hold");
     give_screen_cases(pci, list, n, 0);
     /* a function on bus 0 that is neither this device nor a bridge above it */
     for (int i = 0; i < n; i++)
         if (i != at && list[i].segment == e->segment && list[i].bus == e->bus && list[i].dev != e->dev && list[i].cls != 0x06) {
-            n_result r = n_pci_config_read(pci, N_PCI_TARGET(list[i].segment, list[i].bus, list[i].dev, list[i].func), 0, 4);
+            n_result r = n_hal_pci_config_read(pci, N_PCI_TARGET(list[i].segment, list[i].bus, list[i].dev, list[i].func), 0, 4);
             CHECK(r == -N_ERR_DENIED, "unrelated config read: %lld", (long long)r);
             break;
         }
@@ -1279,21 +1308,21 @@ int main(int argc,char **argv) {
        multifunction slot): the port and function 0 of its device are readable */
     if (info.flags & N_PCI_HAS_UPSTREAM) {
         uint32_t up = info.upstream;
-        n_result r = n_pci_config_read(pci, up, 0x18, 4);
+        n_result r = n_hal_pci_config_read(pci, up, 0x18, 4);
         CHECK(r >= 0 && ((r >> 8) & 0xFF) == e->bus, "upstream bridge read: %lld", (long long)r);
-        r = n_pci_config_read(pci, up & ~7u, 0, 4);
+        r = n_hal_pci_config_read(pci, up & ~7u, 0, 4);
         CHECK(r >= 0 && (r & 0xFFFF) != 0xFFFF, "function 0 beside the upstream bridge: %lld", (long long)r);
     }
     /* a host bridge names the chipset: readable */
     for (int i = 0; i < n; i++)
         if (list[i].cls == 0x06 && list[i].subcls == 0x00) {
-            n_result r = n_pci_config_read(pci, N_PCI_TARGET(list[i].segment, list[i].bus, list[i].dev, list[i].func), 0, 4);
+            n_result r = n_hal_pci_config_read(pci, N_PCI_TARGET(list[i].segment, list[i].bus, list[i].dev, list[i].func), 0, 4);
             CHECK(r == (n_result)((uint32_t)list[i].device << 16 | list[i].vendor), "host bridge config read: %lld",
                   (long long)r);
             break;
         }
 
-    n_handle bar = n_pci_bar(pci, 0);
+    n_handle bar = n_hal_map(pci, 0);
     CHECK(bar >= 0 && n_handle_kind(bar) == N_KIND_SHARED, "bar: %s", n_result_text(bar));
     void *bar_map = NULL;
     if (bar >= 0) n_shared_map(bar, 1 << 20, N_MEMORY_READ_WRITE, &bar_map);
@@ -1354,13 +1383,13 @@ int main(int argc,char **argv) {
         n_handle_close(wc);
     }
 
-    n_result vectors = n_pci_interrupts(pci, 4);
+    n_result vectors = n_hal_interrupts(pci, 4);
     CHECK(vectors >= 1, "interrupts: %s", n_result_text(vectors));
     uint64_t bits = 0;
-    CHECK(n_pci_interrupt_take(pci, &bits, 1, 0) == -N_ERR_TIMEOUT, "nothing pending yet");
+    CHECK(n_hal_interrupt_take(pci, &bits, 1, 0) == -N_ERR_TIMEOUT, "nothing pending yet");
     if (regs && vectors >= 1) {
         wr32(EDU_IRQ_RAISE, 0x5);
-        n_result got = n_pci_interrupt_take(pci, &bits, 1, n_clock_after(2000 * N_NS_PER_MS));
+        n_result got = n_hal_interrupt_take(pci, &bits, 1, n_clock_after(2000 * N_NS_PER_MS));
         CHECK(got == 1 && bits == 1, "interrupt words %lld, bits %llx", (long long)got, (unsigned long long)bits);
         CHECK(rd32(EDU_IRQ_STATUS) == 0x5, "irq status %x", rd32(EDU_IRQ_STATUS));
         wr32(EDU_IRQ_ACK, 0x5);
@@ -1372,10 +1401,10 @@ int main(int argc,char **argv) {
         if(created==thrd_success){
             while(!atomic_load(&waiter_started))thrd_yield();
             n_sleep_until(n_clock_after(1 * N_NS_PER_MS)); /* let the native take enter its blocking continuation */
-            CHECK(n_pci_interrupts(pci,0)==0,"disable interrupts while take waits");
+            CHECK(n_hal_interrupts(pci,0)==0,"disable interrupts while take waits");
             thrd_join(waiter,NULL);
             CHECK(waiter_result==-N_ERR_NOT_READY,"disabled IRQ wakes infinite take: %s",n_result_text(waiter_result));
-            vectors=n_pci_interrupts(pci,4);
+            vectors=n_hal_interrupts(pci,4);
             CHECK(vectors>=1,"interrupt re-enable");
         }
     }
@@ -1495,8 +1524,8 @@ int main(int argc,char **argv) {
        range reads all-ones, as a function gone from the bus. A driver stops the function's bus
        mastering before it lets go. */
     if (bar >= 0) n_handle_close(bar);
-    cmd = n_pci_config_read(pci, N_PCI_SELF, 4, 2);
-    CHECK(cmd >= 0 && n_pci_config_write(pci, 4, 2, (uint32_t)cmd & ~4u) == 0, "bus mastering off before release");
+    cmd = n_hal_pci_config_read(pci, N_PCI_SELF, 4, 2);
+    CHECK(cmd >= 0 && n_hal_pci_config_write(pci, 4, 2, (uint32_t)cmd & ~4u) == 0, "bus mastering off before release");
     n_handle_close(pci);
     if(mixed_map){
         CHECK(mixed_map[0]==0xFFFFFFFFu && mixed_map[4096/4]==0xFFFFFFFFu,"all composed BAR pages lose their claim");
@@ -1510,24 +1539,24 @@ int main(int argc,char **argv) {
         CHECK(rd32(EDU_IDENT) == 0xFFFFFFFFu, "the BAR mapping is revoked with the claim: %08x", rd32(EDU_IDENT));
         n_memory_release((void *)regs, 1 << 20);
     }
-    n_handle back = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(e->segment, e->bus, e->dev, e->func));
+    n_handle back = claim_function(e);
     CHECK(back >= 0, "claim after release: %s", n_result_text(back));
     if (back >= 0) {
-        CHECK((n_pci_config_read(back, N_PCI_SELF, 4, 2) & 4) == 0, "bus mastering stopped at release");
+        CHECK((n_hal_pci_config_read(back, N_PCI_SELF, 4, 2) & 4) == 0, "bus mastering stopped at release");
         /* A driver that ends with bus mastering on is taken as crashed: the system stops the
            function and keeps the DMA memory it had out of use (the system log says so). */
-        cmd = n_pci_config_read(back, N_PCI_SELF, 4, 2);
-        CHECK(cmd >= 0 && n_pci_config_write(back, 4, 2, (uint32_t)cmd | 6) == 0, "bus mastering on again");
+        cmd = n_hal_pci_config_read(back, N_PCI_SELF, 4, 2);
+        CHECK(cmd >= 0 && n_hal_pci_config_write(back, 4, 2, (uint32_t)cmd | 6) == 0, "bus mastering on again");
         n_handle left = n_dma_create(back, 4096, 0);
         CHECK(left >= 0, "dma memory of the crashed driver: %s", n_result_text(left));
         n_handle_close(back);
         if (left >= 0) n_handle_close(left);
-        back = n_pci_claim(n_cap_find(N_CAP_PCI_CLAIM), N_PCI_TARGET(e->segment, e->bus, e->dev, e->func));
+        back = claim_function(e);
         if (info.flags & N_PCI_ISOLATED) {
-            CHECK(back >= 0 && (n_pci_config_read(back, N_PCI_SELF, 4, 2) & 4) == 0,
+            CHECK(back >= 0 && (n_hal_pci_config_read(back, N_PCI_SELF, 4, 2) & 4) == 0,
                   "an isolated crashed driver's function has bus mastering off");
-            struct n_pci_function recovery;
-            CHECK(back >= 0 && n_pci_info(back, &recovery) == 0 && (recovery.flags & N_PCI_NEEDS_RECOVERY),
+            struct n_hal_pci_info recovery;
+            CHECK(back >= 0 && n_hal_pci_info(back, &recovery) == 0 && (recovery.flags & N_PCI_NEEDS_RECOVERY),
                   "EDU has no generic FLR: native recovery remains explicit");
         } else {
             CHECK(back == -N_ERR_NOT_READY, "a crashed nonisolated function is quarantined: %s", n_result_text(back));

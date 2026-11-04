@@ -20,6 +20,7 @@
 #include "dev/blk.h"
 #include "dev/fb.h"
 #include "dev/hibernate.h"
+#include "hal/hal.h"
 #include "fs/bootrecord.h"
 #include "dev/iommu.h"
 #include "dev/pci.h"
@@ -679,6 +680,7 @@ void hibernate_restore(void) {
     kprintf("hibernate: restoring %lu frames (%lu copied last) after %lu ms\n", hd.saved + hd.zero, r.pairs,
             (clock_now_ns() - t0) / NS_PER_MS);
 
+    hal_power_begin();
     blk_hold();
     if (!smp_suspend()) {
         /* a CPU still running would run on through the copy, and may hold a lock the devices'
@@ -688,7 +690,7 @@ void hibernate_restore(void) {
     }
     smp_hold_in_init(); /* out of every page the copy overwrites */
     cli();
-    if (pm_quiesce_devices(false)) {
+    if (hal_quiesce_all(false)) {
         /* its DMA could write over the restored pages; the image is used up, so the next boot is
            a normal one */
         kprintf("hibernate: a device did not stop, restarting instead of restoring\n");

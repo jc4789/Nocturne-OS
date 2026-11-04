@@ -68,6 +68,8 @@ static inline uint32_t n_hal_rule_score(const struct n_hal_rule *r, const struct
 /* 装置が持つ資源。slot はバスが決める番号で、PCI は BAR の番号、ACPI は _CRS の中の順である。 */
 enum n_hal_resource_kind { N_HAL_MEMORY, N_HAL_PORT, N_HAL_GSI };
 #define N_HAL_PREFETCHABLE 1u /* N_HAL_MEMORY：書込みをまとめてよい */
+#define N_HAL_GSI_LEVEL 2u      /* N_HAL_GSI：level で伝える。無ければ edge */
+#define N_HAL_GSI_ACTIVE_LOW 4u /* N_HAL_GSI：active low */
 struct n_hal_resource {
     uint32_t kind, slot, flags, reserved;
     uint64_t base, size;

@@ -289,46 +289,63 @@ static void screen_make_main(void) {
 }
 
 /* ---- 装置 ---- */
-/* 台帳（n_hal_list）を、親の下に子が続く順に並べたもの。 */
+/* 台帳（n_hal_snapshot）を、親の下に子が続く順に並べたもの。行は台帳の記録を指す。 */
 struct hardware_row {
-    struct n_hal_device d;
+    const struct n_hal_device *d;
     unsigned depth;
+    bool served; /* 子孫に動いている実装がある */
 };
+static struct n_hal_snapshot hardware_ledger;
 static struct hardware_row *hardware;
 static size_t hardware_count;
 
-static void hardware_walk(const struct n_hal_device *list, size_t count, uint32_t parent, unsigned depth) {
-    for (size_t i = 0; i < count; i++) {
-        if (list[i].parent != parent) continue;
-        hardware[hardware_count++] = (struct hardware_row){list[i], depth};
-        hardware_walk(list, count, list[i].id, depth + 1);
+/* 人に言えることの無い節：名も級も提供も無く、失敗もしていない。firmware の記述やバスの内部の節である。行にせず、
+   深さにも数えない。 */
+static bool hardware_silent(const struct n_hal_device *d) {
+    uint64_t code;
+    return !d->name[0] && !d->offer_count && d->state != N_HAL_FAILED && !n_hal_device_number(d, N_PROP_PCI_CLASS, &code);
+}
+
+/* parent の下に動いている実装があれば true。 */
+static bool hardware_walk(uint32_t parent, unsigned depth) {
+    bool served = false;
+    const struct n_hal_device *d = hardware_ledger.first;
+    for (uint32_t i = 0; i < hardware_ledger.count; i++, d = n_hal_device_next(d)) {
+        if (d->parent != parent) continue;
+        bool silent = hardware_silent(d);
+        size_t row = hardware_count;
+        if (!silent) hardware[hardware_count++] = (struct hardware_row){d, depth, false};
+        bool below = hardware_walk(d->id, silent ? depth : depth + 1);
+        if (!silent) hardware[row].served = below;
+        served = served || below || d->state == N_HAL_RUNNING || d->state == N_HAL_ATTACHING;
     }
+    return served;
 }
 
 static void hardware_load(void) {
-    struct n_hal_device *list;
-    n_result count = n_hal_snapshot(&list);
+    struct n_hal_snapshot fresh = {0};
+    n_result count = n_hal_snapshot(&fresh);
     if (count < 0) {
         snprintf(status, sizeof status, "%s", n_result_text(count));
         status_bad = true;
         return;
     }
     free(hardware);
-    hardware = calloc(count ? (size_t)count : 1, sizeof *hardware);
+    free((void *)hardware_ledger.first);
+    hardware_ledger = fresh;
+    hardware = calloc(fresh.count ? fresh.count : 1, sizeof *hardware);
     hardware_count = 0;
-    if (hardware) hardware_walk(list, (size_t)count, 0, 0);
-    free(list);
+    if (!hardware) return;
+    const struct n_hal_device *d = hardware_ledger.first;
+    for (uint32_t i = 0; i < hardware_ledger.count; i++, d = n_hal_device_next(d))
+        if (!d->parent) hardware_walk(d->id, 0); /* 根は見せず、その子から並べる */
 }
 
-/* 自分の名を言わない装置の呼び名。 */
+/* PCI の基本の級（PCI Code and ID Assignment）。台帳が級を性質で持つ装置の呼び名で、持たない装置は「そのほか」。 */
 static const char *hardware_kind(const struct n_hal_device *d) {
-    switch ((enum n_hal_bus)d->bus) {
-    case N_HAL_BUS_USB: return WORD(W_HW_USB);
-    case N_HAL_BUS_VMBUS: return WORD(W_HW_VMBUS);
-    case N_HAL_BUS_PORT: return WORD(W_HW_STORAGE);
-    case N_HAL_BUS_PCI: break;
-    }
-    switch (d->at.pci.cls) { /* PCI Code and ID Assignment の基本の級 */
+    uint64_t code;
+    if (!n_hal_device_number(d, N_PROP_PCI_CLASS, &code)) return WORD(W_HW_OTHER);
+    switch (code >> 16) {
     case 0x01: return WORD(W_HW_STORAGE);
     case 0x02: return WORD(W_HW_NETWORK);
     case 0x03: return WORD(W_HW_DISPLAY);
@@ -339,28 +356,40 @@ static const char *hardware_kind(const struct n_hal_device *d) {
     }
 }
 
-static void hardware_where(const struct n_hal_device *d, char *out, size_t cap) {
-    switch ((enum n_hal_bus)d->bus) {
-    case N_HAL_BUS_PCI:
-        snprintf(out, cap, "PCI %04x:%02x:%02x.%x  %04x:%04x", d->at.pci.segment, d->at.pci.bus, d->at.pci.dev, d->at.pci.func, d->at.pci.vendor,
-                 d->at.pci.device);
-        break;
-    case N_HAL_BUS_USB: snprintf(out, cap, "USB %04x:%04x", d->at.usb.vendor, d->at.usb.product); break;
-    case N_HAL_BUS_VMBUS: snprintf(out, cap, "VMBus"); break;
-    case N_HAL_BUS_PORT: snprintf(out, cap, "I/O %x", d->at.port.base); break;
-    }
+/* 橋は動かすものが無くて当たり前なので、何も言わない。 */
+static bool hardware_is_bridge(const struct n_hal_device *d) {
+    uint64_t code;
+    return n_hal_device_number(d, N_PROP_PCI_CLASS, &code) && (code >> 16) == 0x06;
 }
 
-/* 橋は動かすものが無くて当たり前なので、何も言わない。 */
-static void hardware_state(const struct n_hal_device *d, char *out, size_t cap) {
+static void hardware_state(const struct hardware_row *row, char *out, size_t cap) {
+    const struct n_hal_device *d = row->d;
     out[0] = 0;
     switch ((enum n_hal_state)d->state) {
     case N_HAL_UNBOUND:
-        if (d->bus != N_HAL_BUS_PCI || d->at.pci.cls != 0x06) snprintf(out, cap, "%s", WORD(W_HW_UNBOUND));
+        if (!hardware_is_bridge(d) && !d->offer_count && !row->served) snprintf(out, cap, "%s", WORD(W_HW_UNBOUND));
         break;
+    case N_HAL_ATTACHING: snprintf(out, cap, WORD(W_HW_ATTACHING), d->driver); break;
     case N_HAL_RUNNING: snprintf(out, cap, WORD(W_HW_RUNNING), d->driver); break;
     case N_HAL_FAILED: snprintf(out, cap, WORD(W_HW_FAILED), d->driver, n_result_text(d->reason)); break;
     }
+}
+
+/* 行の見出し：装置が言う名、級の呼び名、提供の名の順。級を持たない装置は、提供の名の方が人に分かる。 */
+static const char *hardware_title(const struct n_hal_device *d) {
+    uint64_t code;
+    if (d->name[0]) return d->name;
+    if (!n_hal_device_number(d, N_PROP_PCI_CLASS, &code) && d->offer_count) return n_hal_device_offers(d)[0].label;
+    return hardware_kind(d);
+}
+
+/* 実装が提供するものの名を並べる（ディスク、網、音の出口、画面）。 */
+static void hardware_offers(const struct n_hal_device *d, char *out, size_t cap) {
+    out[0] = 0;
+    const struct n_hal_offer *offers = n_hal_device_offers(d);
+    size_t used = 0;
+    for (uint32_t i = 0; i < d->offer_count && used + 1 < cap; i++)
+        used += (size_t)snprintf(out + used, cap - used, i ? "、%s" : "%s", offers[i].label);
 }
 
 /* ---- サービス ---- */
@@ -1136,16 +1165,17 @@ static void link_card(struct ui_msg *m, uint32_t index) {
 
 static void hardware_page(struct ui_msg *m) {
     for (size_t i = 0; i < hardware_count; i++) {
-        const struct n_hal_device *d = &hardware[i].d;
-        char where[48], state[128], key[16];
-        hardware_where(d, where, sizeof where);
-        hardware_state(d, state, sizeof state);
+        const struct n_hal_device *d = hardware[i].d;
+        char state[128], offers[160], key[16];
+        hardware_state(&hardware[i], state, sizeof state);
+        hardware_offers(d, offers, sizeof offers);
         snprintf(key, sizeof key, "%u", d->id);
         ui_node(m, "column"); ui_nums(m, "padding", (double[]){0, 0, 0, 24.0 * hardware[i].depth}, 4); ui_str(m, "key", key);
             ui_node(m, "card"); ui_num(m, "gap", 4);
-                text_node(m, d->name[0] ? d->name : hardware_kind(d), "heading", 0);
-                text_node(m, where, "caption", 0);
+                text_node(m, hardware_title(d), "heading", 0);
+                if (d->location[0]) text_node(m, d->location, "caption", 0);
                 if (state[0]) text_node(m, state, "caption", d->state == N_HAL_FAILED ? ui_theme.warning : 0);
+                if (offers[0] && strcmp(offers, hardware_title(d))) text_node(m, offers, "caption", 0);
             ui_end(m);
         ui_end(m);
     }

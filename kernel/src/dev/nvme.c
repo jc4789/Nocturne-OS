@@ -1,19 +1,23 @@
-/* NVM Express SSDs (NVM Express Base Specification 2.x, PCIe transport).
+/* NVM Express SSDs (NVM Express Base Specification 2.x, PCIe transport): the driver of every PCI
+   function of class 01h, subclass 08h, programming interface 02h.
 
    Queues: one admin queue pair, and I/O queue pairs as many as the controller gives up to one a
    CPU. Each CPU submits to its queue (the CPUs split over the queues in their order, which keeps
    the CPUs of a cache and a node together), and each queue's completion queue interrupts on a
    CPU it serves, through a message of its own where the function has as many (MSI-X), else
-   sharing the messages it has. A queue holds as many commands at once as its entries but one;
-   every command waits in a slot of its own, woken by the interrupt that completes it.
+   sharing the messages it has, else its INTx line. A queue holds as many commands at once as its
+   entries but one.
 
-   Data moves between the device and the caller's memory itself, described page by page in PRPs
-   (the kernel's own functions pass the IOMMU untranslated, dev/iommu.h, so a bus address is the
-   physical one): a bounce buffer only for blocks a request covers in part, or memory that is not
-   dword aligned. Every active namespace with plain blocks of any size a command can move (no
-   metadata, no protection information) becomes a block device "nvmeC.N". Completions are polled when
-   the platform offers no message interrupt, and until the controller has said how many queues it
-   gives. */
+   A request chain (dev/blk.h) is put into the calling CPU's queue whole, one command after the
+   other, and the doorbell is rung once. The device moves the data between itself and the caller's
+   memory, described by the request's segments in PRPs, or in SGL descriptors where the controller
+   has them (Base 4.1, 4.3); the completion interrupt ends each request there. A command that fails
+   where trying again may help, and each one a reset ended, goes to the controller's thread, which
+   gives it again (at most three times), resets a controller that has stopped answering, polls the
+   completion queues where there is no interrupt, and watches every command's time.
+
+   Every active namespace with plain blocks of any size a command can move (no metadata, no
+   protection information) becomes a block device "nvmeC.N". */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/irq.h"
@@ -22,20 +26,21 @@
 #include "arch/topology.h"
 #include "dev/blk.h"
 #include "dev/pci.h"
-#include "dev/pm.h"
-#include "dev/pci_drivers.h"
+#include "hal/hal.h"
 #include "mm/heap.h"
-#include "mm/pmm.h"
-#include "mm/vmm.h"
 #include "sys/clock.h"
 #include "sys/thread.h"
 #include "sys/wait.h"
 
 #define ADMIN_ENTRIES 32
-#define IO_ENTRIES 64             /* an I/O queue's entries: its submission queue fills one page */
-#define PRPS_PER_PAGE 512         /* one PRP list page: a command of up to 2 MiB */
+#define IO_ENTRIES 64            /* an I/O queue's entries: its submission queue fills one page */
+#define MOST_BYTES (256u * 1024) /* one command: 65 pages with the offset in the first, a list of 64 entries */
+#define LIST_BYTES 512           /* a command's PRP list (64 entries) or SGL segment (32 descriptors) */
+#define SGL_SEGMENTS (LIST_BYTES / 16)
+#define TRIES 3 /* a command is given at most this many times */
 #define ADMIN_NS (5 * NS_PER_S)
 #define IO_NS (30 * NS_PER_S)
+#define TICK_NS (250 * NS_PER_MS)
 #define SHUTDOWN_MOST_NS (60 * NS_PER_S) /* our limit for a shutdown under way: 3.6.1 gives none */
 
 /* controller registers */
@@ -88,16 +93,23 @@
 #define OP_READ 0x02
 #define FEATURE_QUEUES 0x07
 #define FEATURE_COMMAND_SETS 0x19
+#define PSDT_SGL (1u << 14) /* CDW0 bits 15:14 = 01b: the data pointer is an SGL (Figure 92) */
+#define SGL_DATA_BLOCK 0x00u
+#define SGL_LAST_SEGMENT 0x30u
 
 #define FAILED (-1) /* timeout or a dead controller; command errors return the status field */
 
-/* A command's place in its queue: its command identifier is the slot's index. */
+/* A command's place in its queue: its command identifier is the slot's index. An admin command's
+   submitter waits in wq for seq to move on; an I/O command's request is ended where its
+   completion is read. */
 struct slot {
-    struct wait_queue wq; /* its submitter, woken when seq moves on */
-    uint64_t seq;         /* moves on when its command completes, or a reset fails it */
-    int status;           /* 0, the 15-bit status field, or FAILED: written before seq moves on */
-    uint32_t result;      /* the completion's DW0 */
-    bool busy;            /* submitted and not completed: a reset fails it */
+    struct wait_queue wq;
+    uint64_t seq;                /* moves on when its command completes, or a reset fails it */
+    int status;                  /* 0, the 15-bit status field, or FAILED: written before seq moves on */
+    uint32_t result;             /* the completion's DW0 */
+    bool busy;                   /* submitted and not completed: a reset fails it */
+    struct blk_request *request; /* an I/O command's, else NULL */
+    uint64_t deadline;           /* an I/O command's, on the clock */
 };
 
 struct nvme;
@@ -106,21 +118,22 @@ struct queue {
     struct nvme *c;
     uint16_t qid, size, depth; /* depth: the slots, size - 1 (so the submission queue never fills) */
     uint8_t *sq;
-    uint64_t sq_phys;
+    uint64_t sq_bus;
     volatile uint32_t *cq;
-    uint64_t cq_phys;
-    /* The submission side: the tail, the free slots, taking a slot. */
+    uint64_t cq_bus;
+    uint8_t *lists; /* an I/O queue's: LIST_BYTES a slot, for the PRPs or the SGL segment of its command */
+    uint64_t lists_bus;
+    /* The submission side: the tail and the slots taken. */
     struct spinlock sq_lock;
     uint16_t tail;
-    uint64_t *free;          /* a bit a free slot */
-    uint64_t freed;          /* moves on as a slot is given back (room's word) */
-    struct wait_queue room;  /* submitters waiting for a free slot */
+    uint64_t *free;         /* a bit a free slot (atomic: a completion gives one back) */
+    uint64_t freed;         /* moves on as a slot is given back (room's word) */
+    struct wait_queue room; /* submitters waiting for a free slot */
     /* The completion side, taken in the interrupt handler too: the head and phase. */
     struct spinlock cq_lock;
     uint16_t head;
     uint8_t phase;
     struct slot *slots;
-    unsigned node; /* of the CPUs it serves: where its memory comes from */
 };
 
 /* A message's handler context: it reaps the queues whose completion queues it is the vector of. */
@@ -130,30 +143,32 @@ struct vector {
 };
 
 struct nvme {
-    struct nvme *next;
     int index;
+    struct hal_device *hal;
     struct pci_device *pci;
     volatile uint8_t *regs;
     uint64_t cap;
-    unsigned stride, max_xfer; /* max_xfer: bytes a command moves at most */
-    uint64_t ready_ns;         /* CC.EN to CSTS.RDY at most (CAP.TO, CRTO) */
-    uint32_t rtd3e;            /* Identify Controller: the shutdown's microseconds, 0 not reported */
-    uint32_t namespaces;       /* Identify Controller: NN */
+    unsigned stride;
+    unsigned max_xfer; /* bytes a command moves at most: MDTS and MOST_BYTES, as the first enable found */
+    bool sgl;          /* Identify Controller SGLS: SGLs describe the data (as the first enable found) */
+    uint64_t ready_ns; /* CC.EN to CSTS.RDY at most (CAP.TO, CRTO) */
+    uint32_t rtd3e;    /* Identify Controller: the shutdown's microseconds, 0 not reported */
+    uint32_t namespaces; /* Identify Controller: NN */
     char model[41];
     /* Which device this is (4.7.1.2): its VID, SSVID, SN and MN, and its NQN, of Identify Controller. */
     uint8_t identity[64];
     uint8_t nqn[256];
-    bool stranger;             /* cut for being another device, which still answers */
-    uint16_t mqes;             /* the largest queue's entries, 0-based (CAP.MQES) */
+    bool stranger;     /* cut for being another device, which still answers */
+    uint16_t mqes;     /* the largest queue's entries, 0-based (CAP.MQES) */
     struct queue admin;
-    struct queue *io;          /* I/O queue i is queue ID i + 1 */
-    unsigned nio;              /* of them with memory, as the first enable made them */
-    unsigned nvectors;         /* its messages; 0: polled */
+    struct queue *io;  /* I/O queue i is queue ID i + 1 */
+    unsigned nio;      /* of them with memory, as the first enable made them */
+    unsigned nvectors; /* its messages (or its one INTx line); 0: polled */
     struct irq **irqs;
     struct vector *vectors;
-    struct ns *found;          /* its usable namespaces, as the first enable found them */
-    bool discovered;           /* found is made */
-    bool in_use;               /* they are block devices: what they were given is to be kept */
+    struct ns *found;  /* its usable namespaces, as the first enable found them */
+    bool discovered;   /* found is made */
+    bool in_use;       /* they are block devices: what they were given is to be kept */
     /* live: the admin queue takes commands; ready: the I/O queues too, looked at under a queue's
        submission lock. A timeout or a fatal status clears them until the reset that follows
        (recover). generation: moves on at each enable, so that of the callers whose commands failed
@@ -173,7 +188,15 @@ struct nvme {
     bool cut;
     struct mutex reset_lock; /* enable: at start, after a sleep, after a timeout */
     uint8_t *ident;          /* a page for identify, at start */
-    uint64_t ident_phys;
+    uint64_t ident_bus;
+    /* The commands to give again (a failed try, a stop that ended them, a chain the queue could not
+       take): the thread takes them. work moves on when there is something for it to look at. */
+    struct spinlock retry_lock;
+    struct blk_request *retry, **retry_tail;
+    uint64_t work;
+    struct wait_queue work_wq;
+    unsigned inflight; /* I/O commands given and not ended (atomic) */
+    bool stopping;     /* detach: the thread ends (atomic) */
 };
 
 struct ns {
@@ -184,12 +207,11 @@ struct ns {
     unsigned block;
 };
 
-static struct nvme *ctrls;
-static int nctrls;
+static int nctrls; /* atomic: the controllers' numbers */
 
-static int blk_nvme_read(struct blkdev *b, uint64_t lba, uint32_t n, void *buf);
-static int blk_nvme_write(struct blkdev *b, uint64_t lba, uint32_t n, const void *buf);
-static int blk_nvme_persist(struct blkdev *b);
+static void nvme_submit(struct blkdev *d, struct blk_request *chain);
+static const struct blk_ops nvme_ops = {.submit = nvme_submit};
+static void health_check(struct nvme *c);
 
 static uint32_t rd32(struct nvme *c, unsigned off) { return mmio_read32(c->regs + off); }
 static void wr32(struct nvme *c, unsigned off, uint32_t v) { mmio_write32(c->regs + off, v); }
@@ -202,13 +224,59 @@ static void doorbell(struct nvme *c, uint16_t qid, bool cq, uint16_t v) {
     wr32(c, 0x1000 + (2u * qid + (cq ? 1 : 0)) * c->stride, v);
 }
 
+static struct ns *ns_of(const struct blk_request *r) { return r->device->priv; }
+
+static void work_wake(struct nvme *c) {
+    __atomic_add_fetch(&c->work, 1, __ATOMIC_SEQ_CST);
+    wq_wake_all(&c->work_wq);
+}
+
+/* ---- the commands to give again ---- */
+/* The chain's commands go to the thread, which gives them again, or ends them. Any context. */
+static void retry_push(struct nvme *c, struct blk_request *chain) {
+    struct blk_request **tail = &chain;
+    while (*tail) tail = &(*tail)->next;
+    uint64_t f = spin_lock(&c->retry_lock);
+    *c->retry_tail = chain;
+    c->retry_tail = tail;
+    spin_unlock(&c->retry_lock, f);
+    work_wake(c);
+}
+
 /* ---- queues ---- */
 static bool queue_up(const struct queue *q) {
     return __atomic_load_n(q == &q->c->admin ? &q->c->live : &q->c->ready, __ATOMIC_ACQUIRE);
 }
 
-/* cq_lock held: every new completion entry ends its slot's wait. */
-static void reap(struct queue *q) {
+/* A slot given back, free to be taken again at once. Any context. */
+static void slot_give(struct queue *q, unsigned id) {
+    __atomic_fetch_or(&q->free[id / 64], 1ull << (id % 64), __ATOMIC_RELEASE);
+    __atomic_add_fetch(&q->freed, 1, __ATOMIC_RELEASE);
+    wq_wake_all(&q->room);
+}
+
+/* sq_lock held: a free slot taken, -1 when none. */
+static int slot_take(struct queue *q) {
+    for (unsigned w = 0; w < (q->depth + 63u) / 64; w++) {
+        uint64_t bits = __atomic_load_n(&q->free[w], __ATOMIC_ACQUIRE);
+        if (!bits) continue;
+        uint64_t bit = bits & -bits;
+        __atomic_fetch_and(&q->free[w], ~bit, __ATOMIC_ACQ_REL);
+        return (int)(w * 64 + (unsigned)__builtin_ctzll(bit));
+    }
+    return -1;
+}
+
+/* A failed command that no other try can mend: DNR (Do Not Retry) or a media and data integrity error. */
+static bool retriable(unsigned status) { return !(status >> 14 & 1) && (status >> 8 & 7) != 2; }
+
+static const char *op_name(enum blk_op op) { return op == BLK_WRITE ? "write" : op == BLK_READ ? "read" : "flush"; }
+
+/* cq_lock held: every new completion entry ends its slot's wait, or an I/O request: one that did
+   its work, or has had its tries, goes on *done; one that failed where it may be given again goes
+   to the controller's thread. True when an entry was there. */
+static bool reap(struct queue *q, struct blk_request **done) {
+    struct nvme *c = q->c;
     bool moved = false;
     for (;;) {
         volatile uint32_t *e = q->cq + q->head * 4u;
@@ -224,36 +292,87 @@ static void reap(struct queue *q) {
         moved = true;
         if (id >= q->depth || !q->slots[id].busy) continue; /* an answer to a command a reset failed */
         struct slot *s = &q->slots[id];
-        s->status = (int)(dw3 >> 17 & 0x7FFF);
-        s->result = dw0;
+        unsigned status = dw3 >> 17 & 0x7FFF;
         s->busy = false;
-        __atomic_add_fetch(&s->seq, 1, __ATOMIC_RELEASE);
-        wq_wake_all(&s->wq);
+        struct blk_request *r = s->request;
+        if (!r) {
+            s->status = (int)status;
+            s->result = dw0;
+            __atomic_add_fetch(&s->seq, 1, __ATOMIC_RELEASE);
+            wq_wake_all(&s->wq);
+            continue;
+        }
+        s->request = NULL;
+        if (r->op == BLK_WRITE) blk_write_ended(&ns_of(r)->blk);
+        __atomic_sub_fetch(&c->inflight, 1, __ATOMIC_RELEASE);
+        slot_give(q, id);
+        if (!status) {
+            r->result = 0;
+            r->next = *done;
+            *done = r;
+            continue;
+        }
+        bool again = retriable(status) && r->tries < TRIES;
+        kprintf("nvme%d: %s of block %lu failed (type %u code %02x)%s\n", c->index, op_name(r->op), r->lba,
+                status >> 8 & 7, status & 0xFF, again ? ", again" : "");
+        if (again) {
+            r->next = NULL;
+            retry_push(c, r);
+        } else {
+            r->result = -N_ERR_IO;
+            r->next = *done;
+            *done = r;
+        }
     }
     if (moved && queue_up(q)) doorbell(q->c, q->qid, true, q->head); /* else the stop's queue_clear empties it */
+    return moved;
+}
+
+/* The requests reap gathered, ended with the lock given back. */
+static void done_run(struct blk_request *done) {
+    while (done) {
+        struct blk_request *next = done->next;
+        done->next = NULL;
+        blk_complete(done, done->result);
+        done = next;
+    }
+}
+
+static void poll_queue(struct queue *q) {
+    struct blk_request *done = NULL;
+    uint64_t f = spin_lock(&q->cq_lock);
+    if (queue_up(q)) reap(q, &done);
+    spin_unlock(&q->cq_lock, f);
+    done_run(done);
 }
 
 static enum irq_result nvme_isr(void *context) {
     struct vector *v = context;
     struct nvme *c = v->c;
+    struct blk_request *done = NULL;
+    bool moved = false;
     if (!v->index) {
         spin_take(&c->admin.cq_lock);
-        reap(&c->admin);
+        moved |= reap(&c->admin, &done);
         spin_give(&c->admin.cq_lock);
     }
     unsigned nio = __atomic_load_n(&c->nio, __ATOMIC_ACQUIRE), step = MAX(c->nvectors, 1u);
     for (unsigned i = v->index; i < nio; i += step) {
         spin_take(&c->io[i].cq_lock);
-        reap(&c->io[i]);
+        moved |= reap(&c->io[i], &done);
         spin_give(&c->io[i].cq_lock);
     }
-    return IRQ_HANDLED;
+    done_run(done);
+    return moved ? IRQ_HANDLED : IRQ_NONE;
 }
 
 /* The controller off (controller_stop), or a new queue: the queue empty again, every command in it
-   failed, each one's slot given back by its waiter. The submission lock first: a submitter is either
-   through it (its slot busy, failed here) or finds the controller down. */
+   over. A caller waiting on one has it failed, each one's slot given back by its waiter; an I/O
+   request is to be given again. The submission lock first: a submitter is either through it (its
+   slot busy, failed here) or finds the controller down. */
 static void queue_clear(struct queue *q) {
+    struct nvme *c = q->c;
+    struct blk_request *again = NULL, **tail = &again;
     uint64_t f = spin_lock(&q->sq_lock);
     spin_take(&q->cq_lock);
     memset(q->sq, 0, PAGE_SIZE);
@@ -263,13 +382,28 @@ static void queue_clear(struct queue *q) {
     for (unsigned i = 0; i < q->depth; i++) {
         struct slot *s = &q->slots[i];
         if (!s->busy) continue;
-        s->status = FAILED;
         s->busy = false;
+        if (s->request) {
+            struct blk_request *r = s->request;
+            s->request = NULL;
+            if (r->op == BLK_WRITE) blk_write_ended(&ns_of(r)->blk); /* nothing of it moves any more */
+            __atomic_sub_fetch(&c->inflight, 1, __ATOMIC_RELEASE);
+            *tail = r;
+            tail = &r->next;
+            continue;
+        }
+        s->status = FAILED;
         __atomic_add_fetch(&s->seq, 1, __ATOMIC_RELEASE);
         wq_wake_all(&s->wq);
     }
+    for (unsigned w = 0; w < (q->depth + 63u) / 64; w++) q->free[w] = ~0ull;
+    if (q->depth % 64) q->free[q->depth / 64] = (1ull << (q->depth % 64)) - 1;
     spin_give(&q->cq_lock);
     spin_unlock(&q->sq_lock, f);
+    *tail = NULL;
+    if (again) retry_push(c, again);
+    __atomic_add_fetch(&q->freed, 1, __ATOMIC_RELEASE);
+    wq_wake_all(&q->room);
 }
 
 /* Whoever was in the queue's locks has gone. */
@@ -278,41 +412,22 @@ static void queue_pass(struct queue *q) {
     spin_unlock(&q->cq_lock, spin_lock(&q->cq_lock));
 }
 
-/* Memory for a queue of `entries`, from node: false without it. Once; enable clears it each time. */
-static bool queue_alloc(struct queue *q, struct nvme *c, uint16_t qid, uint16_t entries, unsigned node) {
+/* Memory for a queue of `entries`, once; enable clears it each time. An I/O queue has the lists its
+   commands' data pointers are built in. False without memory. */
+static bool queue_alloc(struct queue *q, struct nvme *c, uint16_t qid, uint16_t entries, bool lists) {
     q->c = c;
     q->qid = qid;
     q->size = entries;
     q->depth = (uint16_t)(entries - 1);
-    q->node = node;
-    if (!(q->sq_phys = pmm_alloc_node(node)) || !(q->cq_phys = pmm_alloc_node(node))) return false;
-    q->sq = phys_to_virt(q->sq_phys);
-    q->cq = phys_to_virt(q->cq_phys);
+    if (!(q->sq = hal_dma_alloc(c->hal, PAGE_SIZE, 0, &q->sq_bus)) ||
+        !(q->cq = hal_dma_alloc(c->hal, PAGE_SIZE, 0, &q->cq_bus)))
+        return false;
+    if (lists && !(q->lists = hal_dma_alloc(c->hal, (size_t)q->depth * LIST_BYTES, 0, &q->lists_bus))) return false;
     q->slots = kzalloc(q->depth * sizeof *q->slots);
     q->free = kzalloc((q->depth + 63) / 64 * sizeof *q->free);
     if (!q->slots || !q->free) return false;
-    for (unsigned i = 0; i < q->depth; i++) q->free[i / 64] |= 1ull << (i % 64);
     queue_clear(q);
     return true;
-}
-
-/* sq_lock held: a free slot taken, -1 when none. */
-static int slot_take(struct queue *q) {
-    for (unsigned w = 0; w < (q->depth + 63u) / 64; w++)
-        if (q->free[w]) {
-            unsigned id = w * 64 + (unsigned)__builtin_ctzll(q->free[w]);
-            q->free[w] &= q->free[w] - 1;
-            return (int)id;
-        }
-    return -1;
-}
-
-static void slot_give(struct queue *q, unsigned id) {
-    uint64_t f = spin_lock(&q->sq_lock);
-    q->free[id / 64] |= 1ull << (id % 64);
-    __atomic_add_fetch(&q->freed, 1, __ATOMIC_RELEASE);
-    spin_unlock(&q->sq_lock, f);
-    wq_wake_all(&q->room);
 }
 
 /* The controller can take no command until the next reset (recover): a command timed out, or the
@@ -342,21 +457,22 @@ static bool controller_idle(struct nvme *c) {
 }
 
 /* The controller stopped by a Controller Reset (CC.EN to 0 and CSTS.RDY following, 3.7.2): nothing
-   it held moves any more, so every command in it fails and its caller may take the memory back.
-   A shutdown it may have notified ends with this write: SHN is written back as 00b, or the
-   same write would begin another (Figure 41). EN does not fall while RDY reads 0, which is undefined
-   (Figure 41): RDY is given its time to rise, whatever else the status says. A controller where this
-   cannot be done, or does not end, or stays fatal, gets the other Controller Level Reset, the
-   Function Level Reset (3.7.2). The reset of a healthy controller loses nothing of what it completed
-   (Figure 41, EN); nothing says that of a fatal status, of one gone from the bus, of a Function
-   Level Reset or of EN found 0 while it was in use, a reset no one here asked for (3.7.2), and its
-   cache may be gone. One that still does not stop has its bus mastering turned
-   off, and stays out of use with its namespaces. If the reset was only called off, its thread being
-   killed (dev/pci.h), the next request goes on with it. A Function Level Reset left unfinished is not
-   to be reached by anything but its next call, and has its bus mastering off already (dev/pci.h, 6.6.2):
-   neither the registers nor the configuration are touched before that; nor does anyone that read the
-   queue up go on past its locks (run, reap). `seen`: c->stops as the caller
-   read it; a stop that ended since has done this for it. What the last stop came to is returned. */
+   it held moves any more, so every command in it is over and its memory may be taken back; the I/O
+   requests among them go to be given again. A shutdown it may have notified ends with this
+   write: SHN is written back as 00b, or the same write would begin another (Figure 41). EN does not
+   fall while RDY reads 0, which is undefined (Figure 41): RDY is given its time to rise, whatever
+   else the status says. A controller where this cannot be done, or does not end, or stays fatal,
+   gets the other Controller Level Reset, the Function Level Reset (3.7.2). The reset of a healthy
+   controller loses nothing of what it completed (Figure 41, EN); nothing says that of a fatal
+   status, of one gone from the bus, of a Function Level Reset or of EN found 0 while it was in use,
+   a reset no one here asked for (3.7.2), and its cache may be gone. One that still does not stop
+   has its bus mastering turned off, and stays out of use with its namespaces. If the reset was only
+   called off, its thread being killed (dev/pci.h), the next request goes on with it. A Function
+   Level Reset left unfinished is not to be reached by anything but its next call, and has its bus
+   mastering off already (dev/pci.h, 6.6.2): neither the registers nor the configuration are
+   touched before that; nor does anyone that read the queue up go on past its locks (run, reap).
+   `seen`: c->stops as the caller read it; a stop that ended since has done this for it. What the
+   last stop came to is returned. */
 static bool controller_stop(struct nvme *c, uint64_t seen) {
     mutex_lock(&c->stop_lock);
     if (__atomic_load_n(&c->stops, __ATOMIC_ACQUIRE) == seen) {
@@ -392,7 +508,7 @@ static bool controller_stop(struct nvme *c, uint64_t seen) {
                 kprintf("nvme%d: its reset was called off with its thread\n", c->index);
             } else {
                 kprintf("nvme%d: controller did not reset, turned off\n", c->index);
-                hal_failed(&c->pci->hal, nvme_driver.name, -N_ERR_IO);
+                hal_failed(c->hal, -N_ERR_IO);
                 __atomic_store_n(&c->cut, true, __ATOMIC_RELEASE);
                 for (struct ns *s = c->found; s; s = s->next) __atomic_store_n(&s->blk.gone, true, __ATOMIC_RELEASE);
             }
@@ -409,29 +525,28 @@ static bool controller_stop(struct nvme *c, uint64_t seen) {
     return stopped;
 }
 
-/* Enters a command on q in the free slot `id` (sq_lock held): the entry, then its doorbell. */
-static void submit(struct queue *q, int id, uint32_t cmd[16]) {
+/* Enters a command on q in the free slot `id` (sq_lock held): the entry only, the doorbell is the
+   caller's. */
+static void enter(struct queue *q, int id, uint32_t cmd[16]) {
     q->slots[id].busy = true;
-    cmd[0] = (cmd[0] & 0xFFFF) | (uint32_t)id << 16; /* PRPs, not fused */
+    cmd[0] = (cmd[0] & 0xFFFF) | (uint32_t)id << 16; /* the command identifier; PSDT stays, not fused */
     memcpy(q->sq + q->tail * 64u, cmd, 64);
     q->tail = (uint16_t)((q->tail + 1) % q->size);
-    __atomic_thread_fence(__ATOMIC_RELEASE); /* the entry before the doorbell */
-    doorbell(q->c, q->qid, false, q->tail);
 }
 
-/* Submit a command on q and wait for its completion. Returns 0, the 15-bit status field of a failed
-   command, or FAILED when the controller stopped answering. Then it has been stopped, and nothing
-   of the command moves any more: the caller may take its memory back. It is down until a reset.
-   Waiting for a free slot takes no time from the command: every command in the queue ends, or
-   stops the controller, within its own time. `writing`: the device whose write this is. */
-static int run(struct queue *q, uint32_t cmd[16], uint64_t timeout_ns, uint32_t *result, struct blkdev *writing) {
-    struct nvme *c = q->c;
+/* ---- admin commands ---- */
+/* Submit a command on the admin queue and wait for its completion. Returns 0, the 15-bit status
+   field of a failed command, or FAILED when the controller stopped answering. Then it has been
+   stopped, and nothing of the command moves any more: the caller may take its memory back. It is
+   down until a reset. Waiting for a free slot takes no time from the command: every command in the
+   queue ends, or stops the controller, within its own time. */
+static int run(struct nvme *c, uint32_t cmd[16], uint64_t timeout_ns, uint32_t *result) {
+    struct queue *q = &c->admin;
     int id;
     uint64_t f;
     for (;;) {
         f = spin_lock(&q->sq_lock);
-        bool up = __atomic_load_n(q == &c->admin ? &c->live : &c->ready, __ATOMIC_ACQUIRE);
-        if (!up) {
+        if (!__atomic_load_n(&c->live, __ATOMIC_ACQUIRE)) {
             spin_unlock(&q->sq_lock, f);
             return FAILED;
         }
@@ -444,8 +559,9 @@ static int run(struct queue *q, uint32_t cmd[16], uint64_t timeout_ns, uint32_t 
     struct slot *s = &q->slots[id];
     uint64_t start = __atomic_load_n(&s->seq, __ATOMIC_ACQUIRE);
     uint64_t stops = __atomic_load_n(&c->stops, __ATOMIC_ACQUIRE);
-    if (writing) blk_write_given(writing);
-    submit(q, id, cmd);
+    enter(q, id, cmd);
+    __atomic_thread_fence(__ATOMIC_RELEASE); /* the entry before the doorbell */
+    doorbell(c, q->qid, false, q->tail);
     spin_unlock(&q->sq_lock, f);
 
     int status = FAILED;
@@ -460,9 +576,10 @@ static int run(struct queue *q, uint32_t cmd[16], uint64_t timeout_ns, uint32_t 
         /* Down: a stop is under way, which ends this command, and the function may be in its Function
            Level Reset, which nothing else is to reach (PCIe 6.6.2). Up: read under the lock the stop
            passes through before that reset, by a command that has not ended within its first wait. */
+        struct blk_request *none = NULL;
         f = spin_lock(&q->cq_lock);
         bool up = queue_up(q);
-        if (up && !c->nvectors) reap(q);
+        if (up && !c->nvectors) reap(q, &none);
         uint32_t csts = up && waited ? rd32(c, CSTS) : 0;
         spin_unlock(&q->cq_lock, f);
         if (!up) {
@@ -482,7 +599,9 @@ static int run(struct queue *q, uint32_t cmd[16], uint64_t timeout_ns, uint32_t 
         wq_wait_unless(&s->wq, &s->seq, seen, c->nvectors && waited ? deadline : MIN(deadline, clock_after(NS_PER_MS)));
         waited = true;
     }
-    if (writing) blk_write_ended(writing);
+    f = spin_lock(&q->cq_lock);
+    s->busy = false;
+    spin_unlock(&q->cq_lock, f);
     slot_give(q, (unsigned)id);
     return status;
 }
@@ -499,12 +618,15 @@ static int run_polled(struct nvme *c, uint32_t cmd[16], uint64_t timeout_ns) {
     }
     struct slot *s = &q->slots[id];
     uint64_t start = __atomic_load_n(&s->seq, __ATOMIC_ACQUIRE);
-    submit(q, id, cmd);
+    enter(q, id, cmd);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    doorbell(c, q->qid, false, q->tail);
     spin_unlock(&q->sq_lock, f);
     int status = FAILED;
     for (uint64_t deadline = clock_after(timeout_ns); clock_now_ns() < deadline; pause()) {
+        struct blk_request *none = NULL;
         f = spin_lock(&q->cq_lock);
-        reap(q);
+        reap(q, &none);
         spin_unlock(&q->cq_lock, f);
         if (__atomic_load_n(&s->seq, __ATOMIC_ACQUIRE) != start) {
             status = s->status;
@@ -525,10 +647,8 @@ static bool io_alloc(struct nvme *c, unsigned want) {
     struct queue *io = kzalloc(want * sizeof *io);
     if (!io) return false;
     uint16_t entries = (uint16_t)MIN((unsigned)IO_ENTRIES, c->mqes + 1u);
-    for (unsigned i = 0; i < want; i++) {
-        unsigned first = (unsigned)(((uint64_t)i * topology.cpus + want - 1) / want); /* its first CPU */
-        if (!queue_alloc(&io[i], c, (uint16_t)(i + 1), entries, topology.cpu[first].node)) return false;
-    }
+    for (unsigned i = 0; i < want; i++)
+        if (!queue_alloc(&io[i], c, (uint16_t)(i + 1), entries, true)) return false;
     c->io = io;
     __atomic_store_n(&c->nio, want, __ATOMIC_RELEASE);
     return true;
@@ -537,10 +657,19 @@ static bool io_alloc(struct nvme *c, unsigned want) {
 static int identify(struct nvme *c, uint32_t cns, uint32_t nsid) {
     uint32_t cmd[16] = {OP_IDENTIFY};
     cmd[1] = nsid;
-    *(uint64_t *)&cmd[6] = c->ident_phys;
+    *(uint64_t *)&cmd[6] = c->ident_bus;
     cmd[10] = cns;
     memset(c->ident, 0, PAGE_SIZE);
-    return run(&c->admin, cmd, ADMIN_NS, NULL, NULL);
+    return run(c, cmd, ADMIN_NS, NULL);
+}
+
+/* A controller that is not what it was, or takes less: cut, and nothing is written to it. */
+static void cut_off(struct nvme *c, const char *why) {
+    kprintf("nvme%d: %s, turned off\n", c->index, why);
+    pci_disable_busmaster(c->pci, NULL);
+    c->stranger = true;
+    __atomic_store_n(&c->cut, true, __ATOMIC_RELEASE);
+    for (struct ns *s = c->found; s; s = s->next) __atomic_store_n(&s->blk.gone, true, __ATOMIC_RELEASE);
 }
 
 /* Identify Controller (3.5.1 step 7), with what the host sets from it: the I/O queue entry sizes,
@@ -556,11 +685,7 @@ static bool read_controller(struct nvme *c) {
     c->rtd3e = *(const uint32_t *)(id + 88); /* what its shutdown takes, whichever device it is */
     /* Not the device it was: its namespaces are not the ones here, and nothing is written to it. */
     if (c->discovered && (memcmp(c->identity, id, sizeof c->identity) || memcmp(c->nqn, id + 768, sizeof c->nqn))) {
-        kprintf("nvme%d: another device is here than before, turned off\n", c->index);
-        pci_disable_busmaster(c->pci, NULL);
-        c->stranger = true;
-        __atomic_store_n(&c->cut, true, __ATOMIC_RELEASE);
-        for (struct ns *s = c->found; s; s = s->next) __atomic_store_n(&s->blk.gone, true, __ATOMIC_RELEASE);
+        cut_off(c, "another device is here than before");
         return false;
     }
     memcpy(c->identity, id, sizeof c->identity);
@@ -573,9 +698,19 @@ static bool read_controller(struct nvme *c) {
     }
     while (n && c->model[n - 1] == ' ') n--;
     c->model[n] = 0;
-    unsigned mdts = id[77], most = PRPS_PER_PAGE * PAGE_SIZE;
+    unsigned mdts = id[77], most = MOST_BYTES;
     if (mdts && mdts < 20 && (PAGE_SIZE << mdts) < most) most = PAGE_SIZE << mdts;
-    __atomic_store_n(&c->max_xfer, most, __ATOMIC_RELEASE); /* a reset's read beside the callers' */
+    bool sgl = id[536] & 3; /* SGLS: supported, with or without dword alignment (Figure 338) */
+    /* the block devices were made from what the first enable found: a controller that now takes less
+       or describes data otherwise is not the one they are for */
+    if (c->discovered && (most < c->max_xfer || sgl != c->sgl)) {
+        cut_off(c, "its transfer limits changed");
+        return false;
+    }
+    if (!c->discovered) {
+        c->max_xfer = most;
+        c->sgl = sgl;
+    }
     c->vwc = id[525] & 1;
     c->namespaces = *(const uint32_t *)(id + 516);
     unsigned sqes = id[512], cqes = id[513];
@@ -592,10 +727,10 @@ static bool read_controller(struct nvme *c) {
    not drive are not enabled by any namespace we use. A refusal leaves the one it had. */
 static bool select_command_set(struct nvme *c) {
     uint32_t cmd[16] = {OP_IDENTIFY};
-    *(uint64_t *)&cmd[6] = c->ident_phys;
+    *(uint64_t *)&cmd[6] = c->ident_bus;
     cmd[10] = (uint32_t)CNTID_THIS << 16 | CNS_COMMAND_SETS;
     memset(c->ident, 0, PAGE_SIZE);
-    int r = run(&c->admin, cmd, ADMIN_NS, NULL, NULL);
+    int r = run(c, cmd, ADMIN_NS, NULL);
     if (r) {
         kprintf("nvme%d: identify of its command sets failed (%x)\n", c->index, r);
         return false;
@@ -611,7 +746,7 @@ static bool select_command_set(struct nvme *c) {
     cmd[0] = OP_SET_FEATURES;
     cmd[10] = FEATURE_COMMAND_SETS;
     cmd[11] = combination;
-    if ((r = run(&c->admin, cmd, ADMIN_NS, NULL, NULL)) == FAILED) return false;
+    if ((r = run(c, cmd, ADMIN_NS, NULL)) == FAILED) return false;
     if (r) kprintf("nvme%d: refused command set combination %u (%x)\n", c->index, combination, r);
     return true;
 }
@@ -639,10 +774,13 @@ static void add_namespace(struct nvme *c, uint32_t nsid) {
     s->nsid = nsid;
     s->block = 1u << shift;
     s->blk.sectors = blocks * (s->block / 512);
-    s->blk.read = blk_nvme_read;
-    s->blk.write = blk_nvme_write;
-    if (c->vwc) s->blk.persist = blk_nvme_persist;
     s->blk.block = s->block;
+    s->blk.max_sectors = c->max_xfer / 512;
+    s->blk.max_segments = c->sgl ? SGL_SEGMENTS : 0; /* PRPs: the pages of the transfer, which its size bounds */
+    s->blk.segment_align = 4;                        /* a data pointer is dword aligned */
+    /* PRPs: every entry after the first starts a page, every one before the last ends one (4.3.1) */
+    s->blk.segment_boundary = c->sgl ? 0 : PAGE_SIZE;
+    s->blk.ops = &nvme_ops;
     s->blk.priv = s;
     struct ns **tail = &c->found;
     while (*tail) tail = &(*tail)->next;
@@ -686,11 +824,9 @@ static void add_namespaces(struct nvme *c) {
 }
 
 /* Its messages, as many as there are I/O queues where the function has them; each queue's completion
-   queue takes one in turn. */
+   queue takes one in turn. A function with none has its INTx line, one vector for all the queues. */
 static void vectors_enable(struct nvme *c) {
-    unsigned most = pci_msix_max_vectors(c->pci);
-    if (!most) most = pci_msi_max_vectors(c->pci);
-    unsigned want = MIN(MAX(most, 1u), c->nio);
+    unsigned want = MIN(MAX(hal_irq_max(c->hal), 1u), c->nio);
     struct irq_spec *specs = kzalloc(want * sizeof *specs);
     c->irqs = kzalloc(want * sizeof *c->irqs);
     c->vectors = kzalloc(want * sizeof *c->vectors);
@@ -701,9 +837,9 @@ static void vectors_enable(struct nvme *c) {
     for (unsigned i = 0; i < want; i++) {
         c->vectors[i] = (struct vector){c, i};
         specs[i] = (struct irq_spec){.name = "NVMe", .handler = nvme_isr, .context = &c->vectors[i],
-                                     .node = c->pci->node};
+                                     .node = c->hal->node};
     }
-    c->nvectors = pci_irq_enable(c->pci, specs, want, c->irqs);
+    c->nvectors = hal_irq_enable(c->hal, specs, want, c->irqs);
     kfree(specs);
 }
 
@@ -715,12 +851,13 @@ static bool enable(struct nvme *c) {
     __atomic_add_fetch(&c->generation, 1, __ATOMIC_RELEASE);
     /* a stop whose thread gave up, ended just as this came, is not this thread's answer */
     if (!controller_stop(c, __atomic_load_n(&c->stops, __ATOMIC_ACQUIRE)) &&
-        !(__atomic_load_n(&c->called_off, __ATOMIC_ACQUIRE) && controller_stop(c, __atomic_load_n(&c->stops, __ATOMIC_ACQUIRE))))
+        !(__atomic_load_n(&c->called_off, __ATOMIC_ACQUIRE) &&
+          controller_stop(c, __atomic_load_n(&c->stops, __ATOMIC_ACQUIRE))))
         return false;
-    pci_enable_busmaster(c->pci); /* a Function Level Reset's configuration comes back without it */
+    hal_enable(c->hal, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA); /* a Function Level Reset's configuration comes back without it */
     wr32(c, AQA, (ADMIN_ENTRIES - 1u) << 16 | (ADMIN_ENTRIES - 1u));
-    wr64(c, ASQ, c->admin.sq_phys);
-    wr64(c, ACQ, c->admin.cq_phys);
+    wr64(c, ASQ, c->admin.sq_bus);
+    wr64(c, ACQ, c->admin.cq_bus);
     /* its command sets, 4 KiB pages, round robin */
     bool sets = c->cap & CAP_CSS_SETS;
     wr32(c, CC, CC_EN | (sets ? CC_CSS_SETS : CC_CSS_NVM));
@@ -741,7 +878,7 @@ static bool enable(struct nvme *c) {
     uint32_t cmd[16] = {OP_SET_FEATURES}, got = 0;
     cmd[10] = FEATURE_QUEUES;
     cmd[11] = (want - 1) << 16 | (want - 1);
-    r = run(&c->admin, cmd, ADMIN_NS, &got, NULL);
+    r = run(c, cmd, ADMIN_NS, &got);
     if (r) goto fail;
     unsigned given = MIN((got & 0xFFFF) + 1, (got >> 16) + 1);
     if (!c->nio) {
@@ -760,20 +897,20 @@ static bool enable(struct nvme *c) {
         struct queue *q = &c->io[i];
         memset(cmd, 0, sizeof cmd);
         cmd[0] = OP_CREATE_CQ;
-        *(uint64_t *)&cmd[6] = q->cq_phys;
+        *(uint64_t *)&cmd[6] = q->cq_bus;
         cmd[10] = (uint32_t)(q->size - 1) << 16 | q->qid;
         /* its vector, interrupts on when there are any, contiguous */
         cmd[11] = (c->nvectors ? (i % c->nvectors) << 16 | 2u : 0u) | 1u;
-        if ((r = run(&c->admin, cmd, ADMIN_NS, NULL, NULL))) goto fail;
+        if ((r = run(c, cmd, ADMIN_NS, NULL))) goto fail;
     }
     for (unsigned i = 0; i < c->nio; i++) { /* step 11: the submission queues */
         struct queue *q = &c->io[i];
         memset(cmd, 0, sizeof cmd);
         cmd[0] = OP_CREATE_SQ;
-        *(uint64_t *)&cmd[6] = q->sq_phys;
+        *(uint64_t *)&cmd[6] = q->sq_bus;
         cmd[10] = (uint32_t)(q->size - 1) << 16 | q->qid;
         cmd[11] = (uint32_t)q->qid << 16 | 1u; /* its completion queue, contiguous */
-        if ((r = run(&c->admin, cmd, ADMIN_NS, NULL, NULL))) goto fail;
+        if ((r = run(c, cmd, ADMIN_NS, NULL))) goto fail;
     }
     __atomic_store_n(&c->ready, true, __ATOMIC_RELEASE);
     return true;
@@ -787,7 +924,8 @@ down:
 /* reset_lock held. */
 static bool enable_recorded(struct nvme *c) {
     bool up = enable(c);
-    hal_restarted(&c->pci->hal, nvme_driver.name, up);
+    if (up) hal_recovered(c->hal);
+    else if (!__atomic_load_n(&c->cut, __ATOMIC_ACQUIRE)) hal_failed(c->hal, -N_ERR_IO);
     return up;
 }
 
@@ -821,101 +959,181 @@ static struct queue *io_queue(struct nvme *c) {
     return &c->io[(uint64_t)cpu_current_index() * nio / topology.cpus];
 }
 
-/* ---- transfers ---- */
-/* PRP1 and PRP2 for `bytes` at buf (dword aligned, 513 pages at most): the first page in PRP1 at
-   its offset, then the second page, or a list of the pages after the first in *list (a page the
-   caller frees). False when a page is not mapped, or no page for the list. */
-static bool prps(uint32_t cmd[16], const uint8_t *buf, unsigned bytes, uint64_t *list) {
-    uint64_t va = (uint64_t)buf, first = vmm_kernel_translate(va);
-    unsigned pages = (unsigned)(((va & (PAGE_SIZE - 1)) + bytes + PAGE_SIZE - 1) / PAGE_SIZE);
-    uint64_t prp2 = 0, page = va & ~(uint64_t)(PAGE_SIZE - 1);
-    *list = 0;
-    if (!first) return false;
-    if (pages == 2) {
-        if (!(prp2 = vmm_kernel_translate(page + PAGE_SIZE))) return false;
-    } else if (pages > 2) {
-        if (!(*list = pmm_alloc())) return false;
-        uint64_t *l = phys_to_virt(*list);
-        for (unsigned i = 1; i < pages; i++)
-            if (!(l[i - 1] = vmm_kernel_translate(page + i * PAGE_SIZE))) return false;
-        prp2 = *list;
+/* ---- requests ---- */
+/* The data pointer of r in cmd (DW6 to DW9), built in `list` (at list_bus) where it needs one: the
+   PRPs of its pages (4.3.1: PRP1 at its offset in the first page, PRP2 the second page, or the list
+   of the rest), or its SGL (4.3.2: one Data Block descriptor, or a Last Segment descriptor over a
+   list of them). The segments are physical; the bus address of each adds the device's offset. */
+static void data_pointer(const struct nvme *c, const struct blk_request *r, uint32_t cmd[16], uint64_t *list,
+                         uint64_t list_bus) {
+    const struct hal_device *h = c->hal;
+    if (c->sgl) {
+        cmd[0] |= PSDT_SGL;
+        if (r->segment_count == 1) {
+            *(uint64_t *)&cmd[6] = hal_dma_address(h, r->segments[0].phys);
+            cmd[8] = r->segments[0].bytes;
+            cmd[9] = SGL_DATA_BLOCK << 24;
+            return;
+        }
+        for (uint32_t i = 0; i < r->segment_count; i++) {
+            list[2 * i] = hal_dma_address(h, r->segments[i].phys);
+            list[2 * i + 1] = r->segments[i].bytes | (uint64_t)SGL_DATA_BLOCK << 56;
+        }
+        *(uint64_t *)&cmd[6] = list_bus;
+        cmd[8] = r->segment_count * 16;
+        cmd[9] = SGL_LAST_SEGMENT << 24;
+        return;
     }
-    *(uint64_t *)&cmd[6] = first;
-    *(uint64_t *)&cmd[8] = prp2;
-    return true;
+    *(uint64_t *)&cmd[6] = hal_dma_address(h, r->segments[0].phys);
+    unsigned pages = 0;
+    uint64_t second = 0;
+    for (uint32_t i = 0; i < r->segment_count; i++) {
+        uint64_t at = r->segments[i].phys & ~(uint64_t)(PAGE_SIZE - 1), end = r->segments[i].phys + r->segments[i].bytes;
+        for (; at < end; at += PAGE_SIZE, pages++) {
+            if (pages == 1) second = hal_dma_address(h, at);
+            if (pages >= 1) list[pages - 1] = hal_dma_address(h, at);
+        }
+    }
+    if (pages == 2) *(uint64_t *)&cmd[8] = second;
+    else if (pages > 2) *(uint64_t *)&cmd[8] = list_bus;
 }
 
-/* Read or write `n` logical blocks between the device and buf (blk_by_blocks): the caller's memory,
-   or the request's bounce buffer. */
-static int transfer(void *ctx, bool write, uint64_t lba, unsigned n, uint8_t *buf) {
-    struct ns *s = ctx;
-    struct nvme *c = s->c;
-    for (int attempt = 0;; attempt++) {
-        uint64_t gen = __atomic_load_n(&c->generation, __ATOMIC_ACQUIRE), list;
-        uint32_t cmd[16] = {write ? OP_WRITE : OP_READ};
-        cmd[1] = s->nsid;
-        bool described = prps(cmd, buf, n * s->block, &list);
+/* The command of r in the free slot `id` of q (sq_lock held), entered; no doorbell. */
+static void command_enter(struct queue *q, int id, struct blk_request *r) {
+    struct nvme *c = q->c;
+    struct ns *n = ns_of(r);
+    uint32_t cmd[16] = {r->op == BLK_READ ? OP_READ : r->op == BLK_WRITE ? OP_WRITE : OP_FLUSH};
+    cmd[1] = n->nsid;
+    if (r->op != BLK_PERSIST) {
+        unsigned per = n->block / 512;
+        uint64_t lba = r->lba / per;
         cmd[10] = (uint32_t)lba;
         cmd[11] = (uint32_t)(lba >> 32);
-        cmd[12] = n - 1;
-        int r = described ? run(io_queue(c), cmd, IO_NS, NULL, write ? &s->blk : NULL) : -2;
-        if (list) pmm_free(list);
-        if (!r) return 0;
-        if (r == -2) {
-            kprintf("nvme%d: a buffer of %s block %lu is not mapped, or no page for its list\n", c->index,
-                    write ? "write" : "read", lba);
-            return -1;
+        cmd[12] = r->sectors / per - 1;
+        data_pointer(c, r, cmd, (uint64_t *)(q->lists + (size_t)id * LIST_BYTES), q->lists_bus + (uint64_t)id * LIST_BYTES);
+    }
+    q->slots[id].request = r;
+    q->slots[id].deadline = clock_after(IO_NS);
+    r->tries++;
+    if (r->op == BLK_WRITE) blk_write_given(&n->blk);
+    __atomic_add_fetch(&c->inflight, 1, __ATOMIC_ACQ_REL);
+    enter(q, id, cmd);
+}
+
+/* The commands for the requests of `chain` in the calling CPU's queue, one doorbell for as many as
+   fit. A request waits for a free slot, never for another to end; once the controller is down the
+   rest of the chain is left to the thread, which brings it up. Where nothing interrupts, the wait
+   for a slot reads the completions itself. */
+static void queue_chain(struct nvme *c, struct blk_request *chain) {
+    struct queue *q = io_queue(c);
+    while (chain) {
+        uint64_t f = spin_lock(&q->sq_lock);
+        bool up = __atomic_load_n(&c->ready, __ATOMIC_ACQUIRE);
+        unsigned count = 0;
+        while (chain && up) {
+            int id = slot_take(q);
+            if (id < 0) break;
+            struct blk_request *r = chain;
+            chain = r->next;
+            r->next = NULL;
+            command_enter(q, id, r);
+            count++;
         }
-        if (r == FAILED) { /* a timeout: reset, whether it is given again or not, so others can go on */
-            if (!recover(c, gen) || attempt == 2) return -1;
-            continue;
+        if (count) {
+            __atomic_thread_fence(__ATOMIC_RELEASE); /* the entries before the doorbell */
+            doorbell(c, q->qid, false, q->tail);
         }
-        if (attempt == 2) return -1;
-        unsigned sct = (unsigned)r >> 8 & 7, sc = (unsigned)r & 0xFF;
-        kprintf("nvme%d: %s of block %lu failed (type %u code %02x)\n", c->index, write ? "write" : "read", lba, sct, sc);
-        if (r & 0x4000 || sct == 2) return -1; /* do not retry, or a media error */
+        uint64_t seen = __atomic_load_n(&q->freed, __ATOMIC_ACQUIRE);
+        spin_unlock(&q->sq_lock, f);
+        if (!chain) return;
+        if (!up) {
+            retry_push(c, chain);
+            return;
+        }
+        if (!c->nvectors) poll_queue(q);
+        wq_wait_unless(&q->room, &q->freed, seen, clock_after(c->nvectors ? TICK_NS : NS_PER_MS));
+        health_check(c); /* a controller that stopped answering frees the queue by its reset */
     }
 }
 
-/* 512-byte sectors on top of the namespace's logical blocks: the caller's memory itself where the
-   request covers whole blocks of dword aligned memory, else a bounce buffer of its own. */
-static int rw(struct ns *s, bool write, uint64_t lba, uint32_t count, uint8_t *p) {
-    struct nvme *c = s->c;
+static void nvme_submit(struct blkdev *d, struct blk_request *chain) {
+    struct nvme *c = ((struct ns *)d->priv)->c;
     awake(c);
-    unsigned per = s->block / 512, most = __atomic_load_n(&c->max_xfer, __ATOMIC_ACQUIRE) / s->block;
-    if (!most) return -N_ERR_IO; /* a reset found it takes less than a block now */
-    bool direct = !((uint64_t)p & 3), whole = !(lba % per) && !(count % per);
-    uint8_t *bounce = NULL;
-    if (!direct || !whole) {
-        size_t bytes = (size_t)MIN((uint64_t)most, (count + 2ull * per - 1) / per) * s->block;
-        if (!(bounce = kmalloc(bytes))) return -N_ERR_NO_MEMORY;
-        most = (unsigned)(bytes / s->block);
+    if (__atomic_load_n(&c->ready, __ATOMIC_ACQUIRE) || recover(c, __atomic_load_n(&c->generation, __ATOMIC_ACQUIRE))) {
+        queue_chain(c, chain);
+        return;
     }
-    int r = blk_by_blocks(&s->blk, write, lba, count, p, bounce, most, direct, transfer, s);
-    kfree(bounce);
-    return r;
+    while (chain) { /* the controller does not come up */
+        struct blk_request *next = chain->next;
+        chain->next = NULL;
+        blk_complete(chain, -N_ERR_IO);
+        chain = next;
+    }
 }
 
-static int blk_nvme_read(struct blkdev *b, uint64_t lba, uint32_t n, void *buf) { return rw(b->priv, false, lba, n, buf); }
-static int blk_nvme_write(struct blkdev *b, uint64_t lba, uint32_t n, const void *buf) {
-    return rw(b->priv, true, lba, n, (uint8_t *)buf);
+/* ---- the controller's thread ---- */
+/* The commands waiting to be given again: each one that has had its tries, or whose controller is
+   out of use, ends; the rest go to the queue, after a reset where the controller is down. */
+static void retries_run(struct nvme *c) {
+    uint64_t f = spin_lock(&c->retry_lock);
+    struct blk_request *chain = c->retry;
+    c->retry = NULL;
+    c->retry_tail = &c->retry;
+    spin_unlock(&c->retry_lock, f);
+    if (!chain) return;
+    bool cut = __atomic_load_n(&c->cut, __ATOMIC_ACQUIRE);
+    if (!cut && !__atomic_load_n(&c->ready, __ATOMIC_ACQUIRE))
+        cut = !recover(c, __atomic_load_n(&c->generation, __ATOMIC_ACQUIRE));
+    struct blk_request *again = NULL, **tail = &again;
+    for (struct blk_request *r = chain, *next; r; r = next) {
+        next = r->next;
+        r->next = NULL;
+        if (cut || r->tries >= TRIES || __atomic_load_n(&ns_of(r)->blk.gone, __ATOMIC_ACQUIRE)) {
+            blk_complete(r, -N_ERR_IO);
+        } else {
+            *tail = r;
+            tail = &r->next;
+        }
+    }
+    if (again) queue_chain(c, again);
 }
 
-/* Flush (Base 7.2): the volatile write cache reaches the medium, the writes every queue completed
-   before it with it. */
-static int blk_nvme_persist(struct blkdev *b) {
-    struct ns *s = b->priv;
-    struct nvme *c = s->c;
-    awake(c);
-    for (int attempt = 0; attempt < 2; attempt++) {
-        uint64_t gen = __atomic_load_n(&c->generation, __ATOMIC_ACQUIRE);
-        uint32_t cmd[16] = {OP_FLUSH};
-        cmd[1] = s->nsid;
-        int r = run(io_queue(c), cmd, IO_NS, NULL, NULL);
-        if (!r) return 0;
-        if (r != FAILED || !recover(c, gen)) break;
+/* A command that has had its time, or a controller that says it failed: reset, the commands in it
+   given again. Only where commands are in the controller. */
+static void health_check(struct nvme *c) {
+    if (!__atomic_load_n(&c->ready, __ATOMIC_ACQUIRE) || !__atomic_load_n(&c->inflight, __ATOMIC_ACQUIRE)) return;
+    bool late = false;
+    uint64_t now = clock_now_ns();
+    unsigned nio = __atomic_load_n(&c->nio, __ATOMIC_ACQUIRE);
+    for (unsigned i = 0; i < nio && !late; i++) {
+        struct queue *q = &c->io[i];
+        uint64_t f = spin_lock(&q->cq_lock);
+        for (unsigned k = 0; k < q->depth && !late; k++)
+            late = q->slots[k].busy && q->slots[k].request && q->slots[k].deadline <= now;
+        spin_unlock(&q->cq_lock, f);
     }
-    return -N_ERR_IO;
+    uint32_t csts = pci_reset_left(c->pci) ? 0 : rd32(c, CSTS);
+    if (!late && csts != 0xFFFFFFFFu && !(csts & CSTS_CFS)) return;
+    if (late) kprintf("nvme%d: a command timed out\n", c->index);
+    else kprintf("nvme%d: controller %s\n", c->index, csts == 0xFFFFFFFFu ? "vanished" : "reported a fatal error");
+    uint64_t gen = __atomic_load_n(&c->generation, __ATOMIC_ACQUIRE);
+    controller_stop(c, __atomic_load_n(&c->stops, __ATOMIC_ACQUIRE)); /* every command in it goes to retries */
+    recover(c, gen);
+}
+
+static void nvme_thread(void *arg) {
+    struct nvme *c = arg;
+    while (!__atomic_load_n(&c->stopping, __ATOMIC_ACQUIRE)) {
+        uint64_t seen = __atomic_load_n(&c->work, __ATOMIC_SEQ_CST);
+        hal_busy_begin();
+        if (!c->nvectors)
+            for (unsigned i = 0; i < __atomic_load_n(&c->nio, __ATOMIC_ACQUIRE); i++) poll_queue(&c->io[i]);
+        retries_run(c);
+        health_check(c);
+        hal_busy_end();
+        bool polled = !c->nvectors && __atomic_load_n(&c->inflight, __ATOMIC_ACQUIRE);
+        wq_wait_unless(&c->work_wq, &c->work, seen, clock_after(polled ? NS_PER_MS : TICK_NS));
+    }
 }
 
 /* Each message's vector on the CPU of the first queue it serves (the queues' CPUs are io_queue's). */
@@ -927,17 +1145,12 @@ static void vectors_place(struct nvme *c) {
 }
 
 static int start(struct nvme *c) {
-    struct pci_device *pci = c->pci;
-    uint64_t base = pci_bar_address(pci, 0);
-    if (!base) {
+    struct hal_device *h = c->hal;
+    /* the registers and the doorbells of every queue pair it has, all in its BAR */
+    c->regs = hal_map(h, 0);
+    if (!c->regs) {
         kprintf("nvme%d: no register window\n", c->index);
         return -N_ERR_NOT_FOUND;
-    }
-    /* the registers and the doorbells of every queue pair it has, all in its BAR */
-    c->regs = vmm_map_mmio(base, ALIGN_UP(MAX(pci_bar_size(pci, 0), (uint64_t)0x2000), PAGE_SIZE));
-    if (!c->regs) {
-        kprintf("nvme%d: no memory to map its registers\n", c->index);
-        return -N_ERR_NO_MEMORY;
     }
     uint64_t cap = c->cap = rd64(c, CAP);
     c->stride = 4u << (cap >> 32 & 0xF);
@@ -953,10 +1166,9 @@ static int start(struct nvme *c) {
         kprintf("nvme%d: no NVM command set or no 4 KiB pages (capabilities %lx), skipped\n", c->index, cap);
         return -N_ERR_UNSUPPORTED;
     }
-    if (!(c->ident_phys = pmm_alloc_node(pci->node < 0 ? 0 : (unsigned)pci->node)) ||
-        !queue_alloc(&c->admin, c, 0, ADMIN_ENTRIES, pci->node < 0 ? 0 : (unsigned)pci->node))
+    if (!(c->ident = hal_dma_alloc(h, PAGE_SIZE, 0, &c->ident_bus)) ||
+        !queue_alloc(&c->admin, c, 0, ADMIN_ENTRIES, false))
         return -N_ERR_NO_MEMORY;
-    c->ident = phys_to_virt(c->ident_phys);
     mutex_lock(&c->reset_lock);
     bool up = enable(c);
     mutex_unlock(&c->reset_lock);
@@ -969,17 +1181,18 @@ static int start(struct nvme *c) {
         return -N_ERR_IO;
     }
     vectors_place(c);
-    hal_name(&pci->hal, c->model);
+    hal_name(h, c->model);
 
-    kprintf("nvme%d: %s (%04x:%04x), version %x, %u namespaces, %u I/O queues of %u, %u %s%s\n", c->index, c->model,
-            pci->vendor, pci->device, rd32(c, VS), c->namespaces, c->nio, c->io[0].depth, c->nvectors,
-            !c->nvectors ? "vectors: polled" : pci_msix_max_vectors(pci) ? "MSI-X vectors" : "MSI vectors",
-            c->vwc ? ", write cache" : "");
+    kprintf("nvme%d: %s (%04x:%04x), version %x, %u namespaces, %u I/O queues of %u, %u %s%s, %s\n", c->index, c->model,
+            c->pci->vendor, c->pci->device, rd32(c, VS), c->namespaces, c->nio, c->io[0].depth, c->nvectors,
+            !c->nvectors ? "vectors: polled" : pci_msix_max_vectors(c->pci) ? "MSI-X vectors" : "vectors",
+            c->vwc ? ", write cache" : "", c->sgl ? "SGL" : "PRP");
     __atomic_store_n(&c->in_use, true, __ATOMIC_RELEASE);
     for (struct ns *s = c->found; s; s = s->next) {
         ksnprintf(s->blk.name, sizeof s->blk.name, "nvme%d.%u", c->index, s->nsid);
         strlcpy(s->blk.model, c->model, sizeof s->blk.model);
-        blk_register(&s->blk);
+        s->blk.has_cache = c->vwc;
+        blk_register(h, &s->blk);
     }
     return 0;
 }
@@ -1029,84 +1242,101 @@ static bool shutdown_done(struct nvme *c) {
     }
 }
 
-/* Normal shutdown before power goes away (3.6.1), for every controller of the machine: SHN is to be
-   written before any power down (Figure 41), whoever used it, and the drive then does not count an
-   unsafe shutdown. Its I/O queues go first if it still takes commands; the notification has no such
-   condition: a reset that failed left its cache as it was. One that reports complete stays ready
-   to lose power (3.6.1), and one that does not stop can keep nothing; another device that came in
-   its place has been given nothing, and is told as well. Only one holding block devices, given
-   commands since it last lost power, keeps a power change from going on. Interrupts are already
-   off, the disks held (no command in flight). */
-static bool nvme_shutdown(void *arg) {
-    (void)arg;
+/* Normal shutdown before power goes away (3.6.1): SHN is to be written before any power down
+   (Figure 41), whoever used it, and the drive then does not count an unsafe shutdown. Its I/O
+   queues go first if it still takes commands; the notification has no such condition: a reset that
+   failed left its cache as it was. One that reports complete stays ready to lose power (3.6.1), and
+   one that does not stop can keep nothing; another device that came in its place has been given
+   nothing, and is told as well. Only one holding block devices, given commands since it last lost
+   power, keeps a power change from going on. Interrupts are already off, the disks held (no
+   command in flight). */
+static bool nvme_quiesce(struct hal_device *d) {
+    struct nvme *c = d->driver_data;
+    /* a Function Level Reset left unfinished is not to be reached, and counted its cache lost */
+    bool cut = __atomic_load_n(&c->cut, __ATOMIC_ACQUIRE), stranger = cut && c->stranger;
+    if (!c->regs || (cut && !stranger) || pci_reset_left(c->pci) || CSTS_SHST(rd32(c, CSTS)) == SHST_DONE) return true;
     bool all = true;
-    for (struct nvme *c = ctrls; c; c = c->next) {
-        /* a Function Level Reset left unfinished is not to be reached, and counted its cache lost */
-        bool stranger = __atomic_load_n(&c->cut, __ATOMIC_ACQUIRE) && c->stranger;
-        if (!c->regs || (__atomic_load_n(&c->cut, __ATOMIC_ACQUIRE) && !stranger) || pci_reset_left(c->pci) ||
-            CSTS_SHST(rd32(c, CSTS)) == SHST_DONE)
-            continue;
-        if (__atomic_load_n(&c->live, __ATOMIC_ACQUIRE)) {
-            __atomic_store_n(&c->ready, false, __ATOMIC_RELEASE);
-            delete_queues(c);
-        }
-        wr32(c, CC, (rd32(c, CC) & ~CC_SHN) | CC_SHN_NORMAL);
-        /* its cache may not be on the flash */
-        if (!shutdown_done(c) && !stranger && __atomic_load_n(&c->in_use, __ATOMIC_ACQUIRE) &&
-            !__atomic_load_n(&c->woke, __ATOMIC_ACQUIRE))
-            all = false;
-        controller_down(c);
+    if (__atomic_load_n(&c->live, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&c->ready, false, __ATOMIC_RELEASE);
+        delete_queues(c);
     }
+    wr32(c, CC, (rd32(c, CC) & ~CC_SHN) | CC_SHN_NORMAL);
+    /* its cache may not be on the flash */
+    if (!shutdown_done(c) && !stranger && __atomic_load_n(&c->in_use, __ATOMIC_ACQUIRE) &&
+        !__atomic_load_n(&c->woke, __ATOMIC_ACQUIRE))
+        all = false;
+    controller_down(c);
     return all;
 }
 
 /* After a sleep (the shutdown notification above went first): the next read or write resets the
    controller and sets the queues up again, the way it recovers from a timeout. Resume must not
    wait for the controller; the I/O path may (it reports a controller that does not come back). */
-static bool nvme_resume(void *arg) {
-    (void)arg;
-    for (struct nvme *c = ctrls; c; c = c->next)
-        if (c->regs && c->ident) __atomic_store_n(&c->woke, true, __ATOMIC_RELEASE);
+static bool nvme_resume(struct hal_device *d) {
+    struct nvme *c = d->driver_data;
+    if (c->regs && c->ident) __atomic_store_n(&c->woke, true, __ATOMIC_RELEASE);
     return true;
 }
 
-static struct pm_device nvme_pm = {.name = "nvme", .stage = PM_STAGE_STORAGE, .quiesce = nvme_shutdown,
-                                   .resume = nvme_resume};
-
-/* A controller's first start: CC.EN may take CAP.TO (127.5 s), and no disk beside it waits for that.
-   It counts as a request of the disks: a power change waits for it, and it waits for that. */
-static void first_start(void *arg) {
-    struct nvme *c = arg;
-    blk_busy_begin();
-    int r = start(c);
-    blk_busy_end();
-    if (r < 0) hal_failed(&c->pci->hal, nvme_driver.name, r);
-    blk_looking_end();
-}
-
-static int nvme_attach(struct pci_device *p) {
+static int nvme_attach(struct hal_device *d) {
     struct nvme *c = kzalloc(sizeof *c);
     if (!c) {
-        kprintf("nvme: no memory for the controller at %04x:%02x:%02x.%x\n", PCI_ADDRESS_ARGS(p->address));
+        kprintf("nvme: no memory for the controller at %s\n", d->location);
         return -N_ERR_NO_MEMORY;
     }
-    c->index = nctrls++;
-    c->pci = p;
-    struct nvme **tail = &ctrls;
-    while (*tail) tail = &(*tail)->next;
-    *tail = c;
-    if (!c->index) pm_register(&nvme_pm);
-    pci_enable_busmaster(p);
-    blk_looking_begin();
+    c->index = __atomic_fetch_add(&nctrls, 1, __ATOMIC_ACQ_REL);
+    c->hal = d;
+    c->pci = pci_device_of(d);
+    c->retry_tail = &c->retry;
+    d->driver_data = c;
     char name[16];
     ksnprintf(name, sizeof name, "nvme%d", c->index);
-    if (!kthread_create(name, first_start, c)) {
-        kprintf("nvme%d: no thread to start it\n", c->index);
-        blk_looking_end();
+    if (!kthread_create(name, nvme_thread, c)) {
+        kprintf("nvme%d: no thread for it\n", c->index);
         return -N_ERR_NO_MEMORY;
     }
-    return 0;
+    hal_enable(d, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA);
+    int r = start(c); /* CC.EN may take CAP.TO (127.5 s): this thread is the device's own */
+    if (r < 0) {
+        __atomic_store_n(&c->stopping, true, __ATOMIC_RELEASE);
+        work_wake(c);
+    }
+    return r;
 }
 
-static const struct n_pci_match nvme_matches[] = {N_PCI_CLASS_PROGIF(0x01, 0x08, 0x02)};
-const struct pci_driver nvme_driver = {"nvme", nvme_matches, ARRAY_SIZE(nvme_matches), nvme_attach};
+/* The function leaves, or is given to a program: the controller reset so it moves nothing, every
+   command it had ended. The block devices stay listed, gone; the controller's memory stays too, for
+   what still points to it. */
+static void nvme_detach(struct hal_device *d) {
+    struct nvme *c = d->driver_data;
+    __atomic_store_n(&c->stopping, true, __ATOMIC_RELEASE);
+    for (struct ns *s = c->found; s; s = s->next) __atomic_store_n(&s->blk.gone, true, __ATOMIC_RELEASE);
+    work_wake(c);
+    mutex_lock(&c->reset_lock);
+    controller_stop(c, __atomic_load_n(&c->stops, __ATOMIC_ACQUIRE));
+    __atomic_store_n(&c->cut, true, __ATOMIC_RELEASE);
+    mutex_unlock(&c->reset_lock);
+    uint64_t f = spin_lock(&c->retry_lock);
+    struct blk_request *chain = c->retry;
+    c->retry = NULL;
+    c->retry_tail = &c->retry;
+    spin_unlock(&c->retry_lock, f);
+    while (chain) {
+        struct blk_request *next = chain->next;
+        chain->next = NULL;
+        blk_complete(chain, -N_ERR_IO);
+        chain = next;
+    }
+}
+
+static const struct n_hal_rule nvme_rules[] = {N_PCI_CLASS_PROGIF(0x01, 0x08, 0x02)};
+static const struct hal_driver nvme_driver = {
+    .name = "nvme",
+    .rules = nvme_rules,
+    .rule_count = ARRAY_SIZE(nvme_rules),
+    .attach = nvme_attach,
+    .detach = nvme_detach,
+    .quiesce = nvme_quiesce,
+    .resume = nvme_resume,
+};
+HAL_DRIVER(nvme_driver);

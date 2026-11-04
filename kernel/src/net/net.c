@@ -2,8 +2,10 @@
    over any number of adapters. No names, no leases, no choices here: the address of each adapter
    and the route table come from the service "network" (SYS_NET_ADDRESS_SET, SYS_NET_ROUTES_SET).
 
-   Any CPU. Received frames wait in the NIC's own ring (poll_rx) or in the receive queue below,
+   Any CPU. Received frames wait in the NIC's own rings (poll) or in the receive queue below,
    filled from interrupt handlers and driver threads; the "net" kernel thread takes them in.
+   Frames to send are built one at a time and kept for the adapter's transmit queue they belong to
+   (the flow chooses), then handed over together when the stack leaves net_lock (net_leave).
    System calls run the protocol themselves in the calling task, and sleep on their socket's
    progress (or shared_progress for link, ARP and UDP state) until a change or their deadline.
    Every time here is on the clock's axis (sys/clock.h): a moment is clock_now_ns, a deadline the
@@ -37,6 +39,7 @@
 #include "../sys/thread.h"
 #include "../sys/wait.h"
 #include "../vm/vm.h"
+#include "hal/hal.h"
 #include "../sys/channel.h"
 #include "../sys/watch.h"
 #include "sys/authority.h"
@@ -66,10 +69,21 @@ struct arp_entry {
     uint64_t time; /* when it was learnt */
     bool valid;
 };
+/* The frames built for one transmit queue of an adapter, in order, until the adapter takes them
+   (net_lock). data is allocated when the queue is first used. */
+#define TX_STAGE 64
+#define TX_SLOT 1536
+struct tx_stage {
+    struct net_tx_frame frame[TX_STAGE];
+    uint8_t (*data)[TX_SLOT];
+    unsigned first, count;
+};
 struct net_adapter {
     struct net_adapter *next;
     uint32_t id;
     struct netif *dev;
+    struct tx_stage *tx; /* tx_queues of them: as many as the adapter had when it last came */
+    unsigned tx_queues;
     uint8_t mac[6];
     const char *driver; /* a driver's constant */
     uint32_t ip, mask; /* ip 0: no address yet */
@@ -97,6 +111,28 @@ static unsigned net_callers_waiting;
 static bool net_turn_wanted;
 static struct net_progress net_turn;
 
+/* net_lock held: the frames the adapter did not take before are offered to it again, in order. A
+   queue it does not empty waits for the adapter's notice that room has come. */
+static void tx_flush_queue(struct net_adapter *a, unsigned q) {
+    struct tx_stage *s = &a->tx[q];
+    while (s->count && a->dev) {
+        unsigned run = MIN(s->count, (unsigned)TX_STAGE - s->first);
+        unsigned taken = a->dev->transmit(a->dev, q, &s->frame[s->first], run);
+        ASSERT(taken <= run);
+        a->tx_packets += taken;
+        s->first = (s->first + taken) % TX_STAGE;
+        s->count -= taken;
+        if (taken < run) return;
+    }
+}
+
+static void tx_flush(void) {
+    for (struct net_adapter *a = adapters; a; a = a->next)
+        if (a->dev)
+            for (unsigned q = 0; q < a->tx_queues; q++)
+                if (a->tx[q].count) tx_flush_queue(a, q);
+}
+
 /* A system call (or another task) enters the stack. */
 static void net_enter(void) {
     __atomic_add_fetch(&net_callers_waiting, 1, __ATOMIC_SEQ_CST);
@@ -104,7 +140,10 @@ static void net_enter(void) {
     __atomic_sub_fetch(&net_callers_waiting, 1, __ATOMIC_SEQ_CST);
     if (__atomic_exchange_n(&net_turn_wanted, false, __ATOMIC_SEQ_CST)) progress_wake(&net_turn);
 }
-static void net_leave(void) { mutex_unlock(&net_lock); }
+static void net_leave(void) {
+    tx_flush();
+    mutex_unlock(&net_lock);
+}
 
 /* The retained handle identifies a channel end, independently of handle number
    reuse; its peer closing cancels. Only setup paths consult it: a cancelled HTTP/2
@@ -219,7 +258,7 @@ static uint16_t csum_fold(uint32_t s) {
     while (s >> 16) s = (s & 0xFFFF) + (s >> 16);
     return (uint16_t)~s;
 }
-static uint16_t l4_csum(uint32_t src, uint32_t dst, uint8_t proto, const void *data, size_t len) {
+static uint32_t l4_pseudo_sum(uint32_t src, uint32_t dst, uint8_t proto, size_t len) {
     uint8_t ph[12];
     ip_put(ph, src);
     ip_put(ph + 4, dst);
@@ -227,7 +266,10 @@ static uint16_t l4_csum(uint32_t src, uint32_t dst, uint8_t proto, const void *d
     ph[9] = proto;
     ph[10] = (uint8_t)(len >> 8);
     ph[11] = (uint8_t)len;
-    return csum_fold(csum_add(csum_add(0, ph, 12), data, len));
+    return csum_add(0, ph, 12);
+}
+static uint16_t l4_csum(uint32_t src, uint32_t dst, uint8_t proto, const void *data, size_t len) {
+    return csum_fold(csum_add(l4_pseudo_sum(src, dst, proto, len), data, len));
 }
 
 struct eth_hdr {
@@ -270,6 +312,7 @@ struct tcp_hdr {
 #define RXQ 64
 static uint8_t rxq_buf[RXQ][1536];
 static uint16_t rxq_len[RXQ];
+static uint8_t rxq_flags[RXQ]; /* NET_RX_* */
 static struct net_adapter *rxq_from[RXQ];
 static int rxq_head, rxq_tail;
 static struct spinlock rxq_lock;
@@ -347,11 +390,12 @@ void net_rx_notify(void) {
 }
 
 /* rxq_lock held: the frame into the queue, and the net thread told; false when it is full. */
-static bool rxq_put_locked(struct net_adapter *from, const void *frame, size_t len) {
+static bool rxq_put_locked(struct net_adapter *from, const void *frame, size_t len, unsigned flags) {
     int next = (rxq_head + 1) % RXQ;
     if (next == rxq_tail) return false;
     memcpy(rxq_buf[rxq_head], frame, len);
     rxq_len[rxq_head] = (uint16_t)len;
+    rxq_flags[rxq_head] = (uint8_t)flags;
     rxq_from[rxq_head] = from;
     rxq_head = next;
     rxq_high_water = MAX(rxq_high_water, (uint64_t)((rxq_head - rxq_tail + RXQ) % RXQ));
@@ -359,19 +403,19 @@ static bool rxq_put_locked(struct net_adapter *from, const void *frame, size_t l
     return true;
 }
 
-void net_rx(struct netif *dev, const void *frame, size_t len) {
+void net_rx(struct netif *dev, const void *frame, size_t len, unsigned flags) {
     struct net_adapter *from = __atomic_load_n(&dev->adapter, __ATOMIC_ACQUIRE);
     if (!from) return; /* it has not been registered yet: as if the frame came a moment earlier */
-    uint64_t flags = spin_lock(&rxq_lock);
+    uint64_t lock_flags = spin_lock(&rxq_lock);
     bool queued = false;
     if (len < 14 || len > 1536) rxq_invalid++;
-    else if (!(queued = rxq_put_locked(from, frame, len))) rxq_dropped++;
-    spin_unlock(&rxq_lock, flags);
+    else if (!(queued = rxq_put_locked(from, frame, len, flags))) rxq_dropped++;
+    spin_unlock(&rxq_lock, lock_flags);
     if (queued) wq_wake_all(&rxq_wq);
 }
 
 /* The net thread, net_lock held: every queued frame, including those queued meanwhile. */
-static void eth_input(struct net_adapter *from, const void *packet, size_t len);
+static void eth_input(struct net_adapter *from, const void *packet, size_t len, unsigned flags);
 static void rxq_drain(void) {
     for (;;) {
         uint64_t flags = spin_lock(&rxq_lock);
@@ -379,7 +423,7 @@ static void rxq_drain(void) {
         bool empty = at == rxq_head;
         spin_unlock(&rxq_lock, flags);
         if (empty) return;
-        eth_input(rxq_from[at], rxq_buf[at], rxq_len[at]);
+        eth_input(rxq_from[at], rxq_buf[at], rxq_len[at], rxq_flags[at]);
         flags = spin_lock(&rxq_lock);
         rxq_tail = (at + 1) % RXQ;
         spin_unlock(&rxq_lock, flags);
@@ -393,6 +437,29 @@ static uint8_t frame[1600];
 #define L4 (frame + 14 + 20) /* transport payload area */
 static uint16_t ip_ident;
 
+/* The transmit queue a frame in `frame` goes to: its flow's, so a flow keeps its order. */
+static unsigned tx_queue_of(const struct net_adapter *a, uint16_t type) {
+    if (a->tx_queues == 1) return 0;
+    uint32_t h = 2166136261u;
+    if (type == 0x0800)
+        for (size_t i = 26; i < 38; i++) h = (h ^ frame[i]) * 16777619u; /* both addresses, both ports */
+    return h % a->tx_queues;
+}
+
+/* What the adapter completes for the frame in `frame` (NET_OFFLOAD_CSUM_TX): the stack then left the
+   transport checksum as the pseudo header's sum (l4_csum_tx). */
+static bool csum_offloaded_by(const struct net_adapter *a) {
+    return a && a->dev && (a->dev->offloads & NET_OFFLOAD_CSUM_TX);
+}
+
+static uint32_t tx_offload_of(const struct net_adapter *a, uint16_t type) {
+    if (type != 0x0800 || !csum_offloaded_by(a)) return 0;
+    uint8_t proto = frame[14 + 9];
+    return NET_TX_IP_CSUM | (proto == 6 ? NET_TX_TCP_CSUM : proto == 17 ? NET_TX_UDP_CSUM : 0);
+}
+
+/* The frame is kept for the adapter's queue; net_leave hands it over with the others. A full queue
+   the adapter does not drain is the adapter's backpressure. */
 static int eth_output(struct net_adapter *a, const uint8_t dst[6], uint16_t type, size_t len) {
     if (!a->dev) return -N_ERR_NETWORK_DOWN;
     struct eth_hdr *e = (struct eth_hdr *)frame;
@@ -404,9 +471,23 @@ static int eth_output(struct net_adapter *a, const uint8_t dst[6], uint16_t type
         memset(frame + total, 0, 60 - total);
         total = 60;
     }
-    int result = a->dev->send(a->dev, frame, total);
-    if (!result) {a->tx_packets++;net_service_bytes+=total;}
-    return result;
+    if (total > TX_SLOT) return -N_ERR_INVALID;
+    unsigned q = tx_queue_of(a, type);
+    struct tx_stage *s = &a->tx[q];
+    if (s->count == TX_STAGE) {
+        tx_flush_queue(a, q);
+        if (s->count == TX_STAGE) return -N_ERR_NOT_READY;
+    }
+    if (!s->data && !(s->data = kmalloc(TX_STAGE * sizeof s->data[0]))) return -N_ERR_NO_MEMORY;
+    unsigned slot = (s->first + s->count) % TX_STAGE;
+    memcpy(s->data[slot], frame, total);
+    s->frame[slot] = (struct net_tx_frame){.parts = {{s->data[slot], total}},
+                                           .part_count = 1,
+                                           .length = total,
+                                           .offload = tx_offload_of(a, type)};
+    s->count++;
+    net_service_bytes += total;
+    return 0;
 }
 
 /* This system's own addresses: the loopback network 127/8 and every adapter's address. Their
@@ -433,11 +514,18 @@ static int ip_loopback(size_t len) {
     memset(e, 0, sizeof *e);
     e->type = htons(0x0800);
     uint64_t flags = spin_lock(&rxq_lock);
-    bool queued = rxq_put_locked(NULL, frame, 14 + len);
+    bool queued = rxq_put_locked(NULL, frame, 14 + len, 0);
     spin_unlock(&rxq_lock, flags);
     if (!queued) return -N_ERR_BUSY;
     wq_wake_all(&rxq_wq);
     return 0;
+}
+
+/* What goes in the transport checksum field of a segment of len bytes leaving by path: all of it, or
+   (the adapter completes it) the pseudo header's folded sum, not complemented. */
+static uint16_t l4_csum_tx(const struct net_path *path, uint32_t dst, uint8_t proto, const void *data, size_t len) {
+    if (!csum_offloaded_by(path->via)) return l4_csum(path->src, dst, proto, data, len);
+    return (uint16_t)~csum_fold(l4_pseudo_sum(path->src, dst, proto, len));
 }
 
 static int ip_output(const struct net_path *path, uint32_t dst, uint8_t proto, size_t len) {
@@ -452,7 +540,7 @@ static int ip_output(const struct net_path *path, uint32_t dst, uint8_t proto, s
     ip->csum = 0;
     ip_put(ip->src, path->src);
     ip_put(ip->dst, dst);
-    ip->csum = htons(csum_fold(csum_add(0, ip, 20)));
+    if (!csum_offloaded_by(path->via)) ip->csum = htons(csum_fold(csum_add(0, ip, 20)));
     if (!path->via) return ip_loopback(20 + len);
     return eth_output(path->via, path->mac, 0x0800, 20 + len);
 }
@@ -755,7 +843,7 @@ static int udp_output(uint16_t sport, const struct net_path *path, uint32_t dst,
     u->len = htons((uint16_t)(8 + len));
     u->csum = 0;
     memcpy(L4 + 8, data, len);
-    uint16_t c = l4_csum(path->src, dst, 17, L4, 8 + len);
+    uint16_t c = l4_csum_tx(path, dst, 17, L4, 8 + len);
     u->csum = htons(c ? c : 0xFFFF);
     return ip_output(path, dst, 17, 8 + len);
 }
@@ -772,12 +860,13 @@ static struct udp_sock *udp_of(struct net_adapter *from, uint16_t port) {
     return any;
 }
 
-static void udp_input(struct net_adapter *from, uint32_t src, uint32_t dst, const uint8_t *p, size_t len) {
+static void udp_input(struct net_adapter *from, uint32_t src, uint32_t dst, const uint8_t *p, size_t len,
+                      bool verified) {
     if (len < 8) return;
     const struct udp_hdr *u = (const struct udp_hdr *)p;
     size_t ulen = ntohs(u->len);
     if (ulen < 8 || ulen > len) return;
-    if (u->csum && l4_csum(src, dst, 17, p, ulen) != 0) return;
+    if (u->csum && !verified && l4_csum(src, dst, 17, p, ulen) != 0) return;
     struct udp_sock *s = udp_of(from, ntohs(u->dport));
     if (!s) return;
     int next = (s->qh + 1) % UDP_Q;
@@ -1093,7 +1182,7 @@ static int tcp_output(struct tcb *t, uint8_t flags, uint32_t seq, size_t len) {
         }
     }
     if (len) tcp_ring_read(L4+hl,t->tx,t->tx_capacity,t->tx_head+(seq-t->snd_una),(uint32_t)len);
-    h->csum = htons(l4_csum(t->path.src, t->rip, 6, L4, hl + len));
+    h->csum = htons(l4_csum_tx(&t->path, t->rip, 6, L4, hl + len));
     int result = ip_output(&t->path, t->rip, 6, hl+len);
     if (result == -N_ERR_NOT_READY || result == -N_ERR_BUSY) {
         t->tx_retry = true;
@@ -1278,7 +1367,7 @@ static void tcp_output_reset(const struct net_path *path, uint32_t dst, uint16_t
     h->win = 0;
     h->csum = 0;
     h->urg = 0;
-    h->csum = htons(l4_csum(path->src, dst, 6, L4, 20));
+    h->csum = htons(l4_csum_tx(path, dst, 6, L4, 20));
     if (!ip_output(path, dst, 6, 20)) tcp_stats.segs_out++;
 }
 
@@ -1380,8 +1469,9 @@ static void tcp_listen_input(struct tcb *l, const struct net_path *path, uint32_
     }
 }
 
-static void tcp_input(struct net_adapter *from, uint32_t src, uint32_t dst, const uint8_t *src_mac, const uint8_t *p, size_t len) {
-    if (len < 20 || l4_csum(src, dst, 6, p, len) != 0) return;
+static void tcp_input(struct net_adapter *from, uint32_t src, uint32_t dst, const uint8_t *src_mac, const uint8_t *p, size_t len,
+                      bool verified) {
+    if (len < 20 || (!verified && l4_csum(src, dst, 6, p, len) != 0)) return;
     const struct tcp_hdr *h = (const struct tcp_hdr *)p;
     size_t hl = (size_t)(h->off >> 4) * 4;
     if (hl < 20 || hl > len) return;
@@ -1964,12 +2054,14 @@ static void tcp_close(struct tcb *t) {
    Both prefix and payload share one budget; short reads are ordinary TCP. */
 /* ---------------------------------------------------------------- input dispatch, thread, syscalls */
 
-static void eth_input(struct net_adapter *from, const void *packet, size_t len) {
+static void eth_input(struct net_adapter *from, const void *packet, size_t len, unsigned flags) {
     const uint8_t *p = packet;
     if (len<sizeof(struct eth_hdr)) return;
     const struct eth_hdr *e = (const struct eth_hdr *)p;
+    bool verified = false; /* the adapter checked the IPv4 header and the transport checksum */
     if (from) {
         if (!from->dev) return; /* it went after the frame was queued */
+        verified = (flags & NET_RX_CSUM_OK) && (from->dev->offloads & NET_OFFLOAD_CSUM_RX);
         if (memcmp(e->dst, from->mac, 6) != 0 && !(e->dst[0] & 1)) return; /* not for us (promiscuous NICs) */
         from->rx_packets++;
     }
@@ -1984,7 +2076,7 @@ static void eth_input(struct net_adapter *from, const void *packet, size_t len) 
         if (iplen < 20 || (ip->vihl >> 4) != 4) return;
         size_t hl = (size_t)(ip->vihl & 15) * 4, tl = ntohs(ip->len);
         if (hl < 20 || tl < hl || tl > iplen) return;
-        if (csum_fold(csum_add(0, ip, hl)) != 0) return;
+        if (!verified && csum_fold(csum_add(0, ip, hl)) != 0) return;
         if (ntohs(ip->frag) & 0x3FFF) return; /* fragments are not supported */
         uint32_t src = ip_get(ip->src), dst = ip_get(ip->dst);
         if (from) {
@@ -1994,13 +2086,19 @@ static void eth_input(struct net_adapter *from, const void *packet, size_t len) 
             if (from->ip && dst != from->ip && dst != 0xFFFFFFFF && dst != (from->ip | ~from->mask)) return;
         }
         if (ip->proto == 1) icmp_input(from, e->src, src, dst, ipp + hl, tl - hl);
-        else if (ip->proto == 17) udp_input(from, src, dst, ipp + hl, tl - hl);
-        else if (ip->proto == 6 && (!from || from->ip)) tcp_input(from, src, dst, e->src, ipp + hl, tl - hl);
+        else if (ip->proto == 17) udp_input(from, src, dst, ipp + hl, tl - hl, verified);
+        else if (ip->proto == 6 && (!from || from->ip)) tcp_input(from, src, dst, e->src, ipp + hl, tl - hl, verified);
     }
 }
 
-/* What an adapter's poll_rx hands over. */
-static void device_input(struct netif *dev, const void *frame, size_t len) { eth_input(dev->adapter, frame, len); }
+/* What an adapter's poll hands over. */
+static void device_input(struct netif *dev, const void *frame, size_t len, unsigned flags) {
+    eth_input(dev->adapter, frame, len, flags);
+}
+
+/* One poll of a receive queue takes at most this many frames; a queue that holds more says so (rx_pending)
+   and is taken again after the others. */
+#define NET_POLL_BUDGET 64
 
 /* The output that waited: ACKs held for the end of a batch, segments the adapter had no room
    for, retransmissions it refused. */
@@ -2044,9 +2142,10 @@ static void net_thread(void *arg) {
     for (;;) {
         bool device_ready = false;
         for (struct net_adapter *a = adapters; a && !device_ready; a = a->next)
-            device_ready = a->dev && a->dev->rx_pending && a->dev->rx_pending(a->dev);
+            for (unsigned q = 0; a->dev && q < a->dev->rx_queues && !device_ready; q++)
+                device_ready = a->dev->rx_pending(a->dev, q);
         uint64_t service_bytes = net_service_bytes;
-        mutex_unlock(&net_lock);
+        net_leave();
         /* Every producer, and every timer's fire, sets net_work_pending under rxq_lock before it
            wakes rxq_wq: looked at under that lock, an arrival after the look finds this thread
            enrolled. */
@@ -2078,8 +2177,9 @@ static void net_thread(void *arg) {
         }
         mutex_lock(&net_lock);
         receive_batch = true;
+        tx_flush(); /* frames the adapter had no room for, which its notice may have made */
         for (struct net_adapter *a = adapters; a; a = a->next)
-            if (a->dev && a->dev->poll_rx) a->dev->poll_rx(a->dev, device_input);
+            for (unsigned q = 0; a->dev && q < a->dev->rx_queues; q++) a->dev->poll(a->dev, q, NET_POLL_BUDGET, device_input);
         rxq_drain();
         /* End-of-drain ACK and per-socket readiness, once per connection.
            Resource-blocked sends retry on NIC completion, not a fictitious
@@ -2123,7 +2223,20 @@ static void adapter_address(struct net_adapter *a, uint32_t ip, uint32_t mask) {
     progress_wake(&shared_progress);
 }
 
-void net_register(struct netif *dev) {
+/* net_lock held: the queues' frames for an adapter that has tx_queues transmit queues. The earlier
+   ones, from the adapter's last stay, are dropped. */
+static bool tx_stages_make(struct net_adapter *a, unsigned tx_queues) {
+    struct tx_stage *stages = kzalloc(tx_queues * sizeof *stages);
+    if (!stages) return false;
+    for (unsigned q = 0; q < a->tx_queues; q++) kfree(a->tx[q].data);
+    kfree(a->tx);
+    a->tx = stages;
+    a->tx_queues = tx_queues;
+    return true;
+}
+
+void net_register(struct hal_device *hal, struct netif *dev) {
+    ASSERT(dev->tx_queues && dev->rx_queues && dev->transmit && dev->poll && dev->rx_pending);
     net_enter();
     struct net_adapter *a = adapters;
     while (a && (a->dev || memcmp(a->mac, dev->mac, 6))) a = a->next;
@@ -2135,27 +2248,41 @@ void net_register(struct netif *dev) {
         adapters_end = &a->next;
         spin_unlock(&config_lock, flags);
     }
+    if (a && !tx_stages_make(a, dev->tx_queues)) a = NULL;
+    uint32_t id = 0;
     if (a) {
         a->driver = dev->driver;
+        dev->hal = hal;
         __atomic_store_n(&dev->adapter, a, __ATOMIC_RELEASE);
         a->dev = dev;
+        id = a->id;
         watched_changed(&net_watch);
     }
     bool late = net_initialized;
     net_leave();
-    if (!a) kprintf("net: no memory for the %s adapter\n", dev->driver);
-    else if (late) kprintf("net: %s adapter arrived\n", dev->driver);
+    if (!a) {
+        kprintf("net: no memory for the %s adapter\n", dev->driver);
+        return;
+    }
+    char label[18];
+    ksnprintf(label, sizeof label, "%02x:%02x:%02x:%02x:%02x:%02x", dev->mac[0], dev->mac[1], dev->mac[2], dev->mac[3],
+              dev->mac[4], dev->mac[5]);
+    hal_offer(hal, N_OFFER_NET, id, label);
+    if (late) kprintf("net: %s adapter arrived\n", dev->driver);
 }
 
 void net_unregister(struct netif *dev) {
     net_enter();
     struct net_adapter *a = dev->adapter;
+    uint32_t id = a ? a->id : 0;
     if (a) {
         a->dev = NULL;
         __atomic_store_n(&dev->adapter, NULL, __ATOMIC_RELEASE);
+        for (unsigned q = 0; q < a->tx_queues; q++) a->tx[q].first = a->tx[q].count = 0; /* nothing to send them to */
         adapter_address(a, 0, 0);
     }
     net_leave();
+    if (a) hal_offer_withdraw(dev->hal, N_OFFER_NET, id);
 }
 
 /* What new connections take from now on. Physical allocation rounds to pages; RFC 7323's maximum

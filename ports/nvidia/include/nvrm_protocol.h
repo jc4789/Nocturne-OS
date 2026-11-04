@@ -12,7 +12,7 @@
    the argument struct as RM left it. A reply to NV_ESC_RM_MAP_MEMORY carries the mapped memory as
    an attached shared object: `offset` is where the mapping starts in it, `bytes` its length. */
 #define NVRM_CHANNEL "nocturne.nvidia.rm" /* サービスの名前の頭（n_service_connect） */
-#define NVRM_CHANNEL_FORMAT NVRM_CHANNEL ".%08x" /* N_PCI_TARGET */
+#define NVRM_CHANNEL_FORMAT NVRM_CHANNEL ".%08x" /* the device's id in the ledger */
 /* The dot and its hex digits; sizeof counts the NUL. */
 #define NVRM_CHANNEL_NAME_BYTES (sizeof(NVRM_CHANNEL) + 1 + 2 * sizeof(uint32_t))
 #define NVRM_PROTOCOL 1
@@ -55,7 +55,7 @@ struct nvrm_uvm_request {
 };
 
 /* Direct scanout: an app's own images shown on the screen instead of the desktop while the system
-   lets its fullscreen window be shown directly (n_pci_screen_state's app). One request, its
+   lets its fullscreen window be shown directly (n_screen_read_state's app). One request, its
    argument a struct nvrm_scanout_request. An image is video memory the display engine can scan
    out, of the screen's size, 32 bits per pixel with red in the lowest byte (what a GPU writes for
    R8G8B8A8; alpha is not shown). Images are numbered across nvrm (never 0), belong to the app that

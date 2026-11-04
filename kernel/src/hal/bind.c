@@ -127,7 +127,18 @@ static void bind_thread(void *arg) {
         set_detached(d, 0);
     }
     mutex_unlock(&d->bind);
+    hal_put(d);
     busy_done();
+}
+
+void pending_forget(struct hal_device *d) {
+    if (!d->queued) return;
+    struct hal_device *before = NULL;
+    for (struct hal_device *o = pending_first; o != d; o = o->pending_next) before = o;
+    *(before ? &before->pending_next : &pending_first) = d->pending_next;
+    if (pending_last == d) pending_last = before;
+    d->queued = false;
+    queued--;
 }
 
 /* 合う実装があれば thread を起こす。 */
@@ -146,11 +157,17 @@ static void bind_start(struct hal_device *d) {
         spin_unlock(&hal_lock, f);
         return;
     }
+    if (d->gone) {
+        spin_unlock(&hal_lock, f);
+        return;
+    }
     busy++;
+    d->holds++;
     spin_unlock(&hal_lock, f);
     if (!kthread_create("attach", bind_thread, d)) {
         kprintf("hal: no thread to attach %s\n", d->location);
         hal_failed(d, -N_ERR_NO_MEMORY);
+        hal_put(d);
         busy_done();
     }
 }
@@ -275,19 +292,18 @@ void hal_gate_open(void) {
 }
 
 int hal_bind_process(struct hal_device *d, struct hal_claim *claim, const char *program) {
-    mutex_lock(&d->bind);
     int r = 0;
     uint64_t f = spin_lock(&hal_lock);
     if (d->driver || d->claim || d->gone) {
         r = -N_ERR_BUSY;
     } else {
         d->claim = claim;
+        d->holds++;
         d->state = N_HAL_RUNNING;
         d->reason = 0;
         strlcpy(d->driver_name, program, sizeof d->driver_name);
     }
     spin_unlock(&hal_lock, f);
-    mutex_unlock(&d->bind);
     if (!r) hal_ledger_changed();
     return r;
 }
@@ -300,4 +316,5 @@ void hal_unbind_process(struct hal_device *d) {
     d->driver_name[0] = 0;
     spin_unlock(&hal_lock, f);
     hal_ledger_changed();
+    hal_put(d);
 }

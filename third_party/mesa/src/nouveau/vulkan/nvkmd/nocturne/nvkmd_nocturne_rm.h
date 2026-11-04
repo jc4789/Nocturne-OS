@@ -20,6 +20,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "hal_buses.h"
+
 struct nnrm;       /* one RM client with a device, a subdevice and a GPU address space */
 struct nnrm_mem;   /* physical memory (system or video) */
 struct nnrm_virt;  /* a reserved range of the GPU address space */

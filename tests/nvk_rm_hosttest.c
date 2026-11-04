@@ -18,7 +18,8 @@ static unsigned fail_alloc, fail_map, event, channel_free, posted_unmap;
 static uint32_t next_handle, failed_control, control_status, absent_target, mismatch_target, unready_target;
 static int64_t connect_error;
 static bool pci_failure, partial_alloc;
-static struct n_pciinfo pci_list[] = {
+struct fake_pci { uint16_t vendor; uint8_t cls, subcls, progif, bus, dev; };
+static const struct fake_pci pci_list[] = {
    {.vendor=0x10de,.cls=3,.subcls=0,.progif=0,.bus=1,.dev=1},
    {.vendor=0x10de,.cls=3,.subcls=2,.progif=0,.bus=1,.dev=2},
    {.vendor=0x10de,.cls=3,.subcls=1,.progif=0,.bus=1,.dev=3},
@@ -49,16 +50,33 @@ int mtx_unlock(mtx_t *m) { (void)m; return thrd_success; }
 void mtx_destroy(mtx_t *m) { (void)m; }
 void thrd_yield(void) {}
 
-n_result pcilist(struct n_pciinfo *out, int capacity) {
+#define FAKE_PROPS 4
+static uint32_t fake_target(const struct fake_pci *f) { return N_PCI_TARGET(0, f->bus, f->dev, 0); }
+/* The ledger as the system lists it: one record per function, id = index + 1. */
+n_result n_hal_snapshot(struct n_hal_snapshot *out) {
    if (pci_failure) return -N_ERR_NO_MEMORY;
-   unsigned count=sizeof(pci_list)/sizeof(pci_list[0]);
-   if ((unsigned)capacity<count) count=capacity;
-   memcpy(out,pci_list,count*sizeof(*out));
+   const unsigned count = sizeof pci_list / sizeof *pci_list;
+   const size_t record = sizeof(struct n_hal_device) + FAKE_PROPS * sizeof(struct n_hal_prop);
+   char *bytes = calloc(count, record);
+   if (!bytes) return -N_ERR_NO_MEMORY;
+   for (unsigned i = 0; i < count; i++) {
+      struct n_hal_device *d = (struct n_hal_device *)(bytes + i * record);
+      d->bytes = (uint32_t)record; d->id = i + 1; d->bus = N_BUS_PCI; d->prop_count = FAKE_PROPS;
+      struct n_hal_prop *p = (struct n_hal_prop *)(d + 1);
+      p[0] = (struct n_hal_prop){.key = N_HAL_PROP_BUS, .value = N_BUS_PCI};
+      p[1] = (struct n_hal_prop){.key = N_PROP_PCI_VENDOR, .value = pci_list[i].vendor};
+      p[2] = (struct n_hal_prop){.key = N_PROP_PCI_CLASS, .value = N_PCI_CLASS_CODE(pci_list[i].cls, pci_list[i].subcls, pci_list[i].progif)};
+      p[3] = (struct n_hal_prop){.key = N_PROP_PCI_ADDRESS, .value = fake_target(&pci_list[i])};
+   }
+   out->first = (const struct n_hal_device *)bytes;
+   out->count = count;
    return count;
 }
-int64_t nvrm_connect_device_status(uint32_t target,struct nvrm **out) {
+int64_t nvrm_connect_device_status(uint32_t device,struct nvrm **out) {
    *out=NULL; connects++;
    if(connect_error)return connect_error;
+   if(device==0 || device>sizeof pci_list/sizeof *pci_list)return -N_ERR_NOT_FOUND;
+   uint32_t target=fake_target(&pci_list[device-1]);
    if(target==absent_target)return -N_ERR_NOT_FOUND;
    *out=calloc(1,sizeof(**out));
    if(!*out)return -N_ERR_NO_MEMORY;
@@ -286,7 +304,7 @@ static void enumeration(void) {
 }
 static struct nnrm *space(void) {
    struct nnrm *n=calloc(1,sizeof(*n));
-   CHECK(nvrm_connect_device_status(N_PCI_TARGET(0,1,1,0),&n->rm)==0);
+   CHECK(nvrm_connect_device_status(1,&n->rm)==0);
    n->refs=1;n->info.cls_gpfifo=VOLTA_CHANNEL_GPFIFO_A;
    mtx_init(&n->usermode_lock,mtx_plain);
    atomic_init(&n->internal_va,NNRM_INTERNAL_VA);atomic_init(&n->daemon_lost,false);

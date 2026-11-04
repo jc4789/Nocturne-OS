@@ -6,6 +6,7 @@
 #include "abi.h"
 #include "audio_abi.h"
 #include "settings_abi.h"
+#include "hal_buses.h"
 #include "gfx.h"
 #include <cdefs.h>
 NOCTURNE_BEGIN_DECLS
@@ -134,133 +135,128 @@ n_result n_system_log(char *buf, size_t cap); /* the newest system log text; its
    (from the oldest record the kernel holds at its first receive on)。 */
 n_handle n_system_log_open(void);
 n_result n_app_id(n_handle app); /* its identifier, also after its end (identifiers are not reused) */
-/* Drivers in apps (docs/nocturne-native-abi.md §9). A claim takes the N_CAP_PCI_CLAIM capability;
-   its holder hands the N_KIND_PCI handle to the driver app it launches. A claim is exclusive until its
-   last handle closes, which also turns the function's interrupts off. Isolation is required
-   unless appdrivers-unisolated was explicitly selected at boot. A device left active needs
-   recovery; n_pci_info reports N_PCI_NEEDS_RECOVERY if generic FLR was not possible. */
-n_handle n_pci_claim(n_handle cap, uint32_t target); /* N_PCI_TARGET */
-n_result n_pci_info(n_handle pci, struct n_pci_function *out);
-/* Config space: width 1, 2 or 4 at an offset below 4096 aligned to it. Reads may name another
-   function (N_PCI_TARGET, e.g. the upstream bridge) or N_PCI_SELF; writes only reach the
-   claimed function. A read returns the value (non-negative). */
-n_result n_pci_config_read(n_handle pci, uint64_t target, uint32_t offset, uint32_t width);
-n_result n_pci_config_write(n_handle pci, uint32_t offset, uint32_t width, uint32_t value);
-/* A memory BAR as a shared object over its device memory (uncached; n_shared_view makes
-   write-combining parts or smaller windows to map or to send to another app). */
-n_handle n_pci_bar(n_handle pci, uint32_t bar);
-/* Turn on `count` message-signalled interrupts (MSI-X if offered, else MSI; count is rounded
-   down to what the function and the system give) and return how many. Each one that arrives
-   sets its bit until n_pci_interrupt_take returns it; the handle is N_EVENT_RECEIVABLE while a
-   bit is set. take waits until a message among the first 64 * words has arrived, or deadline
-   (N_CLOCK_NEVER: no limit; N_ERR_TIMEOUT), then writes their bits (message n: bit n % 64 of
-   bits[n / 64]), clears them and returns how many words it wrote; later messages' bits stay. */
-n_result n_pci_interrupts(n_handle pci, uint32_t count);
-n_result n_pci_interrupt_take(n_handle pci, uint64_t *bits, uint32_t words, uint64_t deadline);
-/* While the driver changes how the CPU reaches the boot screen in the function's BAR (as
-   n_pci_info reports it), the system must not write there. hold true returns once nothing is
-   being written and keeps the screen untouched; holds nest, and the last false (or the end of
-   the claim) resumes framebuffer drawing, not necessarily GPU scanout. It does not guarantee
-   recovery after a driver crash or reset. No timeout ever draws over a hold: that is the
-   very race it prevents. The end of the claim stops the function (its BAR mappings, interrupts
-   and bus mastering) before CPU drawing resumes. A hold that lasts as long as the boot option
-   fbhold=<s> says (no time by default) stops the driver's app, and the end of its claim releases
-   the hold.
-   The driver whose buffers screen 0 is drawn into (n_pci_give_screen) holds it the same way.
-   N_ERR_NOT_FOUND: the boot screen is elsewhere and screen 0 is not drawn into its buffers. */
-n_result n_pci_hold_screen(n_handle pci, bool hold);
-/* A display function's driver (PCI class 03) shows screens on its outputs (output: the driver's
-   own number for a connector, a head or a display engine's pipe). Output 0 of the function the
-   boot screen is drawn through is screen 0, the one with the taskbar; every other output has a
-   screen of its own, the same one each time a driver of that function drives it.
-   n_pci_give_screen: the buffers the output shows its screen from (struct n_screen_buffers): from
-   the return on, the screen is drawn there and takes their size, and never into the boot screen
-   any more for screen 0, until the driver gives them back (buffers NULL) or its claim ends (crash
-   included), which stops the function first; the screen is then off, and screen 0 drawn into the
-   boot screen's memory again, which the display engine may no longer show. Each buffer is a
-   writable shared object made through this claim, its BAR (prefetchable; drawn write-combined, so
-   a view of it the driver maps must be write-combining too) or a DMA object whose type is not
-   write-back (a write-combining or uncached view sets it), or a view of either. The size is the
-   mode's the display engine shows (the one the system chose, struct n_screen_state's mode, once
-   the driver offered modes; up to 65535 each); windows fullscreen or maximized on the screen
-   follow it. Returns once nothing is drawn into the output's buffers before; the new ones are
-   drawn in full; the first of them is the one shown. A frame is drawn only into a buffer the
-   output does not show (with one buffer, into the one shown) and asked for as a flip. Returns the
-   serial of the output's last flip before (0: none): a flip up to it was of the buffers before,
-   and one not taken yet is gone.
-   N_ERR_DENIED: not a display function, another claim's object, or a type the buffer cannot have;
-   N_ERR_INVALID: a count of 0 or above N_SCREEN_BUFFERS_MAX, a size of 0 or above 65535, an
-   unknown format, a range beyond the object, or nothing to give back. */
-n_result n_pci_give_screen(n_handle pci, uint32_t output, const struct n_screen_buffers *buffers);
-/* The flips the screens ask of the claim's outputs (struct n_screen_flip), at most max into out,
-   waiting until deadline (N_CLOCK_NEVER: no limit) for one: their count, 0 at the deadline. A flip
-   not taken yet is replaced by the output's next one. The driver shows the flip's buffer from the
-   next vertical blank on and says so with n_pci_screen_vblank. */
-n_result n_pci_screen_flips(n_handle pci, struct n_screen_flip *out, size_t max, uint64_t deadline);
-/* A vertical blank of an output whose buffers its screen is drawn into (struct n_screen_vblank):
-   the moment the display engine measured, on the system's monotonic clock, and the flip it shows.
-   The screen's next frame waits for the flip's blank; a screen without blanks reported shows
-   flips as they are asked. N_ERR_DENIED: the output shows no buffers of this claim. */
-n_result n_pci_screen_vblank(n_handle pci, const struct n_screen_vblank *vblank);
-/* A display function's driver tells the system the monitor it drives on an output and the modes
-   it can show there (struct n_screen_modes): the display service chooses the one shown (a mode on trial in
-   Settings, else the user's choice for that monitor, else the monitor's preferred mode, else the
-   largest at the highest refresh) and says so in struct n_screen_state's mode, which
-   n_pci_screen_state reads. The driver shows that mode (n_pci_give_screen at its size) and gives
-   the modes again with done set to the state's mode_serial and the mode it shows: when that is not
-   the mode wanted, the system never asks for that one again on this monitor and chooses another.
-   Given with done 0 (when the driver starts, or the monitor changed or was plugged in), the system
-   chooses anew, even the same mode again. count 0: the driver drives no monitor on that output
-   any more (and its claim's end does the same). N_ERR_DENIED: not a display function;
-   N_ERR_INVALID: more than N_SCREEN_MODES_MAX modes, or a mode with a size or refresh of 0, or a
-   size above 65535. */
-n_result n_pci_screen_modes(n_handle pci, uint32_t output, const struct n_screen_modes *modes);
-/* For the driver whose buffers an output's screen is drawn into or whose modes on it the system
-   has: waits until deadline (N_CLOCK_NEVER: no limit) while the screen's state is still the one
-   numbered seen (0 never is), then writes it to out (struct n_screen_state says the mode to show, and with
-   N_SCANOUT_DIRECT what the driver shows and draws while an app's window is shown directly).
-   N_ERR_TIMEOUT: out is the state numbered seen. N_ERR_DENIED: the output shows no buffers of
-   this claim and it offered no modes there. */
-n_result n_pci_screen_state(n_handle pci, uint32_t output, uint64_t seen, struct n_screen_state *out,
-                            uint64_t deadline);
-/* For that driver: a surface the output's display engine may show in its buffers' place (an app's
-   image shown directly), given as a buffer is (format without N_SCANOUT_DIRECT; N_SCANOUT_XBGR8888
-   too), of its own size (the engine may scale it to the mode's). The system never draws there but
-   once: its panic screen, which goes to the buffers and to every such surface at its size, as the
-   engine keeps showing what it was flipped to last and no driver runs any more. Returns the
-   surface's number (positive); n_pci_screen_image_end with it lets go before the driver frees the
-   memory. Buffers without N_SCANOUT_DIRECT, the buffers given back, or the claim's end let go of
-   them all. N_ERR_DENIED: the output shows no N_SCANOUT_DIRECT buffers of this claim, or the
-   object is not one n_pci_give_screen takes; N_ERR_INVALID: a size of 0 or above 65535, an unknown
-   format, a range beyond the object, or (end) no such number. */
-n_result n_pci_screen_image(n_handle pci, uint32_t output, n_handle surface, const struct n_scanout *desc);
-n_result n_pci_screen_image_end(n_handle pci, n_result image);
-/* The function's part of the ACPI namespace, as the firmware describes it: its device node
-   (N_ACPI_SELF), that node's device children (N_ACPI_CHILD(i), in namespace order), and the node
-   of the bridge it is below (N_ACPI_UPSTREAM; the host bridge's on a root bus). n_pci_acpi_eval
-   evaluates `name`, one name segment directly under that node ("_DSM", "_ADR"), with nargs
-   (at most 7) integer, string or buffer arguments whose bytes are in data (at most 64 KiB), and
-   writes the result to out: struct n_acpi_value records, the first one the result, then the
-   bytes of its strings and buffers; it returns how many bytes it wrote (at most 1 MiB).
-   N_ERR_DENIED, on every node and whether it exists or not: the methods through which the system
-   itself runs devices and the platform: power and reset (_PS0 to _PS3, _ON_, _OFF, _RST), removal
-   and docking (_EJ0 to _EJ4, _LCK, _DCK), resources (_DIS, _SRS), the handshake that decides what
-   the firmware controls (_OSC, _OST), wake (_PSW, _DSW), initialisation and handlers (_INI, _REG,
-   _EVT), system sleep (_PTS, _WAK, _TTS, _GTS, _BFS); and on N_ACPI_UPSTREAM every name not
-   starting with _ (the bridge's own methods belong to the platform and every function below it).
-   N_ERR_NOT_FOUND: no such node or object; N_ERR_INVALID: a child number past the last (a
-   function without a node has no children), a malformed name or argument; N_ERR_TOO_LARGE: out
-   is too small; N_ERR_IO: the AML failed; N_ERR_UNSUPPORTED: the system runs without AML.
-   n_pci_acpi_notify_take returns the next Notify value of the function's node from its first
-   call on (it waits like n_pci_interrupt_take; 32 not taken are kept, the oldest give way;
-   N_ERR_NOT_FOUND: the function has no node). */
-n_result n_pci_acpi_eval(n_handle pci, uint32_t node, const char *name, const struct n_acpi_value *args,
-                         uint32_t nargs, const void *data, size_t data_size, void *out, size_t out_size);
-n_result n_pci_acpi_notify_take(n_handle pci, uint64_t deadline);
-/* Zeroed RAM that a claimed function may read and write by DMA: a shared object (N_DMA_*
-   flags), held while any handle or mapping holds it. n_dma_addresses gives the bus address of
-   each page from first_page (count of them; returns how many it wrote). */
-n_handle n_dma_create(n_handle pci, size_t bytes, uint32_t flags);
+/* アプリの中の装置ドライバー（docs/nocturne-native-abi.md §9）。n_hal_claim は N_CAP_HAL_CLAIM の能力で、台帳
+   （n_hal_snapshot）の装置を一つ持つ。持った handle（N_KIND_HAL_CLAIM）は、起こすドライバーのアプリへ渡せる。
+   claim は最後の handle が閉じる（アプリの終わりを含む）か、装置が去ると終わる：写像と割り込みと提供が消え、バスが
+   装置を止める。動いている実装がある装置は N_ERR_BUSY、プロセスの実装を許さない装置（PCI のブリッジ）は
+   N_ERR_DENIED。IOMMU があれば機能の DMA は claim の DMA の object にしか届かず、無ければ n_hal_pci_info が
+   N_PCI_ISOLATED を返さない。動いたまま終わった装置の回復は次のドライバーの仕事で、n_hal_pci_info が
+   N_PCI_NEEDS_RECOVERY で知らせる。
+   n_hal_claim_resources は装置の資源（struct n_hal_resource）を max 件まで out へ書き、資源の全部の数を返す。slot は
+   バスが決める番号で、PCI は BAR の番号である。 */
+n_handle n_hal_claim(n_handle cap, uint32_t device);
+n_result n_hal_claim_resources(n_handle claim, struct n_hal_resource *out, size_t max);
+/* メモリーの資源の slot を、装置のメモリーの上の共有 object にする（uncached。n_shared_view で write-combining の
+   部分や小さい窓を作れる：資源が N_HAL_PREFETCHABLE のときだけ）。頁に揃わない資源は N_ERR_UNSUPPORTED。 */
+n_handle n_hal_map(n_handle claim, uint32_t slot);
+/* count 本までの割り込みを立て（バスが一番良い形を選ぶ：PCI は MSI-X、無ければ MSI。count は装置と機械が与える数へ
+   切り下げる）、立てた数を返す。届いた割り込みは、n_hal_interrupt_take が返すまで bit を立てる。handle は bit が
+   立っている間 N_EVENT_RECEIVABLE である。take は先頭の 64 * words 本のどれかが届くか deadline（N_CLOCK_NEVER：
+   限りなし。N_ERR_TIMEOUT）まで待ち、その bit（n 番目は bits[n / 64] の bit n % 64）を書いて消し、書いた語の数を
+   返す。後の割り込みの bit は残る。 */
+n_result n_hal_interrupts(n_handle claim, uint32_t count);
+n_result n_hal_interrupt_take(n_handle claim, uint64_t *bits, uint32_t words, uint64_t deadline);
+/* バスだけの操作（op の番号と in、out の型は hal_buses.h のバスの節）。in は 128 KiB、out は 1 MiB まで。戻りは操作の
+   結果（0 以上）か負の N_ERR_*。バスが持たない操作は N_ERR_UNSUPPORTED。 */
+n_result n_hal_bus_call(n_handle claim, uint32_t op, const void *in, size_t in_size, void *out, size_t out_size);
+/* 実装が装置で提供するもの（N_OFFER_*）を台帳に見せる（kind と instance の組は claim の中で一つ。N_ERR_EXISTS）。
+   claim の終わりが全部引っ込める。 */
+n_result n_hal_offer(n_handle claim, uint32_t kind, uint32_t instance, const char *label);
+n_result n_hal_offer_withdraw(n_handle claim, uint32_t kind, uint32_t instance);
+/* 眠りの知らせ。一度でも呼んだ claim は眠りに加わる：次の知らせ（N_HAL_POWER_SUSPEND か N_HAL_POWER_RESUME）を
+   deadline まで待って返す。SUSPEND には装置を止めてから n_hal_power_done(claim, true) で答え、止められなければ
+   false で答える（眠りは取りやめになる）。答えない、または呼ばない claim を持つ装置がある間、機械は眠らない。 */
+n_result n_hal_power_wait(n_handle claim, uint64_t deadline);
+n_result n_hal_power_done(n_handle claim, bool ok);
+/* PCI の機能の claim だけの操作（N_PCI_CALL_*、hal_buses.h）。
+   n_hal_pci_info：機能の身元、BAR、上のブリッジ、ファームウェアの画面の置き場所。
+   構成空間：幅 1、2、4 で、幅に揃った 4096 未満の offset。読みは別の機能（N_PCI_TARGET。例：上のブリッジ）か
+   N_PCI_SELF を名指しでき、非負の値を返す。書きは claim した機能にだけ届く。カーネルが握るレジスター（BAR、MSI、
+   MSI-X）と、機能の外へ効くビット（リセット、電源の状態、経路）は書けない：N_ERR_DENIED。 */
+n_result n_hal_pci_info(n_handle claim, struct n_hal_pci_info *out);
+n_result n_hal_pci_config_read(n_handle claim, uint64_t target, uint32_t offset, uint32_t width);
+n_result n_hal_pci_config_write(n_handle claim, uint32_t offset, uint32_t width, uint32_t value);
+/* ドライバーが機能の BAR（n_hal_pci_info が framebuffer_bar で示す）の中のブート画面への CPU の届き方を変える
+   間、システムはそこへ書いてはならない。hold true は書込みが無くなってから返り、画面に触れずに保つ。保持は入れ子
+   になり、最後の false（か claim の終わり）が framebuffer の描画を再開する（GPU の走査ではない）。ドライバーの
+   落ちやリセットの後の回復は保証しない。時間で保持の上に描くことはしない：それが防ぐ競合そのものである。claim の
+   終わりは、CPU の描画が戻る前に機能を止める（BAR の写像、割り込み、バスマスター）。起動の引数 fbhold=<秒>
+   （既定は無し）の時間続いた保持は、ドライバーのアプリを止め、その claim の終わりが保持を返す。
+   n_screen_give で画面 0 が描かれているドライバーも、同じように保持する。N_ERR_NOT_FOUND：ブート画面はほかにあり、
+   画面 0 はこの claim の buffer に描かれていない。 */
+n_result n_hal_pci_hold_screen(n_handle claim, bool hold);
+/* 機能の ACPI の名前空間の分（firmware の記述のまま）：機能の device node（N_ACPI_SELF）、その device の子
+   （N_ACPI_CHILD(i)、名前空間の順）、下にいるブリッジの node（N_ACPI_UPSTREAM。root bus ならホストブリッジの）。
+   n_hal_pci_acpi_eval は、その node の直下の名前 `name`（1 区画：「_DSM」「_ADR」）を、nargs 個（7 まで）の整数、
+   文字列、バッファーの引数（中身は data、64 KiB まで）で評価し、結果を out へ書く：struct n_acpi_value の記録、
+   最初が結果、続いて文字列とバッファーのバイト。書いたバイト数を返す（1 MiB まで）。
+   N_ERR_DENIED（node があってもなくても）：システムが装置と機械を動かすのに使う method（電源とリセット _PS0 から
+   _PS3、_ON_、_OFF、_RST。取り外しとドッキング _EJ0 から _EJ4、_LCK、_DCK。資源 _DIS、_SRS。firmware が何を制御
+   するかの交渉 _OSC、_OST。wake _PSW、_DSW。初期化と handler _INI、_REG、_EVT。システムの眠り _PTS、_WAK、_TTS、
+   _GTS、_BFS）、そして N_ACPI_UPSTREAM では _ で始まらない全部の名前（ブリッジ自身の method は、その下の全機能と
+   プラットフォームのものである）。N_ERR_NOT_FOUND：その node か object が無い。N_ERR_INVALID：最後の子より先の
+   番号（node の無い機能に子は無い）、壊れた名前か引数。N_ERR_TOO_LARGE：out が小さい。N_ERR_IO：AML が失敗。
+   N_ERR_UNSUPPORTED：AML なしで動いている。
+   n_hal_pci_acpi_notify_take は、機能の node の次の Notify の値を、最初の呼出し以後から返す（n_hal_interrupt_take
+   と同じに待つ。取られない 32 件を持ち、古いものが譲る。N_ERR_NOT_FOUND：機能に node が無い）。 */
+n_result n_hal_pci_acpi_eval(n_handle claim, uint32_t node, const char *name, const struct n_acpi_value *args,
+                             uint32_t nargs, const void *data, size_t data_size, void *out, size_t out_size);
+n_result n_hal_pci_acpi_notify_take(n_handle claim, uint64_t deadline);
+/* 画面のドライバー（どのバスの claim でもよい）：出力（モニター）の buffer を画面へ渡す。output はドライバーの
+   コネクター、head、表示 engine の pipe の番号である。ファームウェアの画面の画素がある装置の出力 0 が画面 0
+   （タスクバーのある画面）で、ほかの出力は画面を一つずつ持ち、その装置のドライバーが替わっても同じ画面である。
+   n_screen_give：出力が画面を見せる buffer（struct n_screen_buffers）。返った後、画面はそこへ描かれ、その大きさに
+   なり、画面 0 は、ドライバーが返す（buffers が NULL）か claim が終わる（落ちも含む）まで、ブート画面へは描かれ
+   ない（claim の終わりは先に装置を止める）。そのとき画面は消え、画面 0 はブート画面のメモリーへ描かれるが、表示
+   engine はもうそれを見せていないかもしれない。buffer はそれぞれ、この claim で作った書込み可能な共有 object：
+   BAR など prefetchable な装置のメモリー（write-combining で描くので、ドライバーが写す view も write-combining
+   でなければならない）か、型が write-back でない DMA の object（write-combining か uncached の view がその型にする）、
+   またはそれらの view。大きさは、表示 engine が見せる mode のもの（ドライバーが mode を知らせた後は、システムが選んだ
+   mode、struct n_screen_state の mode。各辺 65535 まで）で、その画面で全画面か最大化の窓はそれに従う。出力の前の
+   buffer へ描くものが無くなってから返り、新しい buffer は全部描かれ、その最初のものが見えている。frame は出力が
+   見せていない buffer にだけ描かれ（buffer が一つならその一つへ）、flip として求められる。出力の前の最後の flip の
+   serial（0：無い）を返す：それ以下の flip は前の buffer のもので、まだ取られていないものは消える。
+   N_ERR_DENIED：ほかの claim の object か、buffer が持てない型。N_ERR_INVALID：count が 0 か N_SCREEN_BUFFERS_MAX
+   より多い、大きさが 0 か 65535 より大きい、知らない format、object の外の範囲、返すものが無い。 */
+n_result n_screen_give(n_handle claim, uint32_t output, const struct n_screen_buffers *buffers);
+/* claim の出力の画面が求める flip（struct n_screen_flip）を out へ最大 max 件、deadline（N_CLOCK_NEVER：限りなし）
+   まで待って返す：件数、期限なら 0。まだ取られていない flip は出力の次の flip に替わる。ドライバーは flip の
+   buffer を次の垂直帰線から見せ、n_screen_report_vblank で知らせる。 */
+n_result n_screen_flips(n_handle claim, struct n_screen_flip *out, size_t max, uint64_t deadline);
+/* 画面が buffer に描かれている出力の垂直帰線（struct n_screen_vblank）：表示 engine が測った時刻（システムの
+   monotonic の時計）と、それが見せる flip。画面の次の frame は flip の帰線を待つ。帰線を知らせない画面は、
+   flip を求められた通りに見せる。N_ERR_DENIED：出力はこの claim の buffer を見せていない。 */
+n_result n_screen_report_vblank(n_handle claim, const struct n_screen_vblank *vblank);
+/* ドライバーが出力に繋いだモニターと、そこで見せられる mode（struct n_screen_modes）をシステムに知らせる。見せる
+   mode は表示のサービスが選ぶ（設定の試し、無ければ利用者のそのモニターの選び、無ければモニターの preferred、無ければ
+   最高の refresh の最大）ので、struct n_screen_state の mode が言い、n_screen_read_state が読む。ドライバーはその
+   mode を見せ（n_screen_give をその大きさで）、done に state の mode_serial を入れ、見せている mode を書いて、
+   mode をもう一度知らせる：望みの mode でなければ、システムはそのモニターでそれを二度と求めず、別のものを選ぶ。
+   done 0（ドライバーの始め、モニターの変化か接続のとき）の知らせは、同じ mode でも選び直す。count 0：ドライバーは
+   その出力にもうモニターを繋いでいない（claim の終わりも同じ）。N_ERR_INVALID：N_SCREEN_MODES_MAX より多い mode、
+   大きさか refresh が 0 の mode、65535 より大きい大きさ。 */
+n_result n_screen_offer_modes(n_handle claim, uint32_t output, const struct n_screen_modes *modes);
+/* 出力の画面が buffer に描かれているか、システムがその出力の mode を持っているドライバーのために：画面の状態が
+   seen の番号のままの間 deadline（N_CLOCK_NEVER：限りなし）まで待ち（0 は番号にならない）、out へ書く
+   （struct n_screen_state が見せる mode と、N_SCANOUT_DIRECT なら、アプリの窓を直接見せる間にドライバーが見せ、
+   描くものを言う）。N_ERR_TIMEOUT：out は seen の番号の状態。N_ERR_DENIED：出力はこの claim の buffer を見せて
+   おらず、mode も知らせていない。 */
+n_result n_screen_read_state(n_handle claim, uint32_t output, uint64_t seen, struct n_screen_state *out,
+                             uint64_t deadline);
+/* そのドライバーのために：出力の表示 engine が buffer の代わりに見せてよい surface（アプリの image を直接見せる）。
+   buffer と同じに渡す（format は N_SCANOUT_DIRECT なし。N_SCANOUT_XBGR8888 も）、自分の大きさで（engine が mode の
+   大きさへ拡縮してよい）。システムがそこへ描くのは一度だけ：panic の画面で、buffer とそういう surface 全部へ
+   その大きさで描かれる：engine は最後に flip された物を見せ続け、ドライバーはもう動かないから。surface の番号
+   （正）を返す。n_screen_image_end はそれを、ドライバーがメモリーを解く前に手放す。N_SCANOUT_DIRECT でない
+   buffer、返された buffer、claim の終わりは、全部を手放す。N_ERR_DENIED：出力はこの claim の N_SCANOUT_DIRECT の
+   buffer を見せていない、または n_screen_give が受けない object。N_ERR_INVALID：大きさが 0 か 65535 より大きい、
+   知らない format、object の外の範囲、（end で）そういう番号が無い。 */
+n_result n_screen_image_add(n_handle claim, uint32_t output, n_handle surface, const struct n_scanout *desc);
+n_result n_screen_image_end(n_handle claim, n_result image);
+/* Zeroed RAM that a claimed device may read and write by DMA: a shared object (N_DMA_*
+   flags), held while any handle or mapping holds it. N_ERR_UNSUPPORTED: its bus lets no device reach memory.
+   n_dma_addresses gives the bus address of each page from first_page (count of them; returns how many it wrote). */
+n_handle n_dma_create(n_handle claim, size_t bytes, uint32_t flags);
 n_result n_dma_addresses(n_handle shared, size_t first_page, uint64_t *out, size_t count);
 /* A new shared object over part of another (page-aligned offset and bytes) with the given
    caching (N_CACHE_*): mapping it maps the same pages. */
@@ -444,12 +440,16 @@ n_handle n_power_events_watch(n_handle cap);
 n_result n_power_windows(n_handle cap, bool ask_to_close, char *top_title, size_t size);
 n_result n_power_say(n_handle cap, const struct n_power_state *state);
 n_handle n_power_windows_watch(n_handle cap);
-/* 台帳（docs/hal.md）。n_hal_list は写した数でなく台帳の全部の数を返す。n_hal_snapshot は全部を malloc の記憶へ
-   写し、数を返す。pcilist は PCI の機能だけを写し、写した数を返す。 */
-n_result n_hal_list(struct n_hal_device *out, size_t max);
-n_result n_hal_snapshot(struct n_hal_device **out);
+/* 台帳（docs/hal.md）。n_hal_list は記録の全部のバイト数を返し、bytes に入らなければ何も書かない。n_hal_snapshot は
+   全部を一つの時点で malloc の記憶へ写し、件数を返す（first を free する）。記録は可変の長さで、n_hal_device_next
+   で次へ進む。 */
+struct n_hal_snapshot {
+    const struct n_hal_device *first;
+    uint32_t count;
+};
+n_result n_hal_list(void *out, size_t bytes);
+n_result n_hal_snapshot(struct n_hal_snapshot *out);
 n_handle n_hal_watch(void);
-n_result pcilist(struct n_pciinfo *out, int max);
 long __syscall(long n, long a, long b, long c, long d, long e);
 /* Where a slot of this program's entry image is (abi.h). For a language runtime with its own calls. */
 uintptr_t n_entry_slot(unsigned slot);

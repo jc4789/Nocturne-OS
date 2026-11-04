@@ -69,6 +69,3 @@ int64_t pm_watch_syscall(void);
 int64_t pm_events_syscall(void *out, size_t size);
 int64_t pm_events_watch_syscall(void);
 int64_t pm_say_syscall(const void *state, size_t size);
-/* Interrupts off: every registered device stops, stage by stage. NULL, or the first device that
-   did not stop (with stop_at_failure, the ones after it are left running). */
-const char *pm_quiesce_devices(bool stop_at_failure);

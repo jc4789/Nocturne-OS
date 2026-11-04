@@ -11,4 +11,5 @@ struct hal_device *hal_walk_next(struct hal_device *d);
 void hal_ledger_changed(void);
 
 void hal_bind_request(struct hal_device *d); /* hal/bind.c：結ぶ先を探す */
+void pending_forget(struct hal_device *d);   /* hal/bind.c：結ぶのを待つ列から外す。hal_lock の下 */
 void hal_release(struct hal_device *d);      /* hal/resource.c：実装が手放した後の片づけ */

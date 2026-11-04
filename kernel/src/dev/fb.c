@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "dev/fb.h"
+#include "hal/hal.h"
 #include "limine.h"
 #include "arch/smp.h"
 #include "arch/cpu.h"
@@ -406,8 +407,8 @@ void screen_set_refresh(struct screen *s, uint32_t refresh_mhz, uint32_t vrr_min
    compositor and the console keep drawing into their RAM canvases, and the whole screen is drawn
    again when the last hold ends. Time never ends a hold: drawing while the driver still rebuilds
    is the very write the hold keeps out. A hold ends when the driver gives it back, or when its
-   claim ends (dev/pciuser.c), which stops the device before it gives the holds back; that is also
-   how a driver stuck while holding is ended (pciuser.c, boot option fbhold=).
+   claim ends (dev/screen_driver.c), which stops the device before it gives the holds back; that is also
+   how a driver stuck while holding is ended (dev/screen_driver.c, boot option fbhold=).
    The compositor's frames look at the holds with screen 0's use taken, which fb_hold takes after
    it counted itself. The console's presents count themselves in presenting before they look at
    hold_count and their target; a hold or a change of target changes those before it waits for
@@ -580,7 +581,7 @@ void screen_times(struct screen *s, struct screen_times *out) {
    engine from its buffers to the app's own images, which nothing of the system's is drawn into.
    When the kernel stops, the engine goes on showing whichever was flipped last, and no driver runs
    any more to flip back: the panic screen is drawn into each of them as well (fb_present_last).
-   dev/pciuser.c adds and removes them, one call at a time. */
+   dev/screen_driver.c adds and removes them, one call at a time. */
 static struct scanout *images; /* atomic: the list fb_present_last walks */
 
 void fb_image_add(struct scanout *o) {
@@ -626,3 +627,35 @@ void fb_present_last(const uint32_t *src, int src_pitch, int w, int h) {
     __atomic_sub_fetch(&presenting, 1, __ATOMIC_RELEASE);
 }
 
+/* ---- the firmware's screen as a device ---- */
+static struct hal_device boot_screen;
+static bool boot_screen_listed;
+
+static int boot_screen_attach(struct hal_device *d) {
+    hal_offer(d, N_OFFER_SCREEN, 0, "firmware");
+    return 0;
+}
+
+static void boot_screen_detach(struct hal_device *d) { hal_offer_withdraw(d, N_OFFER_SCREEN, 0); }
+
+static const struct n_hal_rule boot_screen_rules[] = {N_FIXED("boot-screen")};
+static const struct hal_driver boot_screen_driver = {.name = "firmware-screen", .rules = boot_screen_rules,
+                                                     .rule_count = ARRAY_SIZE(boot_screen_rules),
+                                                     .attach = boot_screen_attach, .detach = boot_screen_detach,
+                                                     .cold_ok = true};
+HAL_DRIVER(boot_screen_driver);
+
+void fb_publish(void) {
+    if (!fb.addr) return;
+    hal_device_init(&boot_screen, N_BUS_FIXED, NULL);
+    hal_prop_text(&boot_screen, N_PROP_FIXED_NAME, "boot-screen");
+    hal_resource_add(&boot_screen, N_HAL_MEMORY, 0, N_HAL_PREFETCHABLE, fb.phys, (uint64_t)fb.pitch * fb.height);
+    hal_location(&boot_screen, "firmware");
+    hal_publish(NULL, &boot_screen);
+    boot_screen_listed = true;
+}
+
+void fb_boot_release(void) {
+    if (!__atomic_exchange_n(&boot_screen_listed, false, __ATOMIC_ACQ_REL)) return;
+    hal_remove(&boot_screen);
+}

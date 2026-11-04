@@ -170,6 +170,14 @@ n_result n_shared_map(n_handle shared, size_t bytes, int access, void **mapping)
     return 0;
 }
 n_result n_memory_release(void *addr, size_t bytes) { (void)bytes; if (addr == gop) called("unmap-gop"); return 0; }
+n_result n_hal_offer(n_handle claim, uint32_t kind, uint32_t instance, const char *label) {
+    (void)claim, (void)kind, (void)instance, (void)label;
+    return 0;
+}
+n_result n_hal_offer_withdraw(n_handle claim, uint32_t kind, uint32_t instance) {
+    (void)claim, (void)kind, (void)instance;
+    return 0;
+}
 n_result n_handle_close(n_handle h) { called("close%d", (int)h); return 0; }
 
 static n_result give_result;
@@ -177,7 +185,7 @@ static bool direct_refused;      /* the system refuses N_SCANOUT_DIRECT */
 static bool plain_refused;       /* the system refuses a surface without N_SCANOUT_DIRECT */
 static struct n_scanout given_desc;
 static n_handle given_surface;
-/* What the system draws its panic screen into besides the scanout (n_pci_screen_image): the
+/* What the system draws its panic screen into besides the scanout (n_screen_image_add): the
    numbers it holds. It lets go of all of them when the scanout is no longer N_SCANOUT_DIRECT. */
 #define PANIC_IMAGES 64
 static bool panic_held[PANIC_IMAGES];
@@ -189,7 +197,7 @@ static unsigned panic_images(void) {
     return n;
 }
 static struct n_screen_state screen;
-/* The system's flips of output 0 (n_pci_screen_flips): serial counts them; a give returns the
+/* The system's flips of output 0 (n_screen_flips): serial counts them; a give returns the
    last one asked before. given_surface is the first buffer's view (GIVEN_BOOT: given back),
    given_desc its place, given_second the other buffer's view. */
 #define GIVEN_BOOT (-2)
@@ -197,7 +205,7 @@ static uint64_t flip_serial;
 static n_handle given_second;
 static unsigned given_count;
 /* The boot screen back: the system lets go of the images (pciuser.c screen_give_back). */
-n_result n_pci_give_screen(n_handle pci, uint32_t output, const struct n_screen_buffers *b) {
+n_result n_screen_give(n_handle pci, uint32_t output, const struct n_screen_buffers *b) {
     (void)pci;
     CHECK(output == 0);
     if (!b) {
@@ -217,8 +225,8 @@ n_result n_pci_give_screen(n_handle pci, uint32_t output, const struct n_screen_
     if (!(b->format & N_SCANOUT_DIRECT)) memset(panic_held, 0, sizeof panic_held);
     return (n_result)flip_serial;
 }
-n_result n_pci_screen_image(n_handle pci, uint32_t output, n_handle surface, const struct n_scanout *desc) {
-    CHECK(pci == nvrm_dev.pci && output == 0 && surface == IMAGE_VIEW);
+n_result n_screen_image_add(n_handle pci, uint32_t output, n_handle surface, const struct n_scanout *desc) {
+    CHECK(pci == nvrm_dev.claim && output == 0 && surface == IMAGE_VIEW);
     called("panic-image");
     if (panic_refused) return panic_refused;
     panic_desc = *desc;
@@ -226,23 +234,23 @@ n_result n_pci_screen_image(n_handle pci, uint32_t output, n_handle surface, con
     panic_held[++panic_last] = true;
     return panic_last;
 }
-n_result n_pci_screen_image_end(n_handle pci, n_result image) {
-    CHECK(pci == nvrm_dev.pci);
+n_result n_screen_image_end(n_handle pci, n_result image) {
+    CHECK(pci == nvrm_dev.claim);
     called("panic-image-end");
     if (image <= 0 || image >= PANIC_IMAGES || !panic_held[image]) return -N_ERR_INVALID;
     panic_held[image] = false;
     return 0;
 }
 
-/* What the system says the screen shows (n_pci_screen_state). A wait on a state already seen
+/* What the system says the screen shows (n_screen_read_state). A wait on a state already seen
    stops the state thread, so the test runs state_thread() once per change. A refusal stops it the
    second time in a row: a refusal seen once the thread is stopping is the end of a hand_back and
    not logged, so the first one must not stop it. */
 static n_result screen_result;
 static unsigned screen_refusals;
-n_result n_pci_screen_state(n_handle pci, uint32_t output, uint64_t seen, struct n_screen_state *out,
+n_result n_screen_read_state(n_handle pci, uint32_t output, uint64_t seen, struct n_screen_state *out,
                             uint64_t deadline) {
-    CHECK(pci == nvrm_dev.pci && output == 0);
+    CHECK(pci == nvrm_dev.claim && output == 0);
     if (screen_result) {
         if (deadline > clock_ns && ++screen_refusals >= 2) __atomic_store_n(&scr.state_stop, true, __ATOMIC_RELEASE);
         return screen_result;
@@ -274,7 +282,7 @@ static void follow_screen(void) {
    for the monitor, else its preferred mode, else its preferred size at the nearest refresh, else
    its largest size nearest 60 Hz; never a mode the driver could not show. A monitor offered
    again keeps the mode it was asked for. Each wish is numbered anew. */
-static struct n_screen_modes modes_seen; /* what n_pci_screen_modes gave last */
+static struct n_screen_modes modes_seen; /* what n_screen_offer_modes gave last */
 static struct n_screen_mode user_mode;   /* the user's choice for the monitor (0: none) */
 static struct n_screen_mode refused_modes[N_SCREEN_MODES_MAX];
 static unsigned refused_count;
@@ -329,8 +337,8 @@ static void system_wishes(struct n_screen_mode m) {
 static void system_wants(uint32_t width, uint32_t height, uint32_t mhz) {
     system_wishes((struct n_screen_mode){ width, height, mhz, 0 });
 }
-n_result n_pci_screen_modes(n_handle pci, uint32_t output, const struct n_screen_modes *m) {
-    CHECK(pci == nvrm_dev.pci && output == 0);
+n_result n_screen_offer_modes(n_handle pci, uint32_t output, const struct n_screen_modes *m) {
+    CHECK(pci == nvrm_dev.claim && output == 0);
     if (modes_result) {
         called("modes-refused");
         return modes_result;
@@ -362,7 +370,7 @@ n_result n_pci_screen_modes(n_handle pci, uint32_t output, const struct n_screen
 static uint64_t vblank_count, vblank_ts, vblank_flip;
 static uint32_t vblank_buffer;
 static int vblank_calls;
-n_result n_pci_screen_vblank(n_handle pci, const struct n_screen_vblank *v) {
+n_result n_screen_report_vblank(n_handle pci, const struct n_screen_vblank *v) {
     (void)pci;
     CHECK(v->output == 0);
     vblank_calls++;
@@ -382,8 +390,8 @@ static uint64_t system_flips(uint32_t buffer) {
     return flip_serial;
 }
 /* With no flip waiting, a wait stops the flip thread, so the test runs flip_thread() once per flip. */
-n_result n_pci_screen_flips(n_handle pci, struct n_screen_flip *out, size_t max, uint64_t deadline) {
-    CHECK(pci == nvrm_dev.pci && max >= 1);
+n_result n_screen_flips(n_handle pci, struct n_screen_flip *out, size_t max, uint64_t deadline) {
+    CHECK(pci == nvrm_dev.claim && max >= 1);
     (void)deadline;
     if (!flip_waiting) {
         __atomic_store_n(&scr.state_stop, true, __ATOMIC_RELEASE);
@@ -863,7 +871,7 @@ static void reset(void) {
     vblank_calls = 0;
     memset(&last_request, 0, sizeof last_request);
     memset(&nvrm_dev, 0, sizeof nvrm_dev);
-    nvrm_dev.pci = 3;
+    nvrm_dev.claim = 3;
     nvrm_dev.nv.gpu_id = 0x100;
     nvrm_dev.info.framebuffer_address = GOP_BUS;
     nvrm_dev.info.framebuffer_size = (uint64_t)GOP_PITCH * H;

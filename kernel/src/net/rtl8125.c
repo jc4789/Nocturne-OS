@@ -43,11 +43,8 @@
 #include "../arch/spin.h"
 #include "../dev/pci.h"
 #include "../dev/entropy.h"
-#include "../dev/pm.h"
-#include "../dev/pci_drivers.h"
+#include "../hal/hal.h"
 #include "../mm/heap.h"
-#include "../mm/pmm.h"
-#include "../mm/vmm.h"
 #include "../sys/clock.h"
 
 
@@ -111,6 +108,17 @@
 #define D_LS  (1u << 28)
 #define RX_RES (1u << 21) /* receive error summary */
 #define RX_LEN 0x3FFFu
+/* What the MAC says of a received frame's checksums (opts1, and opts2 for the IP version) */
+#define RX_TCPT (1u << 17)
+#define RX_UDPT (1u << 18)
+#define RX_IPF (1u << 16)
+#define RX_UDPF (1u << 15)
+#define RX_TCPF (1u << 14)
+#define RX_V4F (1u << 30)
+/* What a frame to send asks the MAC to complete (opts2, the 8125's descriptor format) */
+#define TX_IPV4CS (1u << 29)
+#define TX_TCPCS (1u << 30)
+#define TX_UDPCS (1u << 31)
 
 /* PHY (standard registers are mapped at OCP 0xA400 + 2 * register) */
 #define MII_BMCR 0
@@ -131,8 +139,8 @@
 
 #define BUFSZ 2048
 #define FRAME_MAX 1522 /* 1500 + header + VLAN tag + FCS */
-#define UDP_PAD 121 /* short IPv4 UDP frames this length or shorter go out padded (8125A/B) */
-#define LINK_LOOK NS_PER_S /* poll_rx reads the link state again after this, besides the link interrupt */
+#define UDP_PAD 121 /* short IPv4 UDP frames sent without a checksum for the MAC to complete go out this long (8125A/B) */
+#define LINK_LOOK NS_PER_S /* poll reads the link state again after this, besides the link interrupt */
 
 struct desc {
     uint32_t opts1, opts2;
@@ -140,22 +148,19 @@ struct desc {
 };
 #define NRX (PAGE_SIZE / sizeof(struct desc))
 #define NTX (PAGE_SIZE / sizeof(struct desc))
-#define BUFS_PER_PAGE (PAGE_SIZE / BUFSZ)
 _Static_assert(sizeof(struct desc) == 16, "RTL8125 descriptor ABI");
 
-/* The receive ring and the link state belong to the net thread (poll_rx, rx_pending); the
-   transmit ring to send, which the stack calls one at a time. The interrupt handler and
-   poll_rx, each on any CPU, share the interrupt mask and the two latches below: rtl_lock, a leaf
+/* The receive ring and the link state belong to the net thread (poll, rx_pending); the
+   transmit ring to transmit, which the stack calls one at a time. The interrupt handler and
+   poll, each on any CPU, share the interrupt mask and the two latches below: rtl_lock, a leaf
    under the stack's net_lock, guards them; net_rx_notify comes after it is given back. A
    power change (quiesce, resume) runs alone: every other CPU halted, no other task of CPU 0's
    running in the middle. */
 struct rtl8125 {
     struct netif nif; /* first: self is the device */
-    struct pm_device pm;
-    struct pci_device *pci;
     volatile uint8_t *mmio;
     volatile struct desc *rx, *tx;
-    uint64_t rx_ring_phys, tx_ring_phys;
+    uint64_t rx_ring_bus, tx_ring_bus;
     uint8_t *rxbuf[NRX], *txbuf[NTX];
     unsigned rx_cur, tx_cur, tx_clean;
     struct spinlock rtl_lock;
@@ -273,9 +278,9 @@ static void mac_reset(struct rtl8125 *c) {
     if (!wait_reg(c, CMD, 1, CMD_RESET, 0, 10 * NS_PER_US, 10 * NS_PER_MS)) kprintf("rtl8125: reset did not complete\n");
 }
 
-/* Power change (dev/pm.h): interrupts off, then the reset ends every DMA. Polled waits only. */
-static bool rtl_quiesce(void *arg) {
-    struct rtl8125 *c = arg;
+/* Power change (hal.h): interrupts off, then the reset ends every DMA. Polled waits only. */
+static bool rtl_quiesce(struct hal_device *d) {
+    struct rtl8125 *c = d->driver_data;
     wr32(c, IMR_CLEAR, 0xFFFFFFFF);
     wr32(c, RXCFG, rd32(c, RXCFG) & ~0x3Fu);
     wr8(c, CMD, rd8(c, CMD) & ~(CMD_TX_EN | CMD_RX_EN));
@@ -392,10 +397,10 @@ static void rings_start(struct rtl8125 *c) {
     c->rx_cur = c->tx_cur = c->tx_clean = 0;
     c->rx_irq_pending = false;
     __atomic_thread_fence(__ATOMIC_RELEASE);
-    wr32(c, TX_RING, (uint32_t)c->tx_ring_phys);
-    wr32(c, TX_RING + 4, (uint32_t)(c->tx_ring_phys >> 32));
-    wr32(c, RX_RING, (uint32_t)c->rx_ring_phys);
-    wr32(c, RX_RING + 4, (uint32_t)(c->rx_ring_phys >> 32));
+    wr32(c, TX_RING, (uint32_t)c->tx_ring_bus);
+    wr32(c, TX_RING + 4, (uint32_t)(c->tx_ring_bus >> 32));
+    wr32(c, RX_RING, (uint32_t)c->rx_ring_bus);
+    wr32(c, RX_RING + 4, (uint32_t)(c->rx_ring_bus >> 32));
     wr16(c, RX_MAX_SIZE, FRAME_MAX);
     wr16(c, EEE_TXIDLE, 1500 + 14 + 0x20);
     wr32(c, MAR0, 0xFFFFFFFF);
@@ -404,8 +409,8 @@ static void rings_start(struct rtl8125 *c) {
     wr8(c, CMD, CMD_TX_EN | CMD_RX_EN);
 }
 
-static bool rtl_resume(void *arg) {
-    struct rtl8125 *c = arg;
+static bool rtl_resume(struct hal_device *d) {
+    struct rtl8125 *c = d->driver_data;
     hw_init(c);
     cfg_unlock(c);
     wr32(c, IDR0, c->nif.mac[0] | c->nif.mac[1] << 8 | c->nif.mac[2] << 16 | (uint32_t)c->nif.mac[3] << 24);
@@ -419,7 +424,6 @@ static bool rtl_resume(void *arg) {
     wr32(c, IMR_SET, INT_MASK);
     start_autoneg(c);
     net_rx_notify();
-    hal_restarted(&c->pci->hal, rtl8125_driver.name, back);
     return back;
 }
 
@@ -447,7 +451,7 @@ static enum irq_result rtl_irq(void *context) {
     uint32_t isr = rd32(c, ISR);
     bool ours = isr && isr != 0xFFFFFFFF;
     if (ours) {
-        /* The net thread drains the rings: interrupts stay off until poll_rx rearms them. */
+        /* The net thread drains the rings: interrupts stay off until poll rearms them. */
         wr32(c, IMR_CLEAR, 0xFFFFFFFF);
         wr32(c, ISR, isr);
         if (isr & INT_LINK) c->link_event = true;
@@ -458,12 +462,23 @@ static enum irq_result rtl_irq(void *context) {
     return ours ? IRQ_HANDLED : IRQ_NONE;
 }
 
-static bool rtl_rx_pending(struct netif *self) {
+static bool rtl_rx_pending(struct netif *self, unsigned queue) {
+    (void)queue;
     struct rtl8125 *c = (struct rtl8125 *)self;
     return c->rx_irq_pending || c->link_event || !(c->rx[c->rx_cur].opts1 & D_OWN);
 }
 
-static size_t rtl_poll_rx(struct netif *self, void (*input)(struct netif *, const void *, size_t)) {
+/* What the MAC verified of the frame: NET_RX_CSUM_OK for an IPv4 frame whose header and TCP or UDP
+   checksum are right. */
+static unsigned rx_checks(uint32_t opts1, uint32_t opts2) {
+    if (!(opts2 & RX_V4F) || (opts1 & RX_IPF)) return 0;
+    if ((opts1 & RX_TCPT) && !(opts1 & RX_TCPF)) return NET_RX_CSUM_OK;
+    if ((opts1 & RX_UDPT) && !(opts1 & RX_UDPF)) return NET_RX_CSUM_OK;
+    return 0;
+}
+
+static size_t rtl_poll(struct netif *self, unsigned queue, size_t budget, net_input_fn input) {
+    (void)queue;
     struct rtl8125 *c = (struct rtl8125 *)self;
     uint64_t flags = spin_lock(&c->rtl_lock);
     bool event = c->link_event;
@@ -472,11 +487,12 @@ static size_t rtl_poll_rx(struct netif *self, void (*input)(struct netif *, cons
     if (event || clock_now_ns() >= c->link_checked + LINK_LOOK) check_link(c);
     (void)rd8(c, INT_CFG0); /* a register read orders the descriptor writes the NIC posted before it */
     size_t consumed = 0;
-    while (consumed < NRX && !(c->rx[c->rx_cur].opts1 & D_OWN)) {
+    while (consumed < budget && !(c->rx[c->rx_cur].opts1 & D_OWN)) {
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        uint32_t o = c->rx[c->rx_cur].opts1;
+        uint32_t o = c->rx[c->rx_cur].opts1, o2 = c->rx[c->rx_cur].opts2;
         unsigned len = (o & RX_LEN) >= 4 ? (o & RX_LEN) - 4 : 0; /* without the FCS */
-        if (!(o & RX_RES) && (o & D_FS) && (o & D_LS) && len >= 14 && len <= BUFSZ) input(self, c->rxbuf[c->rx_cur], len);
+        if (!(o & RX_RES) && (o & D_FS) && (o & D_LS) && len >= 14 && len <= BUFSZ)
+            input(self, c->rxbuf[c->rx_cur], len, rx_checks(o, o2));
         c->rx[c->rx_cur].opts2 = 0;
         __atomic_thread_fence(__ATOMIC_RELEASE);
         c->rx[c->rx_cur].opts1 = D_OWN | (c->rx_cur == NRX - 1 ? D_EOR : 0) | BUFSZ;
@@ -497,75 +513,90 @@ static size_t rtl_poll_rx(struct netif *self, void (*input)(struct netif *, cons
     return consumed;
 }
 
-static int rtl_send(struct netif *self, const void *frame, size_t len) {
-    struct rtl8125 *c = (struct rtl8125 *)self;
-    if (len > FRAME_MAX - 4) return -N_ERR_INVALID;
-    while (c->tx_clean != c->tx_cur && !(c->tx[c->tx_clean].opts1 & D_OWN)) c->tx_clean = (c->tx_clean + 1) % NTX;
-    unsigned next = (c->tx_cur + 1) % NTX;
-    if (next == c->tx_clean) return -N_ERR_NOT_READY; /* local backpressure */
+/* One frame into the next descriptor, handed to the MAC. A frame longer than the MAC sends is dropped. */
+static void tx_post(struct rtl8125 *c, const struct net_tx_frame *frame) {
     uint8_t *b = c->txbuf[c->tx_cur];
-    memcpy(b, frame, len);
-    const uint8_t *f = frame;
-    /* The 8125A/B corrupt short IPv4 UDP frames unless they are padded (vendor erratum). */
-    size_t min = len >= 24 && f[12] == 0x08 && f[13] == 0x00 && f[23] == 17 ? UDP_PAD : 60;
+    size_t len = 0;
+    for (unsigned i = 0; i < frame->part_count; i++) {
+        memcpy(b + len, frame->parts[i].data, frame->parts[i].length);
+        len += frame->parts[i].length;
+    }
+    uint32_t opts2 = 0;
+    if (frame->offload & NET_TX_IP_CSUM) opts2 |= TX_IPV4CS;
+    if (frame->offload & NET_TX_TCP_CSUM) opts2 |= TX_TCPCS;
+    else if (frame->offload & NET_TX_UDP_CSUM) opts2 |= TX_UDPCS;
+    /* The 8125A/B corrupt a short IPv4 UDP frame unless it is padded, which the MAC's own checksum
+       does not need (Realtek's driver, re_8125_pad). */
+    size_t min = !(frame->offload & (NET_TX_TCP_CSUM | NET_TX_UDP_CSUM)) && len >= 24 && b[12] == 0x08 &&
+                         b[13] == 0x00 && b[23] == 17 ?
+                     UDP_PAD :
+                     60;
     if (len < min) {
         memset(b + len, 0, min - len);
         len = min;
     }
-    c->tx[c->tx_cur].opts2 = 0;
+    c->tx[c->tx_cur].opts2 = opts2;
     __atomic_thread_fence(__ATOMIC_RELEASE);
     c->tx[c->tx_cur].opts1 = D_OWN | D_FS | D_LS | (c->tx_cur == NTX - 1 ? D_EOR : 0) | (uint32_t)len;
-    c->tx_cur = next;
-    wr16(c, TPPOLL, 1); /* normal-priority queue 0 */
-    return 0;
+    c->tx_cur = (c->tx_cur + 1) % NTX;
+}
+
+static unsigned rtl_transmit(struct netif *self, unsigned queue, const struct net_tx_frame *frames, unsigned count) {
+    (void)queue;
+    struct rtl8125 *c = (struct rtl8125 *)self;
+    while (c->tx_clean != c->tx_cur && !(c->tx[c->tx_clean].opts1 & D_OWN)) c->tx_clean = (c->tx_clean + 1) % NTX;
+    unsigned taken = 0, posted = 0;
+    while (taken < count) {
+        if (frames[taken].length > FRAME_MAX - 4) { /* the MAC cannot send it: dropped */
+            taken++;
+            continue;
+        }
+        if ((c->tx_cur + 1) % NTX == c->tx_clean) break; /* no room: the rest waits for a completion */
+        tx_post(c, &frames[taken++]);
+        posted++;
+    }
+    if (posted) wr16(c, TPPOLL, 1); /* normal-priority queue 0: one doorbell for the batch */
+    return taken;
 }
 
 static bool valid_mac(const uint8_t *m) {
     return !(m[0] & 1) && (m[0] | m[1] | m[2] | m[3] | m[4] | m[5]);
 }
 
-static void free_dma(struct rtl8125 *c, uint64_t rx_ring, uint64_t tx_ring) {
-    for (size_t i = 0; i < NRX; i += BUFS_PER_PAGE)
-        if (c->rxbuf[i]) pmm_free(hhdm_virt_to_phys(c->rxbuf[i]));
-    for (size_t i = 0; i < NTX; i += BUFS_PER_PAGE)
-        if (c->txbuf[i]) pmm_free(hhdm_virt_to_phys(c->txbuf[i]));
-    if (rx_ring) pmm_free(rx_ring);
-    if (tx_ring) pmm_free(tx_ring);
-}
-
-static int rtl_attach(struct pci_device *d) {
+static int rtl_attach(struct hal_device *d) {
+    struct pci_device *pci = pci_device_of(d);
     struct rtl8125 *c = kzalloc(sizeof *c);
     if (!c) {
         kprintf("rtl8125: no memory for a device\n");
         return -N_ERR_NO_MEMORY;
     }
+    d->driver_data = c;
     int r = -N_ERR_UNSUPPORTED;
-    uint64_t base = 0, size = 0;
-    for (unsigned i = 0; i < 6 && !base; i++)
-        if ((base = pci_bar_address(d, i))) size = pci_bar_size(d, i);
-    if (!base) {
+    unsigned bar = 0;
+    while (bar < 6 && !hal_resource(d, N_HAL_MEMORY, bar)) bar++;
+    if (bar == 6) {
         kprintf("rtl8125: no memory register window\n");
         goto fail;
     }
-    uint8_t pm = pci_find_cap(d, 0x01);
+    uint8_t pm = pci_find_cap(pci, 0x01);
     if (pm) { /* the firmware may have left the function in a sleep state */
-        uint32_t pmcsr = pci_read32(d->address, pm + 4);
+        uint32_t pmcsr = pci_read32(pci->address, pm + 4);
         if (pmcsr & 3) {
-            pci_write32(d->address, pm + 4, pmcsr & ~3u);
+            pci_write32(pci->address, pm + 4, pmcsr & ~3u);
             clock_spin(10 * NS_PER_MS);
         }
     }
-    if (!(c->mmio = vmm_map_mmio(base, size && size < 0x10000 ? size : 0x10000))) {
+    if (!(c->mmio = hal_map(d, bar))) {
         r = -N_ERR_NO_MEMORY;
         goto fail;
     }
-    pci_enable_busmaster(d);
+    hal_enable(d, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA);
 
     uint32_t txcfg = rd32(c, TXCFG);
     c->macver = txcfg & 0xFCF00000;
     if (txcfg == 0xFFFFFFFF || (c->macver != 0x64000000 && c->macver != 0x64100000)) {
         kprintf("rtl8125: chip version %08x (rev %02x) not supported yet; only the RTL8125B is\n", txcfg,
-                pci_read32(d->address, 8) & 0xFF);
+                pci_read32(pci->address, 8) & 0xFF);
         goto fail;
     }
 
@@ -589,59 +620,64 @@ static int rtl_attach(struct pci_device *d) {
     wr16(c, IDR0 + 4, (uint16_t)(c->nif.mac[4] | c->nif.mac[5] << 8));
     cfg_lock(c);
 
+    /* the rings, then the buffers they point at: one block each, the buffers after one another */
+    uint64_t ring_bus, buffer_bus;
+    uint8_t *rings = hal_dma_alloc(d, 2 * PAGE_SIZE, 0, &ring_bus);
+    uint8_t *buffers = hal_dma_alloc(d, (NRX + NTX) * BUFSZ, 0, &buffer_bus);
+    if (!rings || !buffers) {
+        kprintf("rtl8125: DMA allocation failed\n");
+        r = -N_ERR_NO_MEMORY;
+        goto fail;
+    }
+    c->rx = (volatile struct desc *)rings;
+    c->tx = (volatile struct desc *)(rings + PAGE_SIZE);
+    c->rx_ring_bus = ring_bus;
+    c->tx_ring_bus = ring_bus + PAGE_SIZE;
+    for (size_t i = 0; i < NRX; i++) {
+        c->rxbuf[i] = buffers + i * BUFSZ;
+        c->rx[i].addr = buffer_bus + i * BUFSZ;
+    }
+    for (size_t i = 0; i < NTX; i++) {
+        c->txbuf[i] = buffers + (NRX + i) * BUFSZ;
+        c->tx[i].addr = buffer_bus + (NRX + i) * BUFSZ;
+    }
+
     /* a PCI Express function that interrupts has MSI or MSI-X (PCIe 6.0, 6.1.4); the chip's
        interrupt mask stays clear until the rings are set */
-    if (!pci_irq_enable(d, &(struct irq_spec){.name = "RTL8125", .handler = rtl_irq, .context = c, .node = d->node}, 1, NULL)) {
+    if (!hal_irq_enable(d, &(struct irq_spec){.name = "RTL8125", .handler = rtl_irq, .context = c, .node = d->node}, 1, NULL)) {
         kprintf("rtl8125: no interrupt message could be enabled\n");
         r = -N_ERR_IO;
         goto fail;
     }
-    uint64_t rx_ring = pmm_alloc_zeroed(), tx_ring = pmm_alloc_zeroed();
-    if (!rx_ring || !tx_ring) goto no_dma;
-    c->rx = phys_to_virt(rx_ring);
-    c->tx = phys_to_virt(tx_ring);
-    for (size_t i = 0; i < NRX; i += BUFS_PER_PAGE) {
-        uint64_t p = pmm_alloc();
-        if (!p) goto no_dma;
-        for (size_t k = 0; k < BUFS_PER_PAGE; k++) {
-            c->rxbuf[i + k] = (uint8_t *)phys_to_virt(p) + k * BUFSZ;
-            c->rx[i + k].addr = p + k * BUFSZ;
-        }
-    }
-    for (size_t i = 0; i < NTX; i += BUFS_PER_PAGE) {
-        uint64_t p = pmm_alloc();
-        if (!p) goto no_dma;
-        for (size_t k = 0; k < BUFS_PER_PAGE; k++) {
-            c->txbuf[i + k] = (uint8_t *)phys_to_virt(p) + k * BUFSZ;
-            c->tx[i + k].addr = p + k * BUFSZ;
-        }
-    }
-    c->rx_ring_phys = rx_ring;
-    c->tx_ring_phys = tx_ring;
     rings_start(c);
 
     c->nif.driver = "rtl8125";
-    c->nif.send = rtl_send;
+    c->nif.tx_queues = c->nif.rx_queues = 1;
+    c->nif.offloads = NET_OFFLOAD_CSUM_TX | NET_OFFLOAD_CSUM_RX;
+    c->nif.transmit = rtl_transmit;
     c->nif.rx_pending = rtl_rx_pending;
-    c->nif.poll_rx = rtl_poll_rx;
-    net_register(&c->nif);
-    c->pm = (struct pm_device){.name = "rtl8125", .stage = PM_STAGE_IO, .quiesce = rtl_quiesce, .resume = rtl_resume, .ctx = c};
-    pm_register(&c->pm);
+    c->nif.poll = rtl_poll;
+    net_register(d, &c->nif);
     wr32(c, ISR, 0xFFFFFFFF);
     wr32(c, IMR_SET, INT_MASK);
     start_autoneg(c);
     kprintf("net: rtl8125 (RTL8125B, %08x, PHY code %04x) mac %02x:%02x:%02x:%02x:%02x:%02x\n", txcfg, phy_code,
             c->nif.mac[0], c->nif.mac[1], c->nif.mac[2], c->nif.mac[3], c->nif.mac[4], c->nif.mac[5]);
     return 0;
-no_dma:
-    pci_irq_disable(d);
-    free_dma(c, rx_ring, tx_ring);
-    kprintf("rtl8125: DMA allocation failed\n");
-    r = -N_ERR_NO_MEMORY;
 fail:
+    hal_irq_disable(d); /* before the handler's memory goes */
+    d->driver_data = NULL;
     kfree(c);
     return r;
 }
 
-static const struct n_pci_match rtl_matches[] = {N_PCI_ID(0x10EC, 0x8125)};
-const struct pci_driver rtl8125_driver = {"rtl8125", rtl_matches, ARRAY_SIZE(rtl_matches), rtl_attach};
+static const struct n_hal_rule rtl_rules[] = {N_PCI_ID(0x10EC, 0x8125)};
+static const struct hal_driver rtl8125_driver = {
+    .name = "rtl8125",
+    .rules = rtl_rules,
+    .rule_count = ARRAY_SIZE(rtl_rules),
+    .attach = rtl_attach,
+    .quiesce = rtl_quiesce,
+    .resume = rtl_resume,
+};
+HAL_DRIVER(rtl8125_driver);

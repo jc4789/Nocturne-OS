@@ -82,7 +82,7 @@ int nvidia_dev_get_pci_info(const NvU8 *uuid, struct pci_dev **pci_dev_out, NvU6
 
 void nvrm_uvm_pci_info(struct nvrm_uvm_pci *out)
 {
-    const struct n_pci_function *f = &nvrm_dev.info;
+    const struct n_hal_pci_info *f = &nvrm_dev.info;
     memset(out, 0, sizeof *out);
     out->vendor = f->vendor;
     out->device = f->device;

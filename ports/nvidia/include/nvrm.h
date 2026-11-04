@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "abi.h"
+#include "hal_buses.h"
 /* libnvrm: an app's connection to nvrm, the NVIDIA resource manager (nvrm_protocol.h).
    Every call returns RM's NV_STATUS (NV_OK is 0; nvstatuscodes.h in the RM SDK), and
    NV_ERR_OPERATING_SYSTEM when the driver cannot be reached. Calls on one connection are
@@ -21,23 +22,22 @@ struct nvrm *nvrm_connect_ready(void);
    -N_ERR_NOT_READY when it answered but is not ready, or the failure to reach it
    (nvrm_connect_device_status). */
 int64_t nvrm_connect_ready_status(struct nvrm **out);
-/* Select a PCI function, encoded by N_PCI_TARGET. */
-struct nvrm *nvrm_connect_device(uint32_t pci_target);
+/* Select a device by its id in the ledger (struct n_hal_device). */
+struct nvrm *nvrm_connect_device(uint32_t device);
 /* 0 with *out set; otherwise a negative native N_ERR_* result. In particular,
    endpoint absence is not confused with OOM or an invalid protocol reply. */
-int64_t nvrm_connect_device_status(uint32_t pci_target, struct nvrm **out);
+int64_t nvrm_connect_device_status(uint32_t device, struct nvrm **out);
 /* Adapter state confirmed by this connection's HELLO snapshot. The daemon
    starts serving only after adapter initialization finishes. False includes a
    diagnostic-only daemon and old servers that do not explicitly report state. */
 bool nvrm_device_ready(const struct nvrm *rm);
-/* NVIDIA's display functions accepted by this RM port, per PCI class encoding: the functions the
+/* NVIDIA's display functions accepted by this RM port, as HAL rules (hal_buses.h): the devices the
    service manager starts nvrm for (user/apps/services.c) and the ones a client connects to. */
-static const struct n_pci_match nvrm_gpu_functions[] = {N_PCI_VENDOR_CLASS_PROGIF(0x10DE, 0x03, 0x00, 0x00),
-                                                        N_PCI_VENDOR_CLASS_PROGIF(0x10DE, 0x03, 0x02, 0x00)};
-static inline bool nvrm_pci_is_gpu(uint16_t vendor, uint8_t cls, uint8_t subcls, uint8_t progif) {
-    struct n_pciinfo function = {.cls = cls, .subcls = subcls, .progif = progif, .vendor = vendor};
-    for (size_t i = 0; i < sizeof nvrm_gpu_functions / sizeof *nvrm_gpu_functions; i++)
-        if (n_pci_matches(&nvrm_gpu_functions[i], &function)) return true;
+static const struct n_hal_rule nvrm_gpu_rules[] = {N_PCI_VENDOR_CLASS_PROGIF(0x10DE, 0x03, 0x00, 0x00),
+                                                   N_PCI_VENDOR_CLASS_PROGIF(0x10DE, 0x03, 0x02, 0x00)};
+static inline bool nvrm_is_gpu(const struct n_hal_device *device) {
+    for (size_t i = 0; i < sizeof nvrm_gpu_rules / sizeof *nvrm_gpu_rules; i++)
+        if (n_hal_device_rule_score(device, &nvrm_gpu_rules[i])) return true;
     return false;
 }
 void nvrm_disconnect(struct nvrm *rm);
