@@ -222,7 +222,7 @@ struct interrupter {
     uint64_t erst_phys, erst_bus;
     unsigned ev_idx;
     uint32_t ev_cycle;
-    struct irq *irq;     /* its MSI or MSI-X message, NULL when polled */
+    struct irq *irq;     /* its MSI or MSI-X message, or the INTx line; NULL when polled */
     uint32_t interrupts; /* under lock */
 };
 
@@ -250,6 +250,7 @@ struct usb_hc {
     uint8_t target[RING_KINDS]; /* the interrupter each kind of event goes to */
     bool running; /* atomic; written under every interrupter's lock (hc_set_running), or by resume, where no drain runs */
     bool polled;  /* atomic: no interrupt comes, the poll alarm drains the rings */
+    bool messages; /* the interrupters raise MSI or MSI-X messages, not the INTx pin; set before running */
     struct alarm poll;
     uint32_t periodic[16]; /* open interrupt endpoints by service interval exponent (atomic) */
     /* the worker: kicks counts the notes of work (wq_wait_unless), the rest is the worker's but
@@ -661,19 +662,30 @@ static void drain(struct interrupter *ir, uint64_t at, bool in_interrupt) {
     if (any || in_interrupt) wr64(ir->regs, ERDP, (ir->ev_bus + ir->ev_idx * sizeof(struct trb)) | ERDP_EHB);
 }
 
-/* An interrupter's message, on the CPU its irq is delivered to. */
+/* The INTx pin's assertion is the interrupter's when it may interrupt and has one pending (IMAN,
+   5.5.2.1); the line may be another function's too. Then EINT is cleared, before IP (5.4.2), and
+   clearing IP deasserts the pin (4.17.3). Otherwise nothing is written. ir->lock held. */
+static bool pin_take(struct interrupter *ir) {
+    uint32_t iman = rd32(ir->regs, IMAN);
+    if (iman == 0xFFFFFFFFu || (iman & (IMAN_IP | IMAN_IE)) != (IMAN_IP | IMAN_IE)) return false;
+    wr32(ir->hc->op, USBSTS, STS_EINT);
+    wr32(ir->regs, IMAN, iman); /* IP written 1 clears it; IE and RsvdP kept */
+    return true;
+}
+
+/* An interrupter's interrupt, on the CPU its irq is delivered to. A message is always its own, and
+   its IP cleared itself as it was sent (4.17.5): nothing to acknowledge but the ring (drain). */
 static enum irq_result xhci_isr(void *context) {
     struct interrupter *ir = context;
     uint64_t at = clock_now_ns();
     spin_take(&ir->lock);
-    if (hc_running(ir->hc)) {
-        wr32(ir->hc->op, USBSTS, STS_EINT);
-        wr32(ir->regs, IMAN, IMAN_IP | IMAN_IE);
+    bool ours = hc_running(ir->hc) && (ir->hc->messages || pin_take(ir));
+    if (ours) {
         ir->interrupts++;
         drain(ir, at, true);
     }
     spin_give(&ir->lock);
-    return IRQ_HANDLED;
+    return ours ? IRQ_HANDLED : IRQ_NONE;
 }
 
 /* A polled controller's rings looked at: as often as its fastest interrupt endpoint completes,
@@ -2141,6 +2153,7 @@ static bool interrupters_init(struct usb_hc *hc) {
     hc->nintr = got ? got : 1;
     __atomic_store_n(&hc->polled, !got, __ATOMIC_RELEASE);
     for (unsigned i = 0; i < got; i++) intr[i].irq = irqs[i];
+    hc->messages = got && irqs[0] != hc->pci->intx;
     for (unsigned i = hc->nintr; i < want; i++) interrupter_free(&intr[i]);
     hc->target[RING_CONTROL] = 0;
     hc->target[RING_PERIODIC] = hc->nintr > 1 ? 1 : 0;
@@ -2294,7 +2307,7 @@ static bool hc_start(struct usb_hc *hc) {
     polled = __atomic_load_n(&hc->polled, __ATOMIC_ACQUIRE);
     kprintf("usb: xHCI %d (%04x:%04x) version %x, %u ports, %u slots, %u interrupter%s of %u, %s\n", hc->index,
             pci->vendor, pci->device, rd32(hc->cap, 0) >> 16, hc->max_ports, hc->max_slots, hc->nintr,
-            hc->nintr > 1 ? "s" : "", hc->max_intrs, polled ? "polled" : pci->intx ? "INTx" : pci->msi_count ? "MSI" : "MSI-X");
+            hc->nintr > 1 ? "s" : "", hc->max_intrs, polled ? "polled" : !hc->messages ? "INTx" : pci->msi_count ? "MSI" : "MSI-X");
     for (unsigned i = 0; i < hc->nintr && !polled; i++) {
         struct irq_target to = irq_target(hc->intr[i].irq);
         kprintf("usb: controller %d interrupter %u (%s) on cpu %u vector 0x%x\n", hc->index, i,

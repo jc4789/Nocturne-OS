@@ -454,23 +454,35 @@ static void acpi_worker(void *arg) {
    A _PRT entry that names a link device is wired to the link's resource descriptor number Source
    Index: one of its interrupt descriptors, a line here. Each link is read once, at AML init (or
    when a _PRT names one without the PNP0C0F ID): a line whose _CRS holds one interrupt that _PRS
-   lists keeps it. A link with a line without one is routed when a function first needs it: each
-   such line takes, from its _PRS descriptor (the first of dependent alternatives), an interrupt
-   the IOAPICs take with that descriptor's signal, the one the fewest lines are on already, and
-   only an empty one when either side is exclusive. An ISA IRQ only where the firmware itself put
-   a link or the SCI: an ISA device on the others is edge-triggered and need not be in the
-   namespace. _SRS gets the link's _CRS with every line's interrupt in it (6.2.16: the same
-   descriptors in the same order; 6.4.3.6: an Extended Interrupt one with one interrupt), and
-   gets it again after a sleep, before any function's interrupt can come; a link never routed is
-   disabled then (_DIS, 6.2.3), as no function uses it.
+   lists keeps it, with the _CRS descriptor's signal. A link with a line without one is routed
+   when a function first needs it: each such line takes, from its _PRS descriptor (the first of
+   dependent alternatives), an interrupt the IOAPICs take with that descriptor's signal, the one
+   the fewest lines are on already. Lines on one GSI all share it with one trigger and polarity:
+   the IOAPIC takes a pin's signal from whichever source names it first until it is routed
+   (arch/ioapic.h), so a line of another signal would change the pin under the lines already on
+   it. An ISA IRQ only where the firmware itself put a link or the SCI: an ISA device on the
+   others is edge-triggered and need not be in the namespace. _SRS gets the link's _CRS with every
+   line's interrupt and signal in it (6.2.16: the same descriptors in the same order and length;
+   6.4.2.1 and 6.4.3.6: the flags set the signal too, an Extended Interrupt descriptor holds one
+   interrupt). An IRQ descriptor without its information byte (IRQNoFlags) means edge, active
+   high, exclusive, and must keep that form: a line whose _PRS descriptor signals otherwise is not
+   routed. The link gets its _SRS again after a sleep, before any function's interrupt can come;
+   a link never routed is disabled then (_DIS, 6.2.3), as no function uses it.
    links_mutex orders reading and routing. acpi_links_restore reads without it, nothing else
    running then: the list and each setting are published whole. */
+/* The form of a line's _CRS descriptor, which _SRS keeps (6.2.16). */
+enum line_form {
+    LINE_IRQ_NO_FLAGS, /* IRQ descriptor of length 2: edge, active high, exclusive (6.4.2.1) */
+    LINE_IRQ,          /* IRQ descriptor with its information byte */
+    LINE_EXTENDED,     /* Extended Interrupt descriptor (6.4.3.6) */
+};
+
 struct link_line {
     uint32_t index;  /* its place among the link's resource descriptors: the _PRT's Source Index */
     uint32_t number; /* as its descriptor holds it, an ISA IRQ (IRQ) or a GSI (Extended Interrupt); 0: none */
     uint32_t gsi;
-    bool extended; /* the form of the _CRS descriptor, which _SRS keeps */
-    struct gsi_signal signal;
+    enum line_form form;
+    struct gsi_signal signal; /* what both the IOAPIC and the link's _SRS are told */
 };
 
 struct link {
@@ -509,7 +521,24 @@ static struct gsi_signal interrupt_signal(const uacpi_resource *r) {
                                .shared = sharing == UACPI_SHARED};
 }
 
-static uint32_t line_gsi(bool extended, uint32_t number) { return extended ? number : ioapic_isa_gsi(number); }
+static enum line_form line_form_of(const uacpi_resource *r) {
+    if (r->type == UACPI_RESOURCE_TYPE_EXTENDED_IRQ) return LINE_EXTENDED;
+    return r->irq.length_kind == UACPI_RESOURCE_LENGTH_KIND_ONE_LESS ? LINE_IRQ_NO_FLAGS : LINE_IRQ;
+}
+
+/* Whether a descriptor of that form can set signal: an IRQNoFlags one only the signal it means. */
+static bool form_carries(enum line_form form, struct gsi_signal signal) {
+    switch (form) {
+    case LINE_IRQ_NO_FLAGS: return !signal.level && !signal.active_low && !signal.shared;
+    case LINE_IRQ:
+    case LINE_EXTENDED: return true;
+    }
+    return false;
+}
+
+static uint32_t line_gsi(enum line_form form, uint32_t number) {
+    return form == LINE_EXTENDED ? number : ioapic_isa_gsi(number);
+}
 
 /* The lines of a _CRS in order: counted when link is NULL, else read into it. _CRS holding more
    than one interrupt in a descriptor holds none (firmware reports its _PRS so when unrouted). */
@@ -527,7 +556,7 @@ static uacpi_iteration_decision line_read(void *user, uacpi_resource *r) {
         struct link_line *line = &w->link->line[w->lines];
         *line = (struct link_line){.index = at,
                                    .number = interrupt_count(r) == 1 ? interrupt_number(r, 0) : 0,
-                                   .extended = r->type == UACPI_RESOURCE_TYPE_EXTENDED_IRQ,
+                                   .form = line_form_of(r),
                                    .signal = interrupt_signal(r)};
     }
     w->lines++;
@@ -589,7 +618,7 @@ static struct link *link_read(uacpi_namespace_node *node) {
     for (unsigned i = 0; i < l->nlines; i++) {
         struct link_line *line = &l->line[i];
         if (prs && !possible_lists(possible_line(prs, i), line->number)) line->number = 0;
-        if (line->number) line->gsi = line_gsi(line->extended, line->number);
+        if (line->number) line->gsi = line_gsi(line->form, line->number);
         if (line->number && line->number < 16) pci_isa_irqs |= 1u << line->number;
         every &= line->number != 0;
     }
@@ -625,50 +654,55 @@ static struct link *link_of(uacpi_namespace_node *node) {
     return link_read(node);
 }
 
-/* The lines on gsi, and whether one of them holds it alone. links_mutex held. */
-static unsigned gsi_lines(uint32_t gsi, bool *exclusive) {
+/* How many lines are on gsi already, or UINT32_MAX when a line of signal cannot join them: one
+   of them or it holds the GSI alone, or one of them has another trigger or polarity. links_mutex
+   held. */
+static unsigned gsi_lines(uint32_t gsi, struct gsi_signal signal) {
     unsigned on = 0;
-    *exclusive = false;
     for (struct link *l = links; l; l = l->next)
         for (unsigned i = 0; i < l->nlines; i++) {
             const struct link_line *line = &l->line[i];
             if (!line->number || line->gsi != gsi) continue;
+            if (!line->signal.shared || !signal.shared || line->signal.level != signal.level ||
+                line->signal.active_low != signal.active_low)
+                return UINT32_MAX;
             on++;
-            *exclusive |= !line->signal.shared;
         }
     return on;
 }
 
-/* Line i of l, which has no interrupt, given the best its _PRS descriptor lists in the form of
-   its _CRS one; false when none will do. links_mutex held. */
+/* Line i of l, which has no interrupt, given the best its _PRS descriptor lists, with that
+   descriptor's signal, which the form of its _CRS descriptor must carry; false when none will do.
+   links_mutex held. */
 static bool line_choose(struct link *l, unsigned i, uacpi_resources *prs) {
     struct link_line *line = &l->line[i];
     const uacpi_resource *r = possible_line(prs, i);
-    if (!r || (r->type == UACPI_RESOURCE_TYPE_EXTENDED_IRQ) != line->extended) return false;
+    if (!r || (line_form_of(r) == LINE_EXTENDED) != (line->form == LINE_EXTENDED)) return false;
     struct gsi_signal signal = interrupt_signal(r);
+    if (!form_carries(line->form, signal)) return false;
     uint32_t best = 0;
     unsigned best_on = UINT32_MAX;
     for (unsigned c = 0; c < interrupt_count(r); c++) {
-        uint32_t number = interrupt_number(r, c), gsi = line_gsi(line->extended, number);
-        bool exclusive;
+        uint32_t number = interrupt_number(r, c), gsi = line_gsi(line->form, number);
         if (!number || (number < 16 && !(pci_isa_irqs & 1u << number))) continue;
-        unsigned on = gsi_lines(gsi, &exclusive);
-        if (exclusive || (on && !signal.shared) || on >= best_on || !ioapic_gsi_takes(gsi, signal)) continue;
+        unsigned on = gsi_lines(gsi, signal);
+        if (on >= best_on || !ioapic_gsi_takes(gsi, signal)) continue;
         best = number;
         best_on = on;
     }
     if (!best) return false;
     *line = (struct link_line){.index = line->index,
                                .number = best,
-                               .gsi = line_gsi(line->extended, best),
-                               .extended = line->extended,
+                               .gsi = line_gsi(line->form, best),
+                               .form = line->form,
                                .signal = signal};
     return true;
 }
 
-/* Every line's interrupt into the descriptors of a _CRS. An IRQ descriptor whose mask was empty
-   has room for one IRQ only if uACPI's alignment left it; an Extended Interrupt one always has
-   one (6.4.3.6). */
+/* Every line's interrupt and signal into the descriptors of a _CRS, each keeping its form (an
+   IRQNoFlags one gets only the signal it means, line_choose). An IRQ descriptor whose mask was
+   empty has room for one IRQ only if uACPI's alignment left it; an Extended Interrupt one always
+   has one (6.4.3.6). */
 struct template_walk {
     const struct link *link;
     uint32_t at;
@@ -685,9 +719,15 @@ static uacpi_iteration_decision template_put(void *user, uacpi_resource *r) {
     else if (r->type == UACPI_RESOURCE_TYPE_IRQ && r->length > __builtin_offsetof(uacpi_resource, irq.irqs)) {
         r->irq.irqs[0] = (uint8_t)line->number;
         r->irq.num_irqs = 1;
+        r->irq.triggering = line->signal.level ? UACPI_TRIGGERING_LEVEL : UACPI_TRIGGERING_EDGE;
+        r->irq.polarity = line->signal.active_low ? UACPI_POLARITY_ACTIVE_LOW : UACPI_POLARITY_ACTIVE_HIGH;
+        r->irq.sharing = line->signal.shared ? UACPI_SHARED : UACPI_EXCLUSIVE;
     } else if (r->type == UACPI_RESOURCE_TYPE_EXTENDED_IRQ && r->extended_irq.num_irqs) {
         r->extended_irq.irqs[0] = line->number;
         r->extended_irq.num_irqs = 1;
+        r->extended_irq.triggering = line->signal.level ? UACPI_TRIGGERING_LEVEL : UACPI_TRIGGERING_EDGE;
+        r->extended_irq.polarity = line->signal.active_low ? UACPI_POLARITY_ACTIVE_LOW : UACPI_POLARITY_ACTIVE_HIGH;
+        r->extended_irq.sharing = line->signal.shared ? UACPI_SHARED : UACPI_EXCLUSIVE;
     } else {
         w->ok = false;
     }
