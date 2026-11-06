@@ -22,7 +22,6 @@ section .text
 %define TD_FLAGS   (TRAMP_DATA + 100)
 %define TD_TABLE   (TRAMP_DATA + 104)
 %define TDF_ANY    1            ; the one CPU coming in takes the block's stack and arg
-%define TDF_X2APIC 2            ; the rows name x2APIC IDs, else xAPIC IDs (apic_x2)
 %define ROW_STACK  0            ; struct wake_cpu
 %define ROW_ARG    8
 %define ROW_ID     16
@@ -68,19 +67,33 @@ tramp_lm64:                     ; rbx: the page (a hibernation's last copy enter
     mov ebx, ebx
     test dword [rbx + TD_FLAGS], TDF_ANY
     jnz .any
-    ; The APIC ID from CPUID, in either mode and whether or not the APIC is enabled: in x2APIC mode
-    ; the 32-bit x2APIC ID, CPUID 0Bh EDX (SDM 13.12.8.1); in xAPIC mode the 8-bit initial APIC ID,
-    ; CPUID 01h EBX[31:24] (SDM 13.4.6, APM 16.3.3), the low 8 bits of the x2APIC ID (13.12.8.1).
-    ; A CPU with no row (a STARTUP that was not its own) goes no further.
+    ; This CPU's APIC ID (SDM vol. 3A 11.4.5, APM vol. 2 16.12). In x2APIC mode (IA32_APIC_BASE
+    ; EXTD, bit 10) the x2APIC ID register, MSR 802h. Otherwise CPUID Fn0000_000B EDX, the full ID in
+    ; any APIC mode, where the function is there (Fn0000_0000 EAX at least 0Bh and its level 0 not
+    ; empty, EBX[15:0], SDM 11.4.5 and APM vol. 3 E.3.8); else the initial APIC ID, CPUID 01h
+    ; EBX[31:24] (SDM 11.4.5, APM 16.3.3). A CPU with no row (a STARTUP that was not its own) goes
+    ; no further.
     mov r8, rbx                 ; CPUID writes rbx
-    test dword [rbx + TD_FLAGS], TDF_X2APIC
-    jz .xapic
+    mov ecx, 0x1B
+    rdmsr
+    bt eax, 10
+    jnc .no_x2
+    mov ecx, 0x802
+    rdmsr
+    jmp .id
+.no_x2:
+    xor eax, eax
+    cpuid
+    cmp eax, 0xB
+    jb .initial
     mov eax, 0xB
     xor ecx, ecx
     cpuid
+    test ebx, 0xFFFF
+    jz .initial
     mov eax, edx
     jmp .id
-.xapic:
+.initial:
     mov eax, 1
     cpuid
     mov eax, ebx

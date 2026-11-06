@@ -3,7 +3,6 @@
    first 2 MiB one to one and whose upper half is the kernel's, so that the jump into the kernel
    works before the kernel's own CR3 is loaded. */
 #include "kernel.h"
-#include "arch/apic.h"
 #include "arch/cpu.h"
 #include "arch/fpu.h"
 #include "arch/wake.h"
@@ -31,7 +30,6 @@ struct tramp_data {
     uint64_t table;       /* 104: struct wake_cpu[count] */
 } PACKED;
 #define TDF_ANY 1u
-#define TDF_X2APIC 2u
 _Static_assert(__builtin_offsetof(struct tramp_data, far32) == 40, "wake.asm TD_FAR32");
 _Static_assert(__builtin_offsetof(struct tramp_data, cr3) == 56, "wake.asm TD_CR3");
 _Static_assert(__builtin_offsetof(struct tramp_data, arg) == 88, "wake.asm TD_ARG");
@@ -110,7 +108,7 @@ void wake_prepare_cpus(uint64_t entry, const struct wake_cpu *table, uint32_t co
     struct tramp_data *d = wake_fill(entry);
     d->table = (uint64_t)(uintptr_t)table;
     d->count = count;
-    d->flags = apic_x2() ? TDF_X2APIC : 0;
+    d->flags = 0;
     wake_publish();
 }
 

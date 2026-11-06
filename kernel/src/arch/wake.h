@@ -17,8 +17,8 @@ uint64_t wake_page(void);  /* its physical address: the FACS waking vector, the 
    they are given.
    wake_prepare_cpus: the APs that STARTUPs are sent to after their INITs and this call
    (arch/smp.c), each its row of table (count rows, in the kernel's memory, kept until they are
-   through), found by its APIC ID in the APICs' mode as the call finds it (apic_x2). A CPU a STARTUP reached with no
-   row stops in the page, halted with interrupts off, until an INIT. */
+   through), found by its APIC ID as its own APIC states it (the x2APIC ID register in x2APIC mode,
+   else CPUID: SDM vol. 3A 11.4.5, APM vol. 2 16.12). A CPU a STARTUP reached with no row stops in the page, halted with interrupts off, until an INIT. */
 struct wake_cpu {
     uint64_t stack, arg;
     uint32_t apic_id, pad;
