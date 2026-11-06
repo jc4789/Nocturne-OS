@@ -31,6 +31,31 @@ extern const struct hal_claim_ops hal_claim_plain;
 
 static struct acpi_device *of(struct hal_device *d) { return (struct acpi_device *)d; }
 
+/* _CRS の GSI を順に count まで。信号は _CRS のとおり（MADT が書いた pin は MADT のとおり、arch/ioapic.h）。
+   Exclusive の GSI（ACPI 6.5 6.4.2.1、6.4.3.6）は誰とも線を分けない。一つでも立たなければ、そこで止める。 */
+static unsigned acpi_irq_enable(struct hal_device *d, const struct irq_spec *specs, unsigned count, struct irq **irqs) {
+    struct acpi_device *a = of(d);
+    unsigned most = MIN(count, a->gsi_slots);
+    if (!most || a->irqs) return 0;
+    if (!(a->irqs = kzalloc(most * sizeof *a->irqs))) return 0;
+    unsigned got = 0;
+    for (; got < most; got++) {
+        const struct n_hal_resource *r = hal_resource(d, N_HAL_GSI, got);
+        if (!ioapic_gsi_signal((uint32_t)r->base, r->flags & N_HAL_GSI_LEVEL, r->flags & N_HAL_GSI_ACTIVE_LOW)) break;
+        struct irq_spec spec = specs[got];
+        spec.alone |= !(r->flags & N_HAL_GSI_SHARED);
+        struct irq *irq = irq_request_gsi(&spec, (unsigned)r->base);
+        if (!irq) break;
+        a->irqs[got] = irq;
+        if (irqs) irqs[got] = irq;
+    }
+    a->irq_count = got;
+    if (!got) {
+        kfree(a->irqs);
+        a->irqs = NULL;
+    }
+    return got;
+}
 
 static bool acpi_irq_disable(struct hal_device *d) {
     struct acpi_device *a = of(d);
@@ -54,9 +79,10 @@ static void add_ports(struct acpi_device *a, uint64_t base, uint64_t size) {
     if (size) hal_resource_add(&a->hal, N_HAL_PORT, a->port_slots++, 0, base, size);
 }
 
-static void add_gsi(struct acpi_device *a, uint32_t gsi, uint8_t triggering, uint8_t polarity) {
+static void add_gsi(struct acpi_device *a, uint32_t gsi, uint8_t triggering, uint8_t polarity, uint8_t sharing) {
     uint32_t flags = (triggering == UACPI_TRIGGERING_LEVEL ? N_HAL_GSI_LEVEL : 0) |
-                     (polarity == UACPI_POLARITY_ACTIVE_LOW ? N_HAL_GSI_ACTIVE_LOW : 0);
+                     (polarity == UACPI_POLARITY_ACTIVE_LOW ? N_HAL_GSI_ACTIVE_LOW : 0) |
+                     (sharing == UACPI_SHARED ? N_HAL_GSI_SHARED : 0);
     hal_resource_add(&a->hal, N_HAL_GSI, a->gsi_slots++, flags, gsi, 1);
 }
 
@@ -73,11 +99,15 @@ static uacpi_iteration_decision found_resource(void *user, uacpi_resource *r) {
     struct acpi_device *a = user;
     switch (r->type) {
     case UACPI_RESOURCE_TYPE_IRQ:
-        for (unsigned i = 0; i < r->irq.num_irqs; i++) add_gsi(a, ioapic_isa_gsi(r->irq.irqs[i]), r->irq.triggering, r->irq.polarity);
+        for (unsigned i = 0; i < r->irq.num_irqs; i++)
+            add_gsi(a, ioapic_isa_gsi(r->irq.irqs[i]), r->irq.triggering, r->irq.polarity, r->irq.sharing);
         break;
     case UACPI_RESOURCE_TYPE_EXTENDED_IRQ:
+        /* with a ResourceSource the numbers are that device's interrupts, not GSIs (6.4.3.6) */
+        if (r->extended_irq.source.length) break;
         for (unsigned i = 0; i < r->extended_irq.num_irqs; i++)
-            add_gsi(a, r->extended_irq.irqs[i], r->extended_irq.triggering, r->extended_irq.polarity);
+            add_gsi(a, r->extended_irq.irqs[i], r->extended_irq.triggering, r->extended_irq.polarity,
+                    r->extended_irq.sharing);
         break;
     case UACPI_RESOURCE_TYPE_IO: add_ports(a, r->io.minimum, r->io.length); break;
     case UACPI_RESOURCE_TYPE_FIXED_IO: add_ports(a, r->fixed_io.address, r->fixed_io.length); break;

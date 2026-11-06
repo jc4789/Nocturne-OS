@@ -1482,7 +1482,7 @@ static int start(struct hba *h) {
     h->nslots = (cap >> 8 & 0x1F) + 1;
     for (uint32_t m = h->implemented; m; m &= m - 1) port_add(h, (unsigned)__builtin_ctz(m));
     hba_wr(h, GHC, hba_rd(h, GHC) & ~GHC_IE); /* until PxIS and IS are clear */
-    hal_irq_enable(h->hal, &(struct irq_spec){.name = "AHCI", .handler = ahci_isr, .context = h, .node = h->hal->node}, 1,
+    hal_irq_enable(h->hal, &(struct irq_spec){.name = "AHCI", .handler = ahci_isr, .context = h}, 1,
                    &h->irq);
     kprintf("ahci%d: %04x:%04x, version %x, ports %x, %u slots%s, %s\n", h->index, pci->vendor, pci->device,
             hba_rd(h, VS), h->implemented, h->nslots, h->sncq ? ", queued commands" : "", h->irq ? "interrupts" : "polled");

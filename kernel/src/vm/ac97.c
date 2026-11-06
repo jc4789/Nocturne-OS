@@ -306,7 +306,7 @@ static int ac97_attach(struct hal_device *d) {
     hw_init(c);
     c->hw_ready = true;
     alarm_init(&c->refill, ac97_refill);
-    c->has_irq = hal_irq_enable(d, &(struct irq_spec){.name = "AC'97", .handler = ac97_irq, .context = c, .node = -1}, 1, NULL) == 1;
+    c->has_irq = hal_irq_enable(d, &(struct irq_spec){.name = "AC'97", .handler = ac97_irq, .context = c}, 1, NULL) == 1;
     c->output.ops = &ac97_ops;
     static const uint32_t rates[] = {RATE};
     static const struct n_audio_size sizes[] = {{16, FRAME / 2}};

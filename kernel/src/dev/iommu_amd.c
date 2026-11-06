@@ -3,15 +3,18 @@
    IVRS table that describes the units.
    One device table (64K entries of 32 bytes) serves every unit; each unit reads only the
    entries of the functions behind it, and commands go to all of them. An entry left zero lets
-   a function through: DMA untranslated, interrupts as sent. A claimed function's group has
-   entries pointing at its domain's page tables and at an interrupt remapping table of the
-   claim's own whose entries are the claim's vectors; once blocked they let nothing through. The
-   IOAPICs, the HPET and the kernel's devices keep zero entries, so their interrupts never depend
-   on the units. The units cannot block system management interrupts by device table entry (only
-   their SMI filter can, which is the firmware's and stays as it set it): a claimed device that
-   sends an SMI message the filter lets through reaches the firmware's handler as on a machine
-   without an IOMMU. */
+   a function through: DMA untranslated, interrupts as sent. A kernel function with messages has
+   an entry that leaves its DMA so (V 0) and remaps its interrupts (IV 1, Table 9) through a table
+   of its requester IDs' (2048 entries, the most IntTabLen gives), shared by every function whose
+   requests arrive with one of those IDs. A claimed function's group has entries pointing at its
+   domain's page tables and at the claim's own table; once blocked they let nothing through. The
+   IOAPICs, the HPET and the units' own functions keep zero entries: their interrupts go plain, an
+   8-bit destination. The units cannot block system management interrupts by device table entry
+   (only their SMI filter can, which is the firmware's and stays as it set it): a claimed device
+   that sends an SMI message the filter lets through reaches the firmware's handler as on a
+   machine without an IOMMU. */
 #include "kernel.h"
+#include "arch/apic.h"
 #include "arch/cpu.h"
 #include "arch/irq.h"
 #include "arch/spin.h"
@@ -87,6 +90,8 @@
 #define RING_BYTES 4096           /* command buffer and event log: 256 entries of 16 bytes */
 #define RING_LEN   (8ull << 56)   /* log2 of their entry count */
 #define DT_BYTES   (65536 * 32)
+#define IRT_LOG2   11             /* IntTabLen's largest: 2048 entries (Table 9) */
+#define IRTE_BYTES 16             /* the 128-bit entry of GAEn (Figure 19) */
 /* Every blocked entry's DomainID: iommu.c keeps ID 1 for the back end. Entries that share an ID
    must agree on Mode and root (Table 7), and a released claim's ID is soon another's. */
 #define BLOCK_DOMAIN 1
@@ -162,13 +167,13 @@ struct unit {
 static struct unit *units;
 static size_t nunits, units_room;
 static bool np_cache; /* a unit caches not-present entries */
-/* The CPUs are in x2APIC mode (arch/apic.c): every unit has XTEn and GAEn (2.2.5.3), which
-   select the 128-bit remapping entry with its 32-bit destination, all units using one entry size
-   (2.2.5.2). */
+/* Every unit has GAEn, which selects the 128-bit remapping entry with its 32-bit destination, all
+   units using one entry size (2.2.5.2), and XTEn where the CPUs are in x2APIC mode (2.2.5.3,
+   apic_x2). */
 /* The device tables, one for each segment a unit serves, an ID being unique within its segment (and
    every unit of a segment shares its table), and the completion words. A device table entry belongs
    to the domain of its ID, whose attach and block the common part's attach_mutex orders; an interrupt
-   remapping entry changes in one store (irte_store). What a unit reads of them is invalidated by its
+   remapping entry changes in one store (iommu_entry_write16). What a unit reads of them is invalidated by its
    own batch. */
 struct device_table {
     uint16_t segment;
@@ -176,6 +181,16 @@ struct device_table {
 };
 static struct device_table *device_tables;
 static size_t ndevice_tables, device_tables_room;
+/* The kernel functions' remapping tables, each with the requester IDs whose entries point at it.
+   The list and the IDs under kernel_irts_lock, a leaf; a table is never freed. */
+struct kernel_irt {
+    struct iommu_irt t;
+    struct iommu_id *ids;
+    size_t nids, room;
+    struct kernel_irt *next;
+};
+static struct kernel_irt *kernel_irts;
+static struct spinlock kernel_irts_lock;
 static uint64_t sems;
 static size_t sem_pages;
 
@@ -669,24 +684,36 @@ static void block_flush(struct unit *u, const void *arg) {
     entry_flush(u, arg);
     pages_flush(u, arg);
 }
-static void irt_flush(struct unit *u, const void *arg) {
-    const struct iommu_domain *dom = arg;
-    for (unsigned i = 0; i < dom->nids; i++)
-        if (dom->ids[i].segment == u->segment) command(u, CMD_INV_IRT, dom->ids[i].requester, 0, 0, 0);
+/* The remapping entries and device table entries of a list of IDs. */
+struct id_list {
+    const struct iommu_id *ids;
+    unsigned n;
+    bool devtab;
+};
+static void ids_flush(struct unit *u, const void *arg) {
+    const struct id_list *l = arg;
+    for (unsigned i = 0; i < l->n; i++) {
+        if (l->ids[i].segment != u->segment) continue;
+        if (l->devtab) command(u, CMD_INV_DEVTAB, l->ids[i].requester, 0, 0, 0);
+        command(u, CMD_INV_IRT, l->ids[i].requester, 0, 0, 0);
+    }
 }
 
+static void kernel_irts_leave(const struct iommu_domain *dom);
+
+/* The group's IDs leave the kernel's tables: their entries are the claim's from here on. */
 static bool amd_attach(struct iommu_domain *dom) {
-    if (!(dom->irt = iommu_alloc_pages(1))) {
+    if (!iommu_irt_make(&dom->irt, 1u << IRT_LOG2, IRTE_BYTES)) {
         kprintf("iommu: no memory for an interrupt remapping table\n");
         return false;
     }
-    if (!amd.coherent) iommu_cache_flush(phys_to_virt(dom->irt), PAGE_SIZE);
     /* nothing the firmware cached under this id is used */
     if (!on_every_unit(pages_flush, dom)) return false;
     dom->written = true;
+    kernel_irts_leave(dom);
     for (unsigned i = 0; i < dom->nids; i++)
         dte_write(dom->ids[i], DTE_V | DTE_TV | DTE_MODE(dom->levels) | dom->root | DTE_IR | DTE_IW, dom->id,
-                  DTE_IV | DTE_IRT_LEN(IRT_LOG2) | dom->irt | DTE_INT_REMAP);
+                  DTE_IV | DTE_IRT_LEN(IRT_LOG2) | dom->irt.phys | DTE_INT_REMAP);
     return on_every_unit(entry_flush, dom);
 }
 
@@ -723,22 +750,135 @@ static struct iommu_id amd_alias(struct iommu_id id) {
 }
 
 /* ---- interrupts ----
-   A claimed function's message carries its remapping table index in data bits 10:0 and no
-   destination: entry n is message n, fixed delivery to a physical APIC id. The entries are the
-   128-bit format with GuestMode 0 (Figure 19), whose destination has 32 bits: the CPUs are in
-   x2APIC mode, which makes the units take that format (XTEn, GAEn: program). The table is
-   cached: every change is invalidated (2.3.2). */
+   A remapped message carries its remapping table index in data bits 10:0 (2.2.5.1) and no
+   destination: fixed delivery to a physical APIC id, the entry the 128-bit format with GuestMode 0
+   (Figure 19), whose destination has 32 bits (24 in its low word, 8 in its high one). The table is
+   cached: every change is invalidated (2.3.2) for the IDs that use it. */
 
-/* A 128-bit entry changes in one store the unit cannot see half done, as one that remaps must
-   (2.3.2): cmpxchg16b on the 16-byte aligned entry. */
-static void irte_store(volatile uint64_t *e, uint64_t lo, uint64_t hi) {
-    uint64_t old_lo = e[0], old_hi = e[1];
-    bool stored;
-    do __asm__ volatile("lock cmpxchg16b %1"
-                        : "=@ccz"(stored), "+m"(*(volatile unsigned __int128 *)e), "+a"(old_lo), "+d"(old_hi)
-                        : "b"(lo), "c"(hi)
-                        : "memory");
-    while (!stored);
+static bool is_unit_function(const struct pci_device *d) {
+    for (size_t i = 0; i < nunits; i++)
+        if (units[i].fn == d) return true;
+    return false;
+}
+
+static bool id_listed(const struct iommu_id *ids, size_t n, struct iommu_id id) {
+    for (size_t i = 0; i < n; i++)
+        if (ids[i].segment == id.segment && ids[i].requester == id.requester) return true;
+    return false;
+}
+
+/* The kernel table one of ids already points at, NULL for none. kernel_irts_lock held. */
+static struct kernel_irt *kernel_irt_holding(const struct iommu_id *ids, unsigned n) {
+    for (struct kernel_irt *k = kernel_irts; k; k = k->next)
+        for (unsigned i = 0; i < n; i++)
+            if (id_listed(k->ids, k->nids, ids[i])) return k;
+    return NULL;
+}
+
+/* ids point at k's table: their entries written, those the units had cached invalidated. */
+static bool kernel_irt_join(struct kernel_irt *k, const struct iommu_id *ids, unsigned n) {
+    uint64_t f = spin_lock(&kernel_irts_lock);
+    bool ok = true;
+    for (unsigned i = 0; ok && i < n; i++) {
+        if (id_listed(k->ids, k->nids, ids[i])) continue;
+        struct iommu_id *at = kappend(&k->ids, &k->nids, &k->room, sizeof *at);
+        if (!at) ok = false;
+        else *at = ids[i];
+    }
+    spin_unlock(&kernel_irts_lock, f);
+    if (!ok) return false;
+    for (unsigned i = 0; i < n; i++) dte_write(ids[i], 0, 0, DTE_IV | DTE_IRT_LEN(IRT_LOG2) | k->t.phys | DTE_INT_REMAP);
+    return on_every_unit(ids_flush, &(struct id_list){ids, n, true});
+}
+
+/* The kernel table d's requester IDs point at, made when none does. */
+static struct iommu_irt *kernel_irt_of(struct pci_device *d) {
+    unsigned n;
+    struct iommu_id *ids = iommu_requester_ids(d, &n);
+    if (!ids) return NULL;
+    uint64_t f = spin_lock(&kernel_irts_lock);
+    struct kernel_irt *k = kernel_irt_holding(ids, n);
+    spin_unlock(&kernel_irts_lock, f);
+    bool fresh = !k;
+    if (fresh && (k = kzalloc(sizeof *k)) && !iommu_irt_make(&k->t, 1u << IRT_LOG2, IRTE_BYTES)) {
+        kfree(k);
+        k = NULL;
+    }
+    bool joined = k && kernel_irt_join(k, ids, n);
+    kfree(ids);
+    if (!joined) return NULL; /* a fresh one's IDs may point at it: kept, out of the list */
+    if (fresh) {
+        f = spin_lock(&kernel_irts_lock);
+        k->next = kernel_irts;
+        kernel_irts = k;
+        spin_unlock(&kernel_irts_lock, f);
+    }
+    return &k->t;
+}
+
+static void kernel_irts_leave(const struct iommu_domain *dom) {
+    uint64_t f = spin_lock(&kernel_irts_lock);
+    for (struct kernel_irt *k = kernel_irts; k; k = k->next)
+        for (size_t i = 0; i < k->nids;)
+            if (id_listed(dom->ids, dom->nids, k->ids[i])) k->ids[i] = k->ids[--k->nids];
+            else i++;
+    spin_unlock(&kernel_irts_lock, f);
+}
+
+/* d's messages: the table it has, its claim's, its IDs' kernel table; plain for the units' own
+   functions (their messages report the units' events and cannot wait on them). A member of a
+   claim's group that is not the claimed function sends none (iommu_guests_start). */
+static bool amd_msi_table(struct pci_device *d, struct iommu_irt **t) {
+    *t = NULL;
+    if (d->irt) return *t = d->irt, true;
+    if (is_unit_function(d) || !iommu_seen(d)) return true;
+    struct iommu_domain *dom = d->claimed ? iommu_domain_of(d) : NULL;
+    if (dom) return *t = &dom->irt, true;
+    if (iommu_in_use(d)) return false;
+    return (*t = kernel_irt_of(d)) != NULL;
+}
+
+static uint32_t amd_msi_reach(const struct pci_device *d) {
+    return is_unit_function(d) || !apic_x2() || !iommu_seen(d) ? 0xFF : UINT32_MAX;
+}
+
+static bool amd_msi_write(struct pci_device *d, struct iommu_irt *t, unsigned first, unsigned count, uint8_t vector,
+                          uint32_t dest, uint32_t *address, uint32_t *data) {
+    uint8_t *irt = phys_to_virt(t->phys);
+    for (unsigned i = 0; i < count; i++)
+        iommu_entry_write16((volatile uint64_t *)(irt + (first + i) * IRTE_BYTES),
+                            1u | (uint64_t)(dest & 0xFFFFFF) << 8, (uint8_t)(vector + i) | (uint64_t)(dest >> 24) << 56);
+    *address = iommu_msi_plain(0);
+    *data = first;
+    unsigned n;
+    struct iommu_id *ids = iommu_requester_ids(d, &n);
+    bool ok = ids && on_every_unit(ids_flush, &(struct id_list){ids, n, false});
+    kfree(ids);
+    return ok;
+}
+
+static bool amd_msi_erase(struct pci_device *d, struct iommu_irt *t, const uint32_t *entries, unsigned count) {
+    uint8_t *irt = phys_to_virt(t->phys);
+    for (unsigned i = 0; i < count; i++) {
+        if (entries[i] == IOMMU_NO_IRTE) continue;
+        iommu_entry_write16((volatile uint64_t *)(irt + entries[i] * IRTE_BYTES), 0, 0);
+    }
+    unsigned n;
+    struct iommu_id *ids = iommu_requester_ids(d, &n);
+    bool ok = ids && on_every_unit(ids_flush, &(struct id_list){ids, n, false});
+    kfree(ids);
+    return ok;
+}
+
+/* AMD-Vi remaps no IOAPIC pin here: the entry stays the plain one, its destination of 8 bits. */
+static bool amd_ioapic(uint8_t ioapic_id, unsigned pin, unsigned pins, uint32_t dest, uint64_t *rte) {
+    (void)ioapic_id, (void)pin, (void)pins, (void)rte;
+    return dest <= 0xFF;
+}
+
+static uint32_t amd_ioapic_reach(uint8_t ioapic_id) {
+    (void)ioapic_id;
+    return 0xFF;
 }
 
 
@@ -783,7 +923,8 @@ static bool program(struct unit *u) {
     /* the IVHD flags HtTunEn, PassPW, ResPassPW, Isoc and Coherent are the firmware's settings
        for control bits 1, 8, 9, 11 and 10 */
     uint64_t ctl = kept | CTL_IOMMU_EN | CTL_EVENTLOG_EN | CTL_CMDBUF_EN;
-    ctl |= CTL_XT_EN | CTL_GA_EN; /* the CPUs' x2APIC mode (2.2.5.3); GAMEn 000b: remapping only */
+    uint64_t modes = CTL_GA_EN | (apic_x2() ? CTL_XT_EN : 0); /* 2.2.5.3; GAMEn 000b: remapping only */
+    ctl |= modes;
     if (u->flags & 1) ctl |= 1ull << 1;
     if (u->flags & 2) ctl |= 1ull << 8;
     if (u->flags & 4) ctl |= 1ull << 9;
@@ -793,8 +934,9 @@ static bool program(struct unit *u) {
     wr(u, R_CONTROL, ctl);
     /* the IVHD's XTSup and GASup, which this follows (1.3), confirmed: without the register's,
        XTEn is reserved and GAEn ignored (3.4, offset 0018h) */
-    if ((rd(u, R_CONTROL) & (CTL_XT_EN | CTL_GA_EN)) != (CTL_XT_EN | CTL_GA_EN)) {
-        kprintf("iommu: unit at %lx did not take x2APIC interrupt remapping (XTEn, GAEn)\n", u->base);
+    if ((rd(u, R_CONTROL) & modes) != modes) {
+        kprintf("iommu: unit at %lx did not take its interrupt remapping format (GAEn%s)\n", u->base,
+                apic_x2() ? ", XTEn" : "");
         return false;
     }
     return commands_started(u);
@@ -959,9 +1101,12 @@ static struct iommu_hw amd = {
     .attach = amd_attach,
     .block = amd_block,
     .flush = amd_flush,
-    .msi = amd_msi,
-    .msi_clear = amd_msi_clear,
+    .msi_table = amd_msi_table,
+    .msi_write = amd_msi_write,
+    .msi_erase = amd_msi_erase,
+    .msi_reach = amd_msi_reach,
     .ioapic = amd_ioapic,
+    .ioapic_reach = amd_ioapic_reach,
     .resume = amd_resume,
     .shutdown = amd_shutdown,
 };
@@ -1047,11 +1192,13 @@ const struct iommu_hw *iommu_amd_probe(bool *plain_safe) {
         if (u->mmio_efr && ((u->efr ^ u->mmio_efr) & selected))
             kprintf("iommu: unit at %lx: the IVHD's features (XTSup, GASup, IASup, HATS) differ from its "
                     "register's; the IVHD's are used (1.3)\n", u->base);
-        /* 2.2.5.3: with the CPUs in x2APIC mode (always, arch/apic.c) every unit must have XTEn
-           and GAEn, whatever it remaps; where the IVHD lacks them, the firmware withdrew them (1.3). */
-        if ((u->efr & (EFR_XT | EFR_GA)) != (EFR_XT | EFR_GA)) {
-            kprintf("iommu: unit at %lx lacks the x2APIC interrupt remapping (XTSup, GASup) the CPUs' x2APIC "
-                    "mode requires: AMD-Vi not used\n", u->base);
+        /* the 128-bit entry (GASup) every table here is made of, and with the CPUs in x2APIC mode
+           XTSup, which 2.2.5.3 requires whatever the unit remaps; where the IVHD lacks them, the
+           firmware withdrew them (1.3) */
+        uint64_t need = EFR_GA | (apic_x2() ? EFR_XT : 0);
+        if ((u->efr & need) != need) {
+            kprintf("iommu: unit at %lx lacks the interrupt remapping format the CPUs' mode needs (GASup%s): "
+                    "AMD-Vi not used\n", u->base, apic_x2() ? ", XTSup" : "");
             goto rejected;
         }
     }

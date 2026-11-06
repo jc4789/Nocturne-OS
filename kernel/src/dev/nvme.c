@@ -836,8 +836,7 @@ static void vectors_enable(struct nvme *c) {
     }
     for (unsigned i = 0; i < want; i++) {
         c->vectors[i] = (struct vector){c, i};
-        specs[i] = (struct irq_spec){.name = "NVMe", .handler = nvme_isr, .context = &c->vectors[i],
-                                     .node = c->hal->node};
+        specs[i] = (struct irq_spec){.name = "NVMe", .handler = nvme_isr, .context = &c->vectors[i]};
     }
     c->nvectors = hal_irq_enable(c->hal, specs, want, c->irqs);
     kfree(specs);

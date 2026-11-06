@@ -208,6 +208,18 @@ void iommu_entry_write(volatile uint64_t *e, uint64_t v) {
     if (!hw->coherent) iommu_cache_flush(e, sizeof *e);
 }
 
+void iommu_entry_write16(volatile uint64_t *e, uint64_t lo, uint64_t hi) {
+    ASSERT(!((uintptr_t)e & 15));
+    uint64_t old_lo = e[0], old_hi = e[1];
+    bool stored;
+    do __asm__ volatile("lock cmpxchg16b %1"
+                        : "=@ccz"(stored), "+m"(*(volatile unsigned __int128 *)e), "+a"(old_lo), "+d"(old_hi)
+                        : "b"(lo), "c"(hi)
+                        : "memory");
+    while (!stored);
+    if (!hw->coherent) iommu_cache_flush(e, 16);
+}
+
 /* ---- interrupt remapping tables ---- */
 /* The tables' given-out maps and the functions' entries (irte, irt): a leaf, never held over a
    back end's call. */
@@ -550,6 +562,15 @@ struct iommu_id *iommu_requester_ids(const struct pci_device *d, unsigned *n) {
     }
     *n = (unsigned)l.n;
     return l.at;
+}
+
+bool iommu_seen(const struct pci_device *d) {
+    unsigned n;
+    struct iommu_id *ids = iommu_requester_ids(d, &n);
+    bool seen = ids != NULL;
+    for (unsigned i = 0; seen && i < n; i++) seen = is_covered(ids[i]);
+    kfree(ids);
+    return seen;
 }
 
 /* ---- groups ----
@@ -1104,7 +1125,7 @@ bool iommu_msi_message(struct pci_device *d, unsigned index, unsigned count, con
 bool iommu_msi_clear(struct pci_device *d) {
     if (restore_failed) return false;
     if (!d->irt) return true;
-    if (!hw->msi_erase(d->irt, d->irte, d->irte_room)) return false; /* kept: a unit may still use them */
+    if (hw && !hw->msi_erase(d, d->irt, d->irte, d->irte_room)) return false; /* kept: a unit may still use them */
     messages_forget(d);
     return true;
 }

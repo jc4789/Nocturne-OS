@@ -208,7 +208,7 @@ static bool transport_init(struct hal_device *d) {
     notify = (volatile uint16_t *)(notify_base + notify_off);
     /* the queue's MSI-X entry 0 (virtio 1.x, 4.1.4.3): a device without MSI-X is read again instead */
     if(hal_irq_max(d) &&
-       hal_irq_enable(d,&(struct irq_spec){.name="virtio-gpu",.handler=gpu_isr,.node=-1},1,NULL)){
+       hal_irq_enable(d,&(struct irq_spec){.name="virtio-gpu",.handler=gpu_isr},1,NULL)){
         mmio_write16(&common->queue_msix_vector, 0);
         if(mmio_read16(&common->queue_msix_vector)==0){completion_irq=true;avail->flags=0;}
         else hal_irq_disable(d);

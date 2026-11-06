@@ -557,8 +557,9 @@ static unsigned msix_enable(struct pci_device *d, uint8_t cap, uint8_t msi, cons
                             unsigned count) {
     if (!msix_map(d, cap)) return 0;
     unsigned n = 0;
+    uint32_t reach = iommu_msi_reach(d);
     for (count = MIN(count, d->msix_entries); n < count; n++)
-        if (!(d->msix_irqs[n] = irq_request_msi(&specs[n], IRQ_CPU_ANY))) break;
+        if (!(d->msix_irqs[n] = irq_request_msi(&specs[n], IRQ_CPU_ANY, reach))) break;
     if (!n) return 0;
     if (msi) /* never both: firmware may have left MSI on */
         pci_write32(d->address, msi,
@@ -595,9 +596,10 @@ static unsigned msi_enable(struct pci_device *d, uint8_t cap, uint8_t msix, cons
                            unsigned count) {
     struct irq *got[32]; /* MSI's most (6.8.1.3) */
     unsigned n = pci_msi_max_vectors(d);
+    uint32_t reach = iommu_msi_reach(d);
     while (n > count) n /= 2;
     for (; n; n /= 2)
-        if (irq_request_msi_block(specs, n, IRQ_CPU_ANY, got)) break;
+        if (irq_request_msi_block(specs, n, IRQ_CPU_ANY, reach, got)) break;
     if (!n || !(d->msi_irqs = kmalloc(n * sizeof *d->msi_irqs))) {
         for (unsigned i = 0; i < n; i++) irq_free(got[i]);
         return 0;
@@ -623,11 +625,14 @@ static unsigned msi_enable(struct pci_device *d, uint8_t cap, uint8_t msix, cons
     return n;
 }
 
+/* MSI-X where the function has it, MSI where it has only that or MSI-X could not be set up (its
+   table not mapped, its entries not delivered). */
 unsigned pci_irq_enable(struct pci_device *d, const struct irq_spec *specs, unsigned count, struct irq **irqs) {
     uint8_t msi = pci_find_cap(d, 0x05), msix = pci_find_cap(d, 0x11);
     if (!count || d->msi_count || (d->msix_irqs && d->msix_irqs[0])) return 0; /* pci_irq_disable first */
-    unsigned n = msix ? msix_enable(d, msix, msi, specs, count) : msi ? msi_enable(d, msi, msix, specs, count) : 0;
-    for (unsigned i = 0; irqs && i < n; i++) irqs[i] = msix ? d->msix_irqs[i] : d->msi_irqs[i];
+    unsigned n = msix ? msix_enable(d, msix, msi, specs, count) : 0;
+    if (!n && msi) n = msi_enable(d, msi, msix, specs, count);
+    for (unsigned i = 0; irqs && i < n; i++) irqs[i] = d->msi_count ? d->msi_irqs[i] : d->msix_irqs[i];
     return n;
 }
 
@@ -786,6 +791,22 @@ bool pci_requests_done(const struct pci_device *d) {
 }
 
 /* ---- the bus operations of the device tree (hal/hal.h) ---- */
+/* Messages (MSI-X, then MSI) where the function may send them; else its INTx as ACPI routes it
+   (_PRT), shared with whatever else sits on the line, specs[0]'s handler saying whether the
+   interrupt was its function's. A claimed function gets no INTx: an app's driver that leaves it
+   asserted would hold a shared line, and a message is what a claim remaps (dev/iommu.h). The
+   line is routed before INTx Disable clears: an assertion finds its handler. */
+static unsigned bus_irq_enable(struct hal_device *h, const struct irq_spec *specs, unsigned count, struct irq **irqs) {
+    struct pci_device *d = pci_device_of(h);
+    if (!count) return 0;
+    unsigned n = d->no_messages ? 0 : pci_irq_enable(d, specs, count, irqs);
+    uint32_t gsi;
+    if (n || d->claimed || d->intx || !acpi_pci_gsi(d, &gsi)) return n;
+    if (!(d->intx = irq_request_gsi(&specs[0], gsi))) return 0;
+    pci_write16(d->address, PCI_COMMAND, pci_read16(d->address, PCI_COMMAND) & ~PCI_COMMAND_INTX_DISABLE);
+    if (irqs) irqs[0] = d->intx;
+    return 1;
+}
 
 static bool bus_irq_disable(struct hal_device *h) {
     struct pci_device *d = pci_device_of(h);

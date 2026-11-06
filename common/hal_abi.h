@@ -70,6 +70,7 @@ enum n_hal_resource_kind { N_HAL_MEMORY, N_HAL_PORT, N_HAL_GSI };
 #define N_HAL_PREFETCHABLE 1u /* N_HAL_MEMORY：書込みをまとめてよい */
 #define N_HAL_GSI_LEVEL 2u      /* N_HAL_GSI：level で伝える。無ければ edge */
 #define N_HAL_GSI_ACTIVE_LOW 4u /* N_HAL_GSI：active low */
+#define N_HAL_GSI_SHARED 8u     /* N_HAL_GSI：ほかの装置と線を分けてよい（ACPI の Shared）。無ければ Exclusive */
 struct n_hal_resource {
     uint32_t kind, slot, flags, reserved;
     uint64_t base, size;

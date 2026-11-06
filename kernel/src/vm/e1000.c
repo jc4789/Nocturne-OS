@@ -328,7 +328,7 @@ static int e1000_attach(struct hal_device *d) {
         kprintf("net: e1000 ITR %u x %u ns (e1000-itr-us=0 disables)\n", c->itr_ticks, ITR_TICK_NS);
     }
 
-    if (!hal_irq_enable(d, &(struct irq_spec){.name = "e1000", .handler = e1000_irq, .context = c, .node = -1}, 1, NULL)) {
+    if (!hal_irq_enable(d, &(struct irq_spec){.name = "e1000", .handler = e1000_irq, .context = c}, 1, NULL)) {
         kprintf("net: e1000 has no interrupt route\n");
         r = -N_ERR_UNSUPPORTED;
         goto fail;

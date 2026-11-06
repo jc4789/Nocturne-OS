@@ -61,7 +61,7 @@ bool hv_core_init(void (*isr)(void)) {
     uint32_t calls = HV_PRIV_POST_MESSAGES | HV_PRIV_SIGNAL_EVENTS;
     if (!hv.present || (hv.features & need) != need || (hv.privileges & calls) != calls) return false;
     sint = irq_request_msi(&(struct irq_spec){.name = "VMBus", .handler = vmbus_vector, .node = -1},
-                           cpu_current_index());
+                           cpu_current_index(), UINT32_MAX); /* the SynIC's: this CPU's own */
     if (!sint) {
         kprintf("hyperv: no vector for the SynIC on this CPU\n");
         return false;

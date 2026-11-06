@@ -2125,7 +2125,7 @@ static bool interrupters_init(struct usb_hc *hc) {
         ir->hc = hc;
         ir->index = i;
         ir->regs = hc->rt + IR_SET(i);
-        specs[i] = (struct irq_spec){.name = "xHCI", .handler = xhci_isr, .context = ir, .node = hc->pci->node};
+        specs[i] = (struct irq_spec){.name = "xHCI", .handler = xhci_isr, .context = ir};
         /* the event ring segment must not cross a 64 KiB boundary (6.0, Table 6-1) */
         if ((ir->ev = dma_block(EV_PAGES, &ir->ev_phys)) && (ir->erst = dma_page(&ir->erst_phys))) {
             ir->ev_bus = bus_of(hc, ir->ev_phys);
@@ -2294,7 +2294,7 @@ static bool hc_start(struct usb_hc *hc) {
     polled = __atomic_load_n(&hc->polled, __ATOMIC_ACQUIRE);
     kprintf("usb: xHCI %d (%04x:%04x) version %x, %u ports, %u slots, %u interrupter%s of %u, %s\n", hc->index,
             pci->vendor, pci->device, rd32(hc->cap, 0) >> 16, hc->max_ports, hc->max_slots, hc->nintr,
-            hc->nintr > 1 ? "s" : "", hc->max_intrs, polled ? "polled" : pci->msix_entries ? "MSI-X" : "MSI");
+            hc->nintr > 1 ? "s" : "", hc->max_intrs, polled ? "polled" : pci->intx ? "INTx" : pci->msi_count ? "MSI" : "MSI-X");
     for (unsigned i = 0; i < hc->nintr && !polled; i++) {
         struct irq_target to = irq_target(hc->intr[i].irq);
         kprintf("usb: controller %d interrupter %u (%s) on cpu %u vector 0x%x\n", hc->index, i,

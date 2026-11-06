@@ -45,8 +45,15 @@ void hal_enable(struct hal_device *d, unsigned what) {
 }
 
 unsigned hal_irq_enable(struct hal_device *d, const struct irq_spec *specs, unsigned count, struct irq **irqs) {
-    if (!d->ops || !d->ops->irq_enable) return 0;
-    unsigned got = d->ops->irq_enable(d, specs, count, irqs);
+    if (!d->ops || !d->ops->irq_enable || !count) return 0;
+    struct irq_spec *placed = kmalloc(count * sizeof *placed);
+    if (!placed) return 0;
+    for (unsigned i = 0; i < count; i++) {
+        placed[i] = specs[i];
+        placed[i].node = d->node;
+    }
+    unsigned got = d->ops->irq_enable(d, placed, count, irqs);
+    kfree(placed);
     if (got) d->irqs_on = true;
     return got;
 }

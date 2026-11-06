@@ -69,13 +69,15 @@ struct line {
     struct spinlock lock;   /* holds and dead; taken under an irq's lock */
     unsigned holds;         /* runs woken and not done: the pin masked while above 0 */
     bool dead;              /* masked for good: asserted with no handler taking it (line_count) */
-    unsigned unhandled;     /* deliveries in a row no handler took; its CPU's handlers alone */
+    unsigned delivered, unhandled; /* this window's deliveries, those no handler took; its CPU's alone */
     struct line *next;
 };
 
-/* A level line delivered this many times in a row with none of its handlers taking it is asserted
-   by something no driver quiets, and would hold its CPU in its handlers for ever. */
-#define LINE_UNHANDLED_MOST 100000u
+/* A level line whose deliveries in a window of LINE_WINDOW no handler took LINE_UNHANDLED_MOST
+   times is asserted by something no driver quiets (a handler of a shared line taking now and then
+   does not hide it), and would hold its CPU in its handlers for ever. */
+#define LINE_WINDOW         10000u
+#define LINE_UNHANDLED_MOST 9900u
 
 #define SLOT_LINE 1u /* the slot holds a line */
 struct vectors {
@@ -240,14 +242,15 @@ static bool run(struct irq *irq) {
     return false;
 }
 
-/* A level line's delivery, taken or not by its handlers: one that goes on with none taking it is
-   masked for good (LINE_UNHANDLED_MOST), as nothing will deassert it. On its CPU, interrupts off. */
+/* A level line's delivery, taken or not by its handlers: one nearly none of whose deliveries any
+   handler takes (LINE_UNHANDLED_MOST of LINE_WINDOW) is masked for good, its handlers with it, as
+   nothing will deassert it. On its CPU, interrupts off. */
 static void line_count(struct line *l, bool taken) {
-    if (taken) {
-        l->unhandled = 0;
-        return;
-    }
-    if (++l->unhandled < LINE_UNHANDLED_MOST) return;
+    l->unhandled += !taken;
+    if (++l->delivered < LINE_WINDOW) return;
+    bool storm = l->unhandled >= LINE_UNHANDLED_MOST;
+    l->delivered = l->unhandled = 0;
+    if (!storm) return;
     spin_take(&l->lock);
     bool first = !l->dead;
     if (first) {

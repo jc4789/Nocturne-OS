@@ -29,10 +29,14 @@
 
 /* claim の割り込みを、n_hal_interrupts が一度に立てた数だけ：それぞれの irq の文脈と、届いた印（message n は
    語 n / 64）。handler が立て、take が消す。数を増やすと新しい塊を作る。古い塊は claim が持ち続ける：割り込みの
-   再割り当ての表が持つかもしれない irq は文脈を持ち続けるからである（interrupts_off）。 */
+   再割り当ての表が持つかもしれない irq は文脈を持ち続けるからである（interrupts_off）。
+   level の線（ACPI の装置の GSI）は handler から take まで塞ぐ（IRQ_HOLD）：アプリが装置を静めるまで、線は CPU を
+   呼び続けない。take が開ける。message では塞ぐものが無い。claim の GSI は誰とも線を分けない（alone）：claim の
+   handler はどの割り込みも自分のものとして受けるので、分けた線では他の装置の割り込みを奪う。 */
 struct claim_message {
     struct hal_claim *claim;
     unsigned n;
+    struct irq *irq; /* irq_lock の下。立てていなければ NULL */
 };
 struct claim_vectors {
     struct claim_vectors *older;
@@ -147,11 +151,29 @@ bool hal_claim_dma_unmap(struct hal_claim *c, const uint64_t *frames, uint64_t b
 
 /* ---- 割り込み ---- */
 
+/* claim の message n。irq が向かう CPU で走る。 */
+static enum irq_result claim_isr(void *context) {
+    struct claim_message *m = context;
+    struct hal_claim *c = m->claim;
+    spin_take(&c->irq_lock);
+    if (m->n < c->vectors) {
+        uint64_t *word = &c->vec->pending[m->n / 64], bit = 1ull << (m->n % 64);
+        if (!(*word & bit)) {
+            *word |= bit;
+            __atomic_store_n(&c->pending, c->pending + 1, __ATOMIC_RELEASE);
+        }
+        wq_wake_all(&c->wq);
+        object_notify(&c->object);
+    }
+    spin_give(&c->irq_lock);
+    return IRQ_HOLD;
+}
 
 static void interrupts_off(struct hal_claim *c) {
     if (!c->vectors) return;
     uint64_t irq = spin_lock(&c->irq_lock);
     c->vectors = 0;
+    for (unsigned i = 0; i < c->vec->room; i++) c->vec->messages[i].irq = NULL;
     memset(c->vec->pending, 0, (c->vec->room + 63) / 64 * sizeof *c->vec->pending);
     __atomic_store_n(&c->pending, 0, __ATOMIC_RELAXED);
     spin_unlock(&c->irq_lock, irq);
@@ -183,26 +205,31 @@ static int64_t interrupts_on(struct hal_claim *c, uint32_t count) {
         if (!v) return -N_ERR_NO_MEMORY;
         v->room = count;
         v->pending = (uint64_t *)&v->messages[count];
-        for (unsigned i = 0; i < count; i++) v->messages[i] = (struct claim_message){c, i};
+        for (unsigned i = 0; i < count; i++) v->messages[i] = (struct claim_message){.claim = c, .n = i};
         v->older = c->vec;
     }
     struct irq_spec *specs = kmalloc(count * sizeof *specs);
-    if (!specs) {
+    struct irq **irqs = kzalloc(count * sizeof *irqs);
+    if (!specs || !irqs) {
+        kfree(specs);
+        kfree(irqs);
         if (v != c->vec) kfree(v);
         return -N_ERR_NO_MEMORY;
     }
     for (unsigned i = 0; i < count; i++)
-        specs[i] = (struct irq_spec){.name = "app driver", .handler = claim_isr, .context = &v->messages[i], .node = d->node};
+        specs[i] = (struct irq_spec){.name = "app driver", .handler = claim_isr, .context = &v->messages[i], .alone = true};
     /* message が来るより先に on にする：入口を書いた瞬間に来ることがある */
     uint64_t irq = spin_lock(&c->irq_lock);
     c->vec = v;
     c->vectors = count;
     spin_unlock(&c->irq_lock, irq);
-    unsigned n = hal_irq_enable(d, specs, count, NULL);
+    unsigned n = hal_irq_enable(d, specs, count, irqs);
     kfree(specs);
     irq = spin_lock(&c->irq_lock);
     c->vectors = n;
+    for (unsigned i = 0; i < n; i++) v->messages[i].irq = irqs[i];
     spin_unlock(&c->irq_lock, irq);
+    kfree(irqs);
     if (!n) { /* 名指しできる CPU に空きの vector が無い、または message を作れなかった */
         wq_wake_all(&c->wq);
         object_notify(&c->object);
@@ -221,6 +248,20 @@ int64_t hal_claim_interrupts(struct handle *h, uint32_t count) {
     mutex_unlock(&c->vectors_mutex);
     hal_put(d);
     return r;
+}
+
+/* 取った message の線を開ける（claim_isr の IRQ_HOLD）。vectors_mutex の下で：irq は interrupts_off（同じ mutex の
+   下）が外すまで生きている。外した後なら何もしない。irq_lock は持たない：irq の錠は handler の後の保持で claim の
+   錠と並ばずに取られる。 */
+static void taken_unhold(struct hal_claim *c, const uint64_t *got, unsigned words) {
+    mutex_lock(&c->vectors_mutex);
+    for (unsigned w = 0; w < words; w++)
+        for (uint64_t bits = got[w]; bits; bits &= bits - 1) {
+            unsigned n = w * 64 + (unsigned)__builtin_ctzll(bits);
+            struct irq *line = n < c->vectors ? c->vec->messages[n].irq : NULL;
+            if (line) irq_unhold(line);
+        }
+    mutex_unlock(&c->vectors_mutex);
 }
 
 /* irq_lock を持っている。最初の words 語の印を got へ取り、そこで消す。取った語の数（claim の語数まで）。 */
@@ -249,6 +290,7 @@ int64_t hal_claim_interrupt_take(struct handle *h, uint64_t deadline, uint64_t *
         if (any) {
             unsigned n = pending_take(c, got, words);
             spin_unlock(&c->irq_lock, irq);
+            taken_unhold(c, got, n);
             if (!copy_to_user(ubits, got, n * sizeof *got)) return n;
             /* 渡せなかった：次の take のために印を戻す */
             irq = spin_lock(&c->irq_lock);

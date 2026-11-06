@@ -182,13 +182,13 @@ struct iommu_hw {
        msi_table: *t the table d's messages go through (made where d has none yet, AMD-Vi), NULL
        when they go plain; false when they cannot be delivered. msi_write: entries first .. first + count - 1 of t, message n of d to vector
        + n at dest; the address and data of message 0; false when the units did not confirm it.
-       msi_erase: entries[0 .. count - 1] of t not present (IOMMU_NO_IRTE skipped), true once the
+       msi_erase: entries[0 .. count - 1] of t, d's, not present (IOMMU_NO_IRTE skipped), true once the
        units confirmed it. msi_reach: the
        highest APIC ID d's messages can name. */
     bool (*msi_table)(struct pci_device *d, struct iommu_irt **t);
     bool (*msi_write)(struct pci_device *d, struct iommu_irt *t, unsigned first, unsigned count, uint8_t vector,
                       uint32_t dest, uint32_t *address, uint32_t *data);
-    bool (*msi_erase)(struct iommu_irt *t, const uint32_t *entries, unsigned count);
+    bool (*msi_erase)(struct pci_device *d, struct iommu_irt *t, const uint32_t *entries, unsigned count);
     uint32_t (*msi_reach)(const struct pci_device *d);
     bool (*ioapic)(uint8_t ioapic_id, unsigned pin, unsigned pins, uint32_t dest, uint64_t *rte);
     uint32_t (*ioapic_reach)(uint8_t ioapic_id);
@@ -221,8 +221,15 @@ struct iommu_domain *iommu_domain_of(const struct pci_device *d); /* the claim's
 /* The requester IDs d's requests may arrive with, *n of them, in memory the caller frees with
    kfree; NULL without memory. */
 struct iommu_id *iommu_requester_ids(const struct pci_device *d, unsigned *n);
+/* Every requester ID of d passes a unit (iommu_cover): its interrupts can be remapped. False
+   without memory too. */
+bool iommu_seen(const struct pci_device *d);
 /* Writes a table entry the units may read, flushing it from the caches when they do not snoop. */
 void iommu_entry_write(volatile uint64_t *e, uint64_t v);
+/* A 16-byte aligned 128-bit entry (an interrupt remapping entry) in one store a unit cannot see
+   half done, as both formats ask of an entry in use (VT-d 5.1.4, AMD-Vi 2.3.2), then flushed the
+   same way. */
+void iommu_entry_write16(volatile uint64_t *e, uint64_t lo, uint64_t hi);
 void iommu_cache_flush(const volatile void *p, size_t bytes);
 /* Zeroed physically contiguous pages for hardware tables/queues. Addresses fit every unit's
    physical width and the page-table format; freed with pmm_free_contig. */

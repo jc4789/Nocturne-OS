@@ -131,6 +131,9 @@ void *hal_map(struct hal_device *d, uint32_t slot);
 /* ポートの資源の最初の番地。無ければ 0。 */
 uint16_t hal_port(const struct hal_device *d, uint32_t slot);
 void hal_enable(struct hal_device *d, unsigned what); /* HAL_ENABLE_* */
+/* 割り込みを count まで、specs[i] が i 番目。バスが選ぶ形（PCI は MSI-X、MSI、INTx の順、ACPI は _CRS の GSI）で、
+   向かう CPU は装置の node の中から選ぶ（spec の node は装置の node に置き換わる）。立てた数を返し、irqs があれば
+   それぞれの irq を入れる。 */
 unsigned hal_irq_enable(struct hal_device *d, const struct irq_spec *specs, unsigned count, struct irq **irqs);
 void hal_irq_disable(struct hal_device *d);
 unsigned hal_irq_max(struct hal_device *d);

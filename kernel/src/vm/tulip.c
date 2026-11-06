@@ -220,7 +220,7 @@ static int tulip_attach(struct hal_device *d) {
     c->tx[0].status = OWN;
     c->tx_cur = 1;
 
-    if (!hal_irq_enable(d, &(struct irq_spec){.name = "tulip", .handler = tulip_irq, .context = c, .node = -1}, 1, NULL)) {
+    if (!hal_irq_enable(d, &(struct irq_spec){.name = "tulip", .handler = tulip_irq, .context = c}, 1, NULL)) {
         kprintf("net: tulip has no interrupt route\n");
         r = -N_ERR_UNSUPPORTED;
         goto fail;

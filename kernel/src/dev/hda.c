@@ -443,7 +443,7 @@ static void hda_tick(struct alarm *a, struct regs *r) {
 /* state held: its interrupt on, as the bus gives it (hal_irq_enable: a message where the function may send
    one, a guest in a claim's domain may not). Without one, tick and the thread look instead. */
 static void irq_on(struct hda *h) {
-    struct irq_spec spec = {.name = "HD Audio", .handler = hda_irq, .context = h, .node = h->pci->node};
+    struct irq_spec spec = {.name = "HD Audio", .handler = hda_irq, .context = h};
     h->quiet = !hal_irq_enable(h->hal, &spec, 1, NULL);
 }
 

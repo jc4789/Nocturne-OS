@@ -18,6 +18,7 @@
 /* A redirection entry (82093AA 3.2.4): vector 7:0, delivery mode 10:8, polarity 13 (1: active
    low), trigger 15 (1: level), mask 16, destination 63:56 */
 #define RTE_ACTIVELOW (1u << 13)
+#define RTE_REMOTE_IRR (1u << 14)
 #define RTE_LEVEL     (1u << 15)
 #define RTE_MASK      (1u << 16)
 #define DELIV_NMI     (4u << 8)
@@ -81,6 +82,19 @@ static uint64_t plain_entry(const struct pin *p) {
     return rte | (uint64_t)(p->dest <= 0xFF ? p->dest : 0) << 56;
 }
 
+/* A level pin's interrupt still in service: Remote IRR stays set until the EOI that carries the
+   entry's vector (82093AA 3.2.4), so an entry rewritten meanwhile with another vector would never
+   see it clear and the pin would deliver no more. Masked, the pin is waited on until it clears:
+   the handler runs on another CPU, or has, with interrupts off and briefly. Reads, not time: the
+   clock may not run yet at boot, when nothing is in service. */
+#define REMOTE_IRR_READS 100000u
+static void remote_irr_wait(struct ioapic *io, uint32_t n) {
+    unsigned reads = 0;
+    while (rd(io, REG_RTE(n)) & RTE_REMOTE_IRR && ++reads < REMOTE_IRR_READS) pause();
+    if (reads == REMOTE_IRR_READS)
+        kprintf("ioapic: GSI %u: its Remote IRR does not clear: the EOI of its interrupt was lost\n", io->gsi_base + n);
+}
+
 /* Pin n written from what it was given, through interrupt remapping (dev/iommu.h): false when
    that cannot deliver it, and the pin is masked. io->lock held. */
 static bool pin_write(struct ioapic *io, uint32_t n) {
@@ -88,6 +102,8 @@ static bool pin_write(struct ioapic *io, uint32_t n) {
     uint64_t rte = plain_entry(p);
     bool ok = !(p->routed || p->nmi) || iommu_ioapic_entry(io->id, n, io->pins, p->dest, &rte);
     if (!ok) rte = RTE_MASK;
+    wr(io, REG_RTE(n), rd(io, REG_RTE(n)) | RTE_MASK); /* masked as it is: its vector kept for the EOI */
+    if (p->level) remote_irr_wait(io, n);
     wr(io, REG_RTE(n), RTE_MASK | (uint32_t)rte); /* masked while the destination changes */
     wr(io, REG_RTE(n) + 1, (uint32_t)(rte >> 32));
     wr(io, REG_RTE(n), (uint32_t)rte);

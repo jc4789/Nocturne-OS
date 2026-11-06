@@ -644,7 +644,7 @@ static int rtl_attach(struct hal_device *d) {
 
     /* a PCI Express function that interrupts has MSI or MSI-X (PCIe 6.0, 6.1.4); the chip's
        interrupt mask stays clear until the rings are set */
-    if (!hal_irq_enable(d, &(struct irq_spec){.name = "RTL8125", .handler = rtl_irq, .context = c, .node = d->node}, 1, NULL)) {
+    if (!hal_irq_enable(d, &(struct irq_spec){.name = "RTL8125", .handler = rtl_irq, .context = c}, 1, NULL)) {
         kprintf("rtl8125: no interrupt message could be enabled\n");
         r = -N_ERR_IO;
         goto fail;

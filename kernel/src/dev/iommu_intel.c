@@ -771,12 +771,10 @@ static void contexts_flush(struct unit *u, const void *arg) {
 }
 
 /* ---- interrupts ---- */
+/* One store: an entry in use moves to its new CPU without a moment not present, in which a
+   message on its way would be dropped as a fault (5.1.4). */
 static void irte_write(struct irt_table *t, unsigned index, uint64_t lo, uint64_t hi) {
-    volatile uint64_t *e = (volatile uint64_t *)phys_to_virt(t->phys) + index * 2;
-    e[0] = 0; /* present last */
-    e[1] = hi;
-    e[0] = lo;
-    if (!intel.coherent) iommu_cache_flush(e, 16);
+    iommu_entry_write16((volatile uint64_t *)phys_to_virt(t->t.phys) + index * 2, lo, hi);
 }
 
 /* The destination field (9.10): an x2APIC ID in bits 63:32 in Extended Interrupt Mode, an xAPIC
@@ -816,13 +814,13 @@ static struct irt_table *irt_holding(const struct iommu_irt *t) {
 }
 
 static bool intel_msi_table(struct pci_device *d, struct iommu_irt **t) {
-    struct irt_table *irt = remap ? irt_of(d->address.segment) : NULL;
+    struct irt_table *irt = remap && iommu_seen(d) ? irt_of(d->address.segment) : NULL;
     *t = irt ? &irt->t : NULL;
     return true;
 }
 
 static uint32_t intel_msi_reach(const struct pci_device *d) {
-    return remap && irt_of(d->address.segment) ? remapped_reach() : 0xFF;
+    return remap && irt_of(d->address.segment) && iommu_seen(d) ? remapped_reach() : 0xFF;
 }
 
 /* Message n of d arrives through entry first + n: the address carries the handle first with
@@ -854,7 +852,8 @@ static void iec_entries(struct unit *u, const void *arg) {
         if (l->entries[i] != IOMMU_NO_IRTE) submit(u, INV_IEC(l->entries[i], 0), 0);
 }
 
-static bool intel_msi_erase(struct iommu_irt *it, const uint32_t *entries, unsigned count) {
+static bool intel_msi_erase(struct pci_device *d, struct iommu_irt *it, const uint32_t *entries, unsigned count) {
+    (void)d;
     struct irt_table *t = irt_holding(it);
     uint64_t f = spin_lock(&tables_lock);
     for (unsigned i = 0; i < count; i++)
@@ -951,8 +950,13 @@ static bool intel_attach(struct iommu_domain *dom) {
                          &(struct contexts){dom, CTX_P | dom->root, (uint64_t)(dom->levels - 2) | (uint64_t)dom->id << 8});
 }
 
+static bool intel_msi_erase(struct pci_device *d, struct iommu_irt *it, const uint32_t *entries, unsigned count);
+
+/* The claimed function's remapping entries not present: they stay given until its messages are
+   cleared (iommu_msi_clear), which finds them gone already. */
 static bool intel_block(struct iommu_domain *dom) {
-    bool ok = intel_msi_clear(dom->d);
+    struct pci_device *d = dom->d;
+    bool ok = !d->irt || intel_msi_erase(d, d->irt, d->irte, d->irte_room);
     ok &= on_every_unit(contexts_flush, &(struct contexts){dom, 0, 0});
     return ok && dma_draining(); /* otherwise retain the domain and its DMA pages in quarantine */
 }
