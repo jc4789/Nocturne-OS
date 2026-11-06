@@ -97,8 +97,10 @@ bool lapic_wake_init(int vector) {
                     cpu_features.arat ? "runs" : "stops");
     }
     if (mode == WAKE_DEADLINE) {
-        /* in x2APIC mode the CPU keeps this write before the deadline's, no fence (SDM 13.5.4.1) */
         lapic_write(LAPIC_LVT_TIMER, LVT_TSC_DEADLINE | (uint32_t)vector);
+        /* xAPIC mode: the memory-mapped write ordered before any WRMSR to the deadline by an
+           MFENCE (SDM 13.5.4.1); in x2APIC mode WRMSRs keep their order and the fence is spare */
+        __asm__ volatile("mfence" : : : "memory");
         wrmsr(IA32_TSC_DEADLINE, 0);
         return true;
     }

@@ -1,5 +1,6 @@
 /* AMD's CPUs, and Hygon's, which follow AMD's manuals (arch/cpu_maker.h). */
 #include "kernel.h"
+#include "arch/apic.h"
 #include "arch/cpu.h"
 #include "arch/cpu_maker.h"
 #include "arch/mca.h"
@@ -39,6 +40,25 @@ static void cppc_request(const struct cpu_perf_caps *c, uint8_t preference) {
 static const struct cpu_perf_way cppc_way = {"CPPC", MSR_CPPC_ENABLE, cppc_caps, cppc_request};
 
 static const struct cpu_perf_way *amd_perf_way(void) { return cpu_features.cppc ? &cppc_way : NULL; }
+
+/* ---- the APIC's extended LVT ----
+   APM vol. 2 16.3.4 and 16.3.5, 16.4.5: the version register's EAS (bit 31) says the extended space
+   from 400h is there; its feature register's XLC (bits 23:16) counts the extended LVT entries, at
+   500h + 10h * n (in x2APIC mode the MSRs 840h and 850h + n, 16.11.1). The sources that signal
+   through an entry name it in their own control registers. */
+#define APIC_VERSION_EAS     (1u << 31)
+#define APIC_EXT_FEATURE     0x400u
+#define APIC_EXT_LVT(n)      (0x500u + 0x10u * (n))
+
+static unsigned extended_lvts(void) {
+    if (!(lapic_read(LAPIC_VERSION) & APIC_VERSION_EAS)) return 0;
+    return (lapic_read(APIC_EXT_FEATURE) >> 16) & 0xFF;
+}
+
+/* What the firmware left in them goes: a source the kernel takes up unmasks its entry itself. */
+static void amd_mask_own_lvt(void) {
+    for (unsigned n = 0, count = extended_lvts(); n < count; n++) lapic_write(APIC_EXT_LVT(n), LVT_UNUSED);
+}
 
 /* ---- machine checks ----
    With scalable MCA (CPUID 8000_0007h EBX[3]) every bank has its own block at C000_2000h + 10h * i,
@@ -81,12 +101,6 @@ static void amd_mca_bank_on(unsigned bank) {
 /* The corrected errors a legacy bank's counter takes before it interrupts: one, so that each is
    told as it happens (9.3.2.6: starting count = threshold level - this). */
 #define THRESHOLD_ERRORS 1u
-/* x2APIC registers (16.11.1, Table 16-6): the version (EAS, bit 31: the extended space is there),
-   the extended feature register (XLC, bits 23:16: its LVT entries) and those entries. */
-#define X2APIC_VERSION     0x803u
-#define X2APIC_EXT_FEATURE 0x840u
-#define X2APIC_EXT_LVT     0x850u
-
 static uint16_t threshold_start[LEGACY_BANKS]; /* the count a legacy bank's counter starts from */
 
 static bool threshold_bank(uint64_t misc) {
@@ -114,13 +128,13 @@ static void amd_mca_interrupt_on(void) {
         if (threshold_bank(misc)) offset = MISC_LVTOFF(misc);
     }
     if (offset == 16) return; /* no bank interrupts */
-    if (!(rdmsr(X2APIC_VERSION) & (1ULL << 31)) || offset >= ((rdmsr(X2APIC_EXT_FEATURE) >> 16) & 0xFF)) {
+    if (offset >= extended_lvts()) {
         if (!cpu_current_index()) kprintf("cpu: machine-check thresholds name LVT entry %u, which the APIC lacks\n", offset);
         return;
     }
     mca_threshold_vector(threshold_told);
     /* the entry first: a counter enabled before it may interrupt through anything (9.3.2.6) */
-    wrmsr(X2APIC_EXT_LVT + offset, VEC_MCE_THRESHOLD); /* fixed, unmasked */
+    lapic_write(APIC_EXT_LVT(offset), VEC_MCE_THRESHOLD); /* fixed, unmasked */
     unsigned told = 0;
     for (unsigned i = 0; i < banks; i++) {
         uint64_t misc = rdmsr(mca_msr(i, MCA_MISC0));
@@ -184,4 +198,7 @@ const struct cpu_maker cpu_amd = {
     .mca_interrupt_on = amd_mca_interrupt_on,
     .die_shift = amd_die_shift,
     .cache_leaf = amd_cache_leaf,
+    .mask_own_lvt = amd_mask_own_lvt,
+    /* APM vol. 2 16.9.1 enters x2APIC mode with nothing asked before it */
+    .x2apic_unremapped = true,
 };

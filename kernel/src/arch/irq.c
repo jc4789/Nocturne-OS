@@ -694,7 +694,7 @@ void irq_init(void) {
     pic_disable();
     ioapic_init();
     apic_init();
-    if (!apic_init_cpu()) panic("irq: the first CPU's local APIC does not enter x2APIC mode");
+    if (!apic_init_cpu()) panic("irq: the first CPU's local APIC does not enter %s mode", apic_x2() ? "x2APIC" : "xAPIC");
     if (!irq_request_system(&(struct irq_spec){.name = "irq drain", .handler = drain, .node = -1}, VEC_IRQ_DRAIN))
         panic("irq: the drain vector is taken");
 }

@@ -19,7 +19,7 @@
 | `arch/topology.c` | MADT・SRAT・SLIT から CPU・core・LLC・NUMA node と node の距離を数える。CPU の数に上限は無い。 |
 | `arch/smp.c`・`wake.c` | AP の起動、panic のときの NMI による停止、S3 からの復帰。 |
 | `arch/spin.h` | MCS spinlock。 |
-| `arch/irq.c`・`apic.c`・`ioapic.c`・`lapic_timer.c` | CPU ごとの vector の表、x2APIC と IPI、IOAPIC、LAPIC の timer（CPU に TSC-deadline があればそれ、無ければ one-shot）。 |
+| `arch/irq.c`・`apic.c`・`ioapic.c`・`lapic_timer.c` | CPU ごとの vector の表、ローカル APIC（xAPIC か x2APIC を起動で一つ選ぶ。`apic_choose_mode`・`apic_x2`）と IPI、IOAPIC、LAPIC の timer（CPU に TSC-deadline があればそれ、無ければ one-shot）。 |
 | `arch/idt.c`・`gdt.c`・`isr.asm` | IDT・GDT・TSS と、syscall・例外・割り込みの入口。 |
 | `sys/entry.c`・`entry_code.asm`・`kernel/entry/` | 入口の像：全プロセスへ写す溝の並びと、像の中の時計（`clock.c`。別に組み、平らなファイルで埋め込む）。公開の面と、溝から来た呼出しの確かめ。 |
 | `arch/fpu.c`・`idle.c`・`pat.c` | XSAVES による FPU の保存、MWAIT か HLT による idle と性能の要求（AMD の CPPC、Intel の HWP）、PAT。 |

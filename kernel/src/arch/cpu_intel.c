@@ -121,4 +121,6 @@ const struct cpu_maker cpu_intel = {
     .perf_way = intel_perf_way,
     .mca_interrupt_on = cmci_on,
     .cache_leaf = intel_cache_leaf,
+    /* SDM vol. 3A 13.12.7: interrupt remapping with Extended Interrupt Mode before x2APIC mode */
+    .x2apic_unremapped = false,
 };
