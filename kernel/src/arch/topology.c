@@ -7,6 +7,7 @@
    nodes are the SRAT's proximity domains (ACPI 6.5 5.2.16), the distances the SLIT's (5.2.17).
    Everything is boot memory, sized by what the tables hold. */
 #include "kernel.h"
+#include "arch/apic.h"
 #include "arch/cpu.h"
 #include "arch/cpu_maker.h"
 #include "arch/topology.h"
@@ -94,7 +95,9 @@ static int by_apic_id(const void *a, const void *b) {
 }
 
 /* A MADT processor entry: false for one of another type. 0xFF and 0xFFFFFFFF are the xAPIC's
-   and the x2APIC's broadcast destinations, never a processor's. */
+   and the x2APIC's broadcast destinations, never a processor's. One the APICs' mode cannot send to
+   (an ID of 255 or above in xAPIC mode, apic_reaches) is a processor not used: a firmware that
+   hands over xAPIC mode leaves those off (SDM vol. 3A 13.12.8.1). */
 static bool processor(const struct acpi_entry *e, struct found *f, uint32_t *flags) {
     if (e->type == ACPI_MADT_LAPIC && e->length >= sizeof(struct acpi_madt_lapic)) {
         const struct acpi_madt_lapic *l = (const void *)e;
@@ -147,13 +150,14 @@ static unsigned number(struct cpu_place *cpu, unsigned count, unsigned by, size_
 static struct cpu_place *read_cpus(void) {
     const struct acpi_sdt *madt = acpi_find("APIC", 0);
     if (!madt) panic("topology: no MADT");
-    unsigned n = 0, later = 0;
+    unsigned n = 0, later = 0, unreached = 0;
     struct found f;
     uint32_t flags;
     for (const struct acpi_entry *e = acpi_entry_next(madt, ACPI_MADT_ENTRIES, NULL); e;
          e = acpi_entry_next(madt, ACPI_MADT_ENTRIES, e))
         if (processor(e, &f, &flags)) {
-            if (flags & ACPI_CPU_ENABLED) n++;
+            if (!apic_reaches(f.apic_id)) unreached += (flags & ACPI_CPU_ENABLED) != 0;
+            else if (flags & ACPI_CPU_ENABLED) n++;
             else if (flags & ACPI_CPU_ONLINE_CAPABLE) later++;
         }
     if (!n) panic("topology: the MADT lists no enabled processor");
@@ -161,7 +165,7 @@ static struct cpu_place *read_cpus(void) {
     unsigned k = 0;
     for (const struct acpi_entry *e = acpi_entry_next(madt, ACPI_MADT_ENTRIES, NULL); e;
          e = acpi_entry_next(madt, ACPI_MADT_ENTRIES, e))
-        if (processor(e, &f, &flags) && (flags & ACPI_CPU_ENABLED)) all[k++] = f;
+        if (processor(e, &f, &flags) && (flags & ACPI_CPU_ENABLED) && apic_reaches(f.apic_id)) all[k++] = f;
     sort(all, n, sizeof *all, by_apic_id);
     /* one processor listed twice (a type-0 and a type-9 entry) is one CPU */
     unsigned count = 0, first = n;
@@ -191,6 +195,7 @@ static struct cpu_place *read_cpus(void) {
     kprintf("cpu: APIC ID shifts (leaf 0x%x) core %u, die %u, package %u; LLC %s, shift %u\n", shift.leaf, shift.core,
             shift.die, shift.package, llc, shift.llc);
     if (later) kprintf("cpu: %u more entries online-capable only, not used (no hot-add)\n", later);
+    if (unreached) kprintf("cpu: %u more enabled with APIC IDs xAPIC mode cannot send to, not used\n", unreached);
     return cpu;
 }
 

@@ -45,6 +45,13 @@ struct cpu_maker {
     bool (*die_shift)(unsigned *shift);
     /* The CPUID leaf that gives the caches' sharing; 0 where there is none. */
     uint32_t (*cache_leaf)(void);
+    /* This CPU's APIC's own LVT entries beyond the architecture's, masked (apic_init_cpu). */
+    void (*mask_own_lvt)(void);
+    /* The kernel may move the APICs to x2APIC mode before interrupts are remapped: the maker's
+       manual asks for nothing before it (arch/apic.h, apic_choose_mode). False where it asks for
+       remapping with extended IDs first (SDM vol. 3A 13.12.7), which comes after the APICs here
+       (dev/iommu.c), and where no manual here says. */
+    bool x2apic_unremapped;
 };
 
 extern const struct cpu_maker cpu_amd, cpu_intel;

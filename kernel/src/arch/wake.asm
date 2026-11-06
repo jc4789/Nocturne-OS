@@ -2,10 +2,10 @@
 ; boot and after a sleep, and the BSP when the firmware wakes the machine from S3 (the FACS waking
 ; vector). arch/wake.c copies tramp_start..tramp_end to a page below 1 MiB and fills the data
 ; block at TRAMP_DATA in that page. Real mode -> 32-bit protected mode -> long mode through a page
-; table in low memory that maps the page itself and the kernel's upper half; x2APIC mode; then, for
-; the CPU the data block is for (arch/wake.h), a jump to `entry` with rsp = `stack` and
-; rdi = `arg`: the block's own for the BSP the firmware wakes, else those of the CPU's row in the
-; table, found by its x2APIC ID.
+; table in low memory that maps the page itself and the kernel's upper half; then, for the CPU the
+; data block is for (arch/wake.h), a jump to `entry` with rsp = `stack` and rdi = `arg`: the
+; block's own for the BSP the firmware wakes, else those of the CPU's row in the table, found by
+; its APIC ID. The APIC is left in the mode it came in; arch/apic.c sets it.
 bits 16
 section .text
 
@@ -22,6 +22,7 @@ section .text
 %define TD_FLAGS   (TRAMP_DATA + 100)
 %define TD_TABLE   (TRAMP_DATA + 104)
 %define TDF_ANY    1            ; the one CPU coming in takes the block's stack and arg
+%define TDF_X2APIC 2            ; the rows name x2APIC IDs, else xAPIC IDs (apic_x2)
 %define ROW_STACK  0            ; struct wake_cpu
 %define ROW_ARG    8
 %define ROW_ID     16
@@ -65,19 +66,27 @@ tramp_pm32:
 bits 64
 tramp_lm64:                     ; rbx: the page (a hibernation's last copy enters here too)
     mov ebx, ebx
-    mov ecx, 0x1B               ; IA32_APIC_BASE: x2APIC mode, which INIT keeps (APM 16.10), from
-    rdmsr                       ; wherever the firmware left it: enabled first, then with EXTD too
-    bt eax, 10                  ; (APM 16.9.1); it keeps its x2APIC ID
-    jc .x2
-    bts eax, 11
-    wrmsr
-    bts eax, 10
-    wrmsr
-.x2:
     test dword [rbx + TD_FLAGS], TDF_ANY
     jnz .any
-    mov ecx, 0x802              ; the x2APIC ID: a CPU with no row (a STARTUP that was not its own)
-    rdmsr                       ; goes no further
+    ; The APIC ID from CPUID, in either mode and whether or not the APIC is enabled: in x2APIC mode
+    ; the 32-bit x2APIC ID, CPUID 0Bh EDX (SDM 13.12.8.1); in xAPIC mode the 8-bit initial APIC ID,
+    ; CPUID 01h EBX[31:24] (SDM 13.4.6, APM 16.3.3), the low 8 bits of the x2APIC ID (13.12.8.1).
+    ; A CPU with no row (a STARTUP that was not its own) goes no further.
+    mov r8, rbx                 ; CPUID writes rbx
+    test dword [rbx + TD_FLAGS], TDF_X2APIC
+    jz .xapic
+    mov eax, 0xB
+    xor ecx, ecx
+    cpuid
+    mov eax, edx
+    jmp .id
+.xapic:
+    mov eax, 1
+    cpuid
+    mov eax, ebx
+    shr eax, 24
+.id:
+    mov rbx, r8
     mov rsi, [rbx + TD_TABLE]
     mov ecx, [rbx + TD_COUNT]
 .row:

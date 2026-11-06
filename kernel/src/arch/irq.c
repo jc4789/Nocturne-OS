@@ -605,7 +605,7 @@ void irq_init(void) {
     pic_disable();
     ioapic_init();
     apic_init();
-    if (!apic_init_cpu()) panic("irq: the first CPU's local APIC does not enter x2APIC mode");
+    if (!apic_init_cpu()) panic("irq: the first CPU's local APIC does not enter %s mode", apic_x2() ? "x2APIC" : "xAPIC");
 }
 
 void irq_suspend(void) { ioapic_suspend(); }

@@ -9,7 +9,7 @@
 #include <stdint.h>
 
 struct cpu_place {
-    uint32_t apic_id; /* the x2APIC ID */
+    uint32_t apic_id; /* the x2APIC ID; in xAPIC mode below 255, the same (arch/apic.h) */
     uint32_t uid;     /* the ACPI processor UID */
     unsigned core;    /* the CPUs of a core are its SMT threads */
     unsigned llc;     /* the CPUs sharing a last-level cache */

@@ -274,14 +274,14 @@ static bool machine_sleep(void (*enter)(void), unsigned state, enum pm_action ac
     /* The clock first: every wait from here on (a unit's or a link's that does not answer) is
        bounded on it, and until it is back it stands still (the TSC began again from 0). */
     int64_t secs = clock_resume();
-    /* before anything sends it an interrupt or a request, and before the APIC goes back to x2APIC
-       mode, which comes after interrupt remapping with extended IDs (SDM 13.12.7); units that
-       never slept are still on, translating with the claims' tables, and are left alone. Units
-       that do not come back are turned off where they confirm it (iommu_resume): the IOAPICs'
-       entries and the PCI functions' messages are then made again plain, or left off, and x2APIC
-       mode comes back without remapping, the deviation arch/apic.c describes for the boot. */
+    /* before anything sends it an interrupt or a request, and before the APIC goes back to its
+       mode (arch/apic.h), x2APIC mode coming after interrupt remapping with extended IDs (SDM
+       13.12.7); units that never slept are still on, translating with the claims' tables, and are
+       left alone. Units that do not come back are turned off where they confirm it
+       (iommu_resume): the IOAPICs' entries and the PCI functions' messages are then made again
+       plain, or left off, and the APIC comes back in its mode without remapping. */
     const char *units_lost = slept ? iommu_resume() : NULL;
-    if (!apic_init_cpu()) panic("pm: this CPU's APIC did not come back in x2APIC mode");
+    if (!apic_init_cpu()) panic("pm: this CPU's APIC did not come back in %s mode", apic_x2() ? "x2APIC" : "xAPIC");
     irq_resume(); /* the 8259 masked again, every IOAPIC entry written again */
     log_resume(); /* the serial port set up again, its interrupt routed again above */
     vm_resume(); /* the hypervisor's other overlay pages and its interrupts, after the LAPIC */

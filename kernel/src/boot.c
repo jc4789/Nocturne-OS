@@ -2,6 +2,7 @@
 #include "kernel.h"
 #include "fs/bootrecord.h"
 #include "limine.h"
+#include "arch/apic.h"
 #include "arch/cpu.h"
 #include "arch/mca.h"
 #include "arch/irq.h"
@@ -160,6 +161,7 @@ void kmain(void) {
     struct limine_memmap_response *mm = mm_req.response;
     bootmem_init(mm);
     acpi_tables_init(mm);
+    apic_choose_mode(); /* the APICs' mode, which decides the APIC IDs topology counts */
     topology_init();
     bootmem_by_node();
     percpu_init();

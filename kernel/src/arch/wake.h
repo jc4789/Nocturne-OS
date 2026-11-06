@@ -9,16 +9,16 @@
 void wake_init(void);      /* after vmm_init: find the wake page in low memory */
 bool wake_available(void); /* false when no usable page below 1 MiB was found */
 uint64_t wake_page(void);  /* its physical address: the FACS waking vector, the SIPI page */
-/* A CPU through the wake page enters x2APIC mode, then jumps to entry in long mode on the kernel's
-   page tables' upper half, with rsp = stack and rdi = arg, interrupts off, no IDT, the page's own
-   GDT.
+/* A CPU through the wake page jumps to entry in long mode on the kernel's page tables' upper half,
+   with rsp = stack and rdi = arg, interrupts off, no IDT, the page's own GDT, its APIC in the mode
+   it came in (apic_init_cpu sets it).
 
    wake_prepare_any: the BSP the firmware wakes from S3, the one CPU to come in, takes them as
    they are given.
    wake_prepare_cpus: the APs that STARTUPs are sent to after their INITs and this call
    (arch/smp.c), each its row of table (count rows, in the kernel's memory, kept until they are
-   through), found by its x2APIC ID. A CPU a STARTUP reached with no row stops in the page, halted
-   with interrupts off, until an INIT. */
+   through), found by its APIC ID in the chosen mode (apic_x2). A CPU a STARTUP reached with no
+   row stops in the page, halted with interrupts off, until an INIT. */
 struct wake_cpu {
     uint64_t stack, arg;
     uint32_t apic_id, pad;

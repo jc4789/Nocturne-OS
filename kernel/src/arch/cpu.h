@@ -104,6 +104,7 @@ struct cpu_features {
     bool mwait, pcid, invpcid, avx, tsc_deadline, invariant_tsc, aperf_mperf, cppc, hwp, hwp_epp, invlpgb, tme, rdrand,
         arch_capabilities, topology_extensions, umip, scalable_mca, lfence_serializing;
     bool arat; /* the LAPIC timer goes on counting in every C-state */
+    bool x2apic; /* the APIC has x2APIC mode (arch/apic.h: whether it runs in it) */
     bool cmci; /* the banks' corrected errors have Intel's LVT entry (SDM vol. 3B 18.5) */
     /* speculation controls (AMD APM vol. 2 3.2.9, 3.1.7; Intel SDM vol. 2A CPUID leaf 7) */
     bool ibpb, ibrs, stibp, ibrs_always_on, stibp_always_on, auto_ibrs;
