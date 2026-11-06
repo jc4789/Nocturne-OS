@@ -43,8 +43,7 @@ static unsigned acpi_irq_enable(struct hal_device *d, const struct irq_spec *spe
         const struct n_hal_resource *r = hal_resource(d, N_HAL_GSI, got);
         struct gsi_signal signal = {.level = r->flags & N_HAL_GSI_LEVEL, .active_low = r->flags & N_HAL_GSI_ACTIVE_LOW,
                                     .shared = r->flags & N_HAL_GSI_SHARED};
-        if (!ioapic_gsi_signal((uint32_t)r->base, signal)) break;
-        struct irq *irq = irq_request_gsi(&specs[got], (unsigned)r->base);
+        struct irq *irq = irq_request_gsi(&specs[got], (unsigned)r->base, signal);
         if (!irq) break;
         a->irqs[got] = irq;
         if (irqs) irqs[got] = irq;

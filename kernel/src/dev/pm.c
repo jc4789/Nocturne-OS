@@ -284,8 +284,8 @@ static bool machine_sleep(void (*enter)(void), unsigned state, enum pm_action ac
        plain, or left off, and the APIC comes back in its mode without remapping. */
     const char *units_lost = slept ? iommu_resume() : NULL;
     if (!apic_init_cpu()) panic("pm: this CPU's APIC did not come back in %s mode", apic_x2() ? "x2APIC" : "xAPIC");
-    irq_resume(); /* the 8259 masked again, every IOAPIC entry written again */
-    log_resume(); /* the serial port set up again, its interrupt routed again above */
+    irq_resume(slept); /* the 8259 masked again; the IOAPIC entries stay masked until every CPU is back */
+    log_resume(); /* the serial port set up again */
     vm_resume(); /* the hypervisor's other overlay pages and its interrupts, after the LAPIC */
     alarm_resume(); /* CPU 0's wake device, after its LAPIC */
     acpi_wake_prepare(state);
@@ -297,6 +297,7 @@ static bool machine_sleep(void (*enter)(void), unsigned state, enum pm_action ac
     /* a hibernation's snapshot is no sleep: the firmware heard of none */
     if (state == 3 || slept) acpi_wake(state);
     smp_resume();
+    irq_resume_lines(); /* the IOAPIC entries, to CPUs that run */
     const char *lost = hal_resume_all();
     input_resumed();
     acpi_freeze(false);

@@ -364,7 +364,9 @@ uacpi_status uacpi_kernel_install_interrupt_handler(uacpi_u32 irq, uacpi_interru
     sci_ctx = ctx;
     sci_irq = irq;
     sci_gsi = ioapic_isa_gsi(irq);
-    sci = irq_request_gsi(&(struct irq_spec){.name = "ACPI SCI", .handler = sci_entry, .node = -1}, sci_gsi);
+    /* sharable, level, active low (ACPI 6.5 5.2.9, SCI_INT) */
+    struct gsi_signal signal = {.level = true, .active_low = true, .shared = true};
+    sci = irq_request_gsi(&(struct irq_spec){.name = "ACPI SCI", .handler = sci_entry, .node = -1}, sci_gsi, signal);
     if (!sci) return UACPI_STATUS_INTERNAL_ERROR;
     *out = sci;
     return UACPI_STATUS_OK;
@@ -458,9 +460,8 @@ static void acpi_worker(void *arg) {
    when a function first needs it: each such line takes, from its _PRS descriptor (the first of
    dependent alternatives), an interrupt the IOAPICs take with that descriptor's signal, the one
    the fewest lines are on already. Lines on one GSI all share it with one trigger and polarity:
-   the IOAPIC takes a pin's signal from whichever source names it first until it is routed
-   (arch/ioapic.h), so a line of another signal would change the pin under the lines already on
-   it. An ISA IRQ only where the firmware itself put a link or the SCI: an ISA device on the
+   the pin keeps the signal of the first source routed on it (arch/ioapic.h), so a function on a
+   line of another signal would be refused its interrupt. An ISA IRQ only where the firmware itself put a link or the SCI: an ISA device on the
    others is edge-triggered and need not be in the namespace. _SRS gets the link's _CRS with every
    line's interrupt and signal in it (6.2.16: the same descriptors in the same order and length;
    6.4.2.1 and 6.4.3.6: the flags set the signal too, an Extended Interrupt descriptor holds one
@@ -1000,19 +1001,20 @@ void *acpi_pci_node(const struct pci_device *d) {
 
 /* The entry of a _PRT for device dev's pin (0 = INTA): a GSI wired to it, which PCI's INTx drive
    level, active low and shared, or the line of the link device it names (ACPI 6.5 6.2.13). */
-static bool prt_gsi(const uacpi_pci_routing_table *t, uint8_t dev, unsigned pin, uint32_t *gsi) {
+static bool prt_gsi(const uacpi_pci_routing_table *t, uint8_t dev, unsigned pin, uint32_t *gsi,
+                    struct gsi_signal *signal) {
     for (size_t i = 0; i < t->num_entries; i++) {
         const uacpi_pci_routing_table_entry *e = &t->entries[i];
         if (e->address >> 16 != dev || e->pin != pin) continue;
-        struct gsi_signal signal = {.level = true, .active_low = true, .shared = true};
+        *signal = (struct gsi_signal){.level = true, .active_low = true, .shared = true};
         if (!e->source) *gsi = e->index;
-        else if (!link_gsi(e->source, e->index, gsi, &signal)) return false;
-        return ioapic_gsi_signal(*gsi, signal);
+        else if (!link_gsi(e->source, e->index, gsi, signal)) return false;
+        return true;
     }
     return false;
 }
 
-bool acpi_pci_gsi(const struct pci_device *d, uint32_t *gsi) {
+bool acpi_pci_gsi(const struct pci_device *d, uint32_t *gsi, struct gsi_signal *signal) {
     if (!aml_ready || !d) return false;
     unsigned pin = (pci_read32(d->address, 0x3C) >> 8) & 0xFF; /* 1 = INTA .. 4 = INTD */
     if (pin < 1 || pin > 4) return false;
@@ -1021,7 +1023,7 @@ bool acpi_pci_gsi(const struct pci_device *d, uint32_t *gsi) {
         uacpi_namespace_node *bus = d->upstream ? acpi_pci_node(d->upstream) : acpi_pci_host(d);
         uacpi_pci_routing_table *table;
         if (bus && uacpi_get_pci_routing_table(bus, &table) == UACPI_STATUS_OK) {
-            bool found = prt_gsi(table, d->address.dev, pin, gsi);
+            bool found = prt_gsi(table, d->address.dev, pin, gsi, signal);
             uacpi_free_pci_routing_table(table);
             return found;
         }

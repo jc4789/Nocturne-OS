@@ -10,6 +10,7 @@
 #include "dev/iommu.h"
 #include "mm/heap.h"
 #include "mm/vmm.h"
+#include "sys/clock.h"
 
 #define REG_ID     0x00
 #define REG_VER    0x01
@@ -31,6 +32,8 @@ struct pin {
     uint8_t vector;
     bool routed;     /* a vector's (ioapic_route) */
     bool held;       /* masked by its line (ioapic_hold) */
+    bool moving;     /* masked while its route changes (pin_quiet to the new entry) */
+    bool live;       /* its entry delivers: routed or an NMI source, and written (pin_write) */
     bool nmi;        /* an NMI source: delivered as an NMI to CPU 0, no device's */
     bool described;  /* its signal the MADT's (an override, the SCI, an NMI source): ACPI's _CRS and _PRT keep it */
     struct gsi_signal signal;
@@ -75,42 +78,77 @@ static struct ioapic *owner(uint32_t gsi, uint32_t *n) {
     return NULL;
 }
 
-/* The plain entry of a pin as given: masked unless routed or an NMI source, and while held. */
+/* The plain entry of a pin as given: masked unless routed or an NMI source, while held, and while
+   its route changes. */
 static uint64_t plain_entry(const struct pin *p) {
     if (!p->routed && !p->nmi) return RTE_MASK;
     uint64_t rte = p->nmi ? DELIV_NMI : p->vector; /* fixed delivery: 000b */
     if (p->signal.active_low) rte |= RTE_ACTIVELOW;
     if (p->signal.level && !p->nmi) rte |= RTE_LEVEL; /* an NMI is edge-triggered */
-    if (p->held) rte |= RTE_MASK;
-    return rte | (uint64_t)(p->dest <= 0xFF ? p->dest : 0) << 56;
+    if (p->held || p->moving) rte |= RTE_MASK;
+    return rte | (uint64_t)(p->dest <= IOMMU_PLAIN_REACH ? p->dest : 0) << 56;
 }
 
-/* A level pin's interrupt still in service: Remote IRR stays set until the EOI that carries the
-   entry's vector (82093AA 3.2.4), so an entry rewritten meanwhile with another vector would never
-   see it clear and the pin would deliver no more. Masked, the pin is waited on until it clears:
-   the handler runs on another CPU, or has, with interrupts off and briefly. Reads, not time: the
-   clock may not run yet at boot, when nothing is in service. */
-#define REMOTE_IRR_READS 100000u
-static void remote_irr_wait(struct ioapic *io, uint32_t n) {
-    unsigned reads = 0;
-    while (rd(io, REG_RTE(n)) & RTE_REMOTE_IRR && ++reads < REMOTE_IRR_READS) pause();
-    if (reads == REMOTE_IRR_READS)
-        kprintf("ioapic: GSI %u: its Remote IRR does not clear: the EOI of its interrupt was lost\n", io->gsi_base + n);
+/* The end of pin n's interrupt with that vector, as an EOI would bring it: the IOAPIC's EOI
+   register, which clears Remote IRR in each of its entries with the vector, or, before version
+   20h, the masked entry turned edge-triggered and back, which clears it. io->lock held. */
+static void eoi_write(struct ioapic *io, uint32_t n, uint8_t vector) {
+    if (io->version >= VERSION_EOIR) {
+        mmio_write32(io->regs + EOIR_WORD, vector);
+        return;
+    }
+    uint32_t lo = rd(io, REG_RTE(n));
+    wr(io, REG_RTE(n), (lo | RTE_MASK) & ~RTE_LEVEL);
+    wr(io, REG_RTE(n), lo);
 }
 
-/* Pin n written from what it was given, through interrupt remapping (dev/iommu.h): false when
-   that cannot deliver it, and the pin is masked. io->lock held. */
+/* Remote IRR left set in masked pin n with nothing in service: the CPU that took its interrupt was
+   reset before its EOI (the firmware's before boot, S3, INIT), so none will come. io->lock held. */
+static void remote_irr_clear(struct ioapic *io, uint32_t n) {
+    uint32_t lo = rd(io, REG_RTE(n));
+    if (lo & RTE_REMOTE_IRR) eoi_write(io, n, (uint8_t)lo);
+}
+
+/* Pin n written from what it was given, through interrupt remapping (dev/iommu.h), masked while
+   its entries change: false when remapping cannot deliver it, and the pin stays masked. Nothing
+   may be in service on it with another vector than the one written (pin_quiet). io->lock held. */
 static bool pin_write(struct ioapic *io, uint32_t n) {
     struct pin *p = &io->pin[n];
+    wr(io, REG_RTE(n), rd(io, REG_RTE(n)) | RTE_MASK);
     uint64_t rte = plain_entry(p);
     bool ok = !(p->routed || p->nmi) || iommu_ioapic_entry(io->id, n, io->pins, p->dest, &rte);
+    p->live = ok && (p->routed || p->nmi);
     if (!ok) rte = RTE_MASK;
-    wr(io, REG_RTE(n), rd(io, REG_RTE(n)) | RTE_MASK); /* masked as it is: its vector kept for the EOI */
-    if (p->signal.level) remote_irr_wait(io, n);
-    wr(io, REG_RTE(n), RTE_MASK | (uint32_t)rte); /* masked while the destination changes */
     wr(io, REG_RTE(n) + 1, (uint32_t)(rte >> 32));
     wr(io, REG_RTE(n), (uint32_t)rte);
     return ok;
+}
+
+/* Pin n masked for a new route, and its interrupt in service, if any, ended: Remote IRR of a level
+   pin clears only at the EOI with the entry's vector (82093AA 3.2.4), and its remapping entry
+   (VT-d) must not lead elsewhere before then. Waited for out of the lock with this CPU's
+   interrupts on, so that the handler, here or on another CPU, runs to its EOI and takes the lock
+   for its hold. One that never ends lost its EOI: cleared then. Any thread; the pin's moving
+   until the caller writes it. */
+#define REMOTE_IRR_WAIT_NS (100 * NS_PER_MS)
+static void pin_quiet(struct ioapic *io, uint32_t n) {
+    uint64_t f = spin_lock(&io->lock);
+    io->pin[n].moving = true;
+    uint32_t lo = rd(io, REG_RTE(n)) | RTE_MASK;
+    wr(io, REG_RTE(n), lo);
+    spin_unlock(&io->lock, f);
+    if (!(lo & RTE_LEVEL)) return;
+    uint64_t until = clock_after(REMOTE_IRR_WAIT_NS);
+    for (bool busy = true; busy; pause()) {
+        f = spin_lock(&io->lock);
+        busy = rd(io, REG_RTE(n)) & RTE_REMOTE_IRR;
+        if (busy && clock_now_ns() >= until) {
+            kprintf("ioapic: GSI %u: its interrupt in service was never ended; cleared\n", io->gsi_base + n);
+            remote_irr_clear(io, n);
+            busy = false;
+        }
+        spin_unlock(&io->lock, f);
+    }
 }
 
 /* The signal of an ISA source the MPS INTI flags describe: the bus's own (00) is edge and active
@@ -200,8 +238,11 @@ void ioapic_init(void) {
     for (unsigned i = 0; i < nios; i++) {
         io = ios[i];
         uint64_t f = spin_lock(&io->lock);
-        for (n = 0; n < io->pins; n++)
+        for (n = 0; n < io->pins; n++) {
+            wr(io, REG_RTE(n), rd(io, REG_RTE(n)) | RTE_MASK);
+            remote_irr_clear(io, n);
             if (!pin_write(io, n)) kprintf("ioapic: the NMI source at GSI %u cannot be delivered\n", io->gsi_base + n);
+        }
         spin_unlock(&io->lock, f);
     }
 }
@@ -263,23 +304,28 @@ bool ioapic_route(uint32_t gsi, uint8_t vector, uint32_t dest) {
     uint32_t n;
     struct ioapic *io = owner(gsi, &n);
     if (!io || io->pin[n].nmi) return false;
+    pin_quiet(io, n);
     uint64_t f = spin_lock(&io->lock);
     struct pin *p = &io->pin[n];
     p->vector = vector;
     p->dest = dest;
     p->routed = true;
+    p->moving = false;
     bool ok = pin_write(io, n);
     if (!ok) p->routed = false;
     spin_unlock(&io->lock, f);
     return ok;
 }
 
+/* Its hold goes with its route: a line routed here later starts unheld. */
 void ioapic_unroute(uint32_t gsi) {
     uint32_t n;
     struct ioapic *io = owner(gsi, &n);
     if (!io || io->pin[n].nmi) return;
+    pin_quiet(io, n);
     uint64_t f = spin_lock(&io->lock);
-    io->pin[n].routed = false;
+    struct pin *p = &io->pin[n];
+    p->routed = p->held = p->moving = false;
     pin_write(io, n);
     (void)rd(io, REG_RTE(n)); /* the masking write has reached the chip: nothing more leaves the pin */
     spin_unlock(&io->lock, f);
@@ -295,14 +341,12 @@ void ioapic_eoi(uint32_t gsi, uint8_t vector) {
     uint32_t n;
     struct ioapic *io = owner(gsi, &n);
     if (!io) return;
-    if (io->version >= VERSION_EOIR) {
+    if (io->version >= VERSION_EOIR) { /* a register of its own: no IOREGSEL between */
         mmio_write32(io->regs + EOIR_WORD, vector);
         return;
     }
     spin_take(&io->lock);
-    uint32_t lo = rd(io, REG_RTE(n));
-    wr(io, REG_RTE(n), (lo | RTE_MASK) & ~RTE_LEVEL);
-    wr(io, REG_RTE(n), lo);
+    eoi_write(io, n, vector);
     spin_give(&io->lock);
 }
 
@@ -316,7 +360,7 @@ void ioapic_hold(uint32_t gsi, bool held) {
     struct pin *p = &io->pin[n];
     p->held = held;
     uint32_t lo = rd(io, REG_RTE(n));
-    wr(io, REG_RTE(n), held || !p->routed ? lo | RTE_MASK : lo & ~RTE_MASK);
+    wr(io, REG_RTE(n), held || !p->live || p->moving ? lo | RTE_MASK : lo & ~RTE_MASK);
     spin_give(&io->lock);
 }
 
@@ -355,7 +399,7 @@ void ioapic_resume(void) {
         struct ioapic *io = ios[i];
         uint64_t f = spin_lock(&io->lock);
         wr(io, REG_ID, io->saved_id);
+        for (uint32_t n = 0; n < io->pins; n++) remote_irr_clear(io, n); /* masked since ioapic_mask_all */
         spin_unlock(&io->lock, f);
     }
-    if (!ioapic_remap()) kprintf("ioapic: an entry stays masked after sleep\n");
 }

@@ -796,8 +796,11 @@ static struct iommu_id amd_alias(struct iommu_id id) {
 /* ---- interrupts ----
    A remapped message carries its remapping table index in data bits 10:0 (2.2.5.1) and no
    destination: fixed delivery to a physical APIC id, the entry the 128-bit format with GuestMode 0
-   (Figure 19), whose destination has 32 bits (24 in its low word, 8 in its high one). The table is
-   cached: every change is invalidated (2.3.2) for the IDs that use it. */
+   (Figure 19), whose destination has 32 bits (24 in its low word, 8 in its high one). Its address
+   has DM 1: with DM 0 the unit takes data bits 10:8 as the message type whatever the table's
+   length, and only DM 1 indexes 2048 entries (Table 19); the entry's own DM says how it is
+   delivered. The table is cached: every change is invalidated (2.3.2) for the IDs that use it. */
+#define MSI_ADDRESS_DM (1u << 2)
 
 static bool is_unit_function(const struct pci_device *d) {
     for (size_t i = 0; i < nunits; i++)
@@ -835,7 +838,9 @@ static bool kernel_irt_join(struct kernel_irt *k, const struct iommu_id *ids, un
     return on_every_unit(ids_flush, &(struct id_list){ids, n, true});
 }
 
-/* The kernel table d's requester IDs point at, made when none does. */
+/* The kernel table d's requester IDs point at, made when none does: one made meanwhile for a
+   function sharing an ID wins, and the one made here goes back. A table in the list stays there,
+   its IDs pointing at it or about to. */
 static struct iommu_irt *kernel_irt_of(struct pci_device *d) {
     unsigned n;
     struct iommu_id *ids = iommu_requester_ids(d, &n);
@@ -843,21 +848,38 @@ static struct iommu_irt *kernel_irt_of(struct pci_device *d) {
     uint64_t f = spin_lock(&kernel_irts_lock);
     struct kernel_irt *k = kernel_irt_holding(ids, n);
     spin_unlock(&kernel_irts_lock, f);
-    bool fresh = !k;
-    if (fresh && (k = kzalloc(sizeof *k)) && !iommu_irt_make(&k->t, 1u << irt_log2, IRTE_BYTES)) {
-        kfree(k);
-        k = NULL;
+    if (!k) {
+        struct kernel_irt *made = kzalloc(sizeof *made);
+        if (made && !iommu_irt_make(&made->t, 1u << irt_log2, IRTE_BYTES)) {
+            kfree(made);
+            made = NULL;
+        }
+        f = spin_lock(&kernel_irts_lock);
+        if (!(k = kernel_irt_holding(ids, n)) && made) {
+            made->next = kernel_irts;
+            kernel_irts = k = made;
+            made = NULL;
+        }
+        spin_unlock(&kernel_irts_lock, f);
+        if (made) {
+            iommu_irt_free(&made->t);
+            kfree(made);
+        }
     }
     bool joined = k && kernel_irt_join(k, ids, n);
     kfree(ids);
-    if (!joined) return NULL; /* a fresh one's IDs may point at it: kept, out of the list */
-    if (fresh) {
-        f = spin_lock(&kernel_irts_lock);
-        k->next = kernel_irts;
-        kernel_irts = k;
-        spin_unlock(&kernel_irts_lock, f);
-    }
-    return &k->t;
+    return joined ? &k->t : NULL;
+}
+
+/* One of d's requester IDs is an IOAPIC's (struct ioapic_source): its table is indexed by the
+   vector, and a message of d would take an entry a pin owns. */
+static bool sends_as_ioapic(struct pci_device *d) {
+    unsigned n;
+    struct iommu_id *ids = iommu_requester_ids(d, &n);
+    bool found = false;
+    for (size_t i = 0; ids && !found && i < nioapic_sources; i++) found = id_listed(ids, n, ioapic_sources[i].id);
+    kfree(ids);
+    return found;
 }
 
 static void kernel_irts_leave(const struct iommu_domain *dom) {
@@ -878,12 +900,12 @@ static bool amd_msi_table(struct pci_device *d, struct iommu_irt **t) {
     if (is_unit_function(d) || !iommu_seen(d)) return true;
     struct iommu_domain *dom = d->claimed ? iommu_domain_of(d) : NULL;
     if (dom) return *t = &dom->irt, true;
-    if (iommu_in_use(d)) return false;
+    if (iommu_in_use(d) || sends_as_ioapic(d)) return false;
     return (*t = kernel_irt_of(d)) != NULL;
 }
 
 static uint32_t amd_msi_reach(const struct pci_device *d) {
-    return is_unit_function(d) || !apic_x2() || !iommu_seen(d) ? 0xFF : UINT32_MAX;
+    return is_unit_function(d) || !apic_x2() || !iommu_seen(d) ? IOMMU_PLAIN_REACH : UINT32_MAX;
 }
 
 static bool amd_msi_write(struct pci_device *d, struct iommu_irt *t, unsigned first, unsigned count, uint8_t vector,
@@ -892,7 +914,7 @@ static bool amd_msi_write(struct pci_device *d, struct iommu_irt *t, unsigned fi
     for (unsigned i = 0; i < count; i++)
         iommu_entry_write16((volatile uint64_t *)(irt + (first + i) * IRTE_BYTES),
                             1u | (uint64_t)(dest & 0xFFFFFF) << 8, (uint8_t)(vector + i) | (uint64_t)(dest >> 24) << 56);
-    *address = iommu_msi_plain(0);
+    *address = iommu_msi_plain(0) | MSI_ADDRESS_DM;
     *data = first;
     unsigned n;
     struct iommu_id *ids = iommu_requester_ids(d, &n);
@@ -927,10 +949,10 @@ static struct ioapic_source *remapped_ioapic(uint8_t ioapic_id) {
 static bool amd_ioapic(uint8_t ioapic_id, unsigned pin, unsigned pins, uint32_t dest, uint64_t *rte) {
     (void)pin, (void)pins;
     struct ioapic_source *s = remapped_ioapic(ioapic_id);
-    if (!s) return dest <= 0xFF;
+    if (!s) return dest <= IOMMU_PLAIN_REACH;
     uint64_t v = *rte;
     unsigned mode = v >> 8 & 7;
-    if (mode == 4) return dest <= 0xFF && (s->passes & IVHD_NMI_PASS);
+    if (mode == 4) return dest <= IOMMU_PLAIN_REACH && (s->passes & IVHD_NMI_PASS);
     ASSERT(mode == 0);
     uint8_t vector = (uint8_t)v;
     iommu_entry_write16((volatile uint64_t *)((uint8_t *)phys_to_virt(s->t.phys) + vector * IRTE_BYTES),
@@ -944,7 +966,7 @@ static bool amd_ioapic(uint8_t ioapic_id, unsigned pin, unsigned pins, uint32_t 
 }
 
 static uint32_t amd_ioapic_reach(uint8_t ioapic_id) {
-    return remapped_ioapic(ioapic_id) && apic_x2() ? UINT32_MAX : 0xFF;
+    return remapped_ioapic(ioapic_id) && apic_x2() ? UINT32_MAX : IOMMU_PLAIN_REACH;
 }
 
 /* Each IOAPIC the IVRS names gets its table and its DTE pointing at it: interrupts remapped, its

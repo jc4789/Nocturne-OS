@@ -9,7 +9,7 @@
    The system vectors are the same on every CPU, at the top. A device's are given per CPU from
    VEC_DEVICE_FIRST to VEC_DEVICE_LAST, its CPU chosen in the device's node (fewest vectors in
    use) among the CPUs its interrupts can name. What a source can name is its reach, the highest
-   APIC ID its route carries: 0xFF for a plain MSI address or IOAPIC redirection entry (SDM
+   APIC ID its route carries: FEh for a plain MSI address or IOAPIC redirection entry (SDM
    13.11.1; 82093AA), more where the IOMMU remaps the source (dev/iommu.h, iommu_msi_reach and
    iommu_ioapic_reach). No driver has a fixed vector. The IOAPICs' lines are each given a vector
    number no other line has on any CPU: a level interrupt's EOI reaches every IOAPIC with its
@@ -21,6 +21,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "arch/cpu.h"
+#include "arch/ioapic.h"
 #include "arch/percpu.h"
 
 #define VEC_PIC_BASE      0x20 /* the 8259's 16, moved here and all masked (irq_init): none comes */
@@ -68,9 +69,11 @@ struct irq;
    irq_request_msi_block: count (a power of two up to 32) vectors in one aligned run on one CPU,
    for MSI's multiple messages (PCI Local Bus 3.0, 6.8.1.3: message n is data + n), specs[i] for
    message i: false when it cannot.
-   irq_request_gsi: the IOAPIC pin's, its trigger, polarity and sharing as the MADT and ACPI
-   describe them (arch/ioapic.h), its reach the pin's; a level shared pin is shared unless a request
-   asks for it alone (spec.alone), an edge or exclusive one is not.
+   irq_request_gsi: the IOAPIC pin's, source what ACPI says the device signals (_CRS, _PRT), told
+   to the pin with the route (ioapic_gsi_signal: refused where the pin takes it not); the line's
+   trigger, polarity and sharing then the pin's (the MADT's where it describes the pin), its reach
+   the pin's; a level shared pin is shared unless a request asks for it alone (spec.alone), an
+   edge or exclusive one is not.
    irq_request_system: a system vector (VEC_SYSTEM_FIRST up to VEC_APIC_ERROR) on every CPU, for
    the local APIC's own sources and the IPIs; a handler, no thread. Any time after the heap.
    Any CPU; the MSI and GSI requests and irq_free sleep (a thread, a mutex), never from an
@@ -79,7 +82,7 @@ struct irq;
 struct irq *irq_request_msi(const struct irq_spec *spec, unsigned cpu, uint32_t reach);
 bool irq_request_msi_block(const struct irq_spec *specs, unsigned count, unsigned cpu, uint32_t reach,
                            struct irq **irqs);
-struct irq *irq_request_gsi(const struct irq_spec *spec, unsigned gsi);
+struct irq *irq_request_gsi(const struct irq_spec *spec, unsigned gsi, struct gsi_signal source);
 struct irq *irq_request_system(const struct irq_spec *spec, unsigned vector);
 /* Returns once no handler or thread of it runs on any CPU, nor will (its source the caller turned
    off first: a message that still comes is a stray). Never from its own handler or thread. */
@@ -112,11 +115,14 @@ struct regs *irq_regs(void);
 /* CPU 0 once, after the MADT and the heap, before any MSI or GSI request: the 8259 moved and
    masked, the IOAPICs found and masked, the local APICs' NMI inputs read and this CPU's APIC set
    (apic_init_cpu; every other CPU sets its own as it starts). suspend and resume: CPU 0 around
-   S3, interrupts off: the IOAPICs' entries masked, then (the chips reset) the 8259 masked again
-   and every entry made again, after the IOMMU (iommu_resume) and this CPU's APIC. */
+   a sleep, interrupts off: the IOAPICs' entries masked; then, after the IOMMU (iommu_resume) and
+   this CPU's APIC, the 8259 masked again, the vectors left draining freed (slept: this CPU's APIC
+   was reset), the IOAPICs' entries still masked; resume_lines, once every CPU is back
+   (smp_resume), every entry made again. */
 void irq_init(void);
 void irq_suspend(void);
-void irq_resume(void);
+void irq_resume(bool slept);
+void irq_resume_lines(void);
 
 /* The ways into the kernel (arch/idt.c, arch/isr.asm): idt_init builds the IDT on the first CPU
    and loads its entries there, entry_load loads them on each other CPU as it starts (the IDT and

@@ -784,7 +784,7 @@ static void irte_write(struct irt_table *t, unsigned index, uint64_t lo, uint64_
 static uint64_t irte_dest(uint32_t dest) { return eime ? (uint64_t)dest << 32 : (uint64_t)(dest & 0xFF) << 40; }
 
 /* The highest APIC ID an entry names: 32 bits in Extended Interrupt Mode, 8 otherwise. */
-static uint32_t remapped_reach(void) { return eime ? UINT32_MAX : 0xFF; }
+static uint32_t remapped_reach(void) { return eime ? UINT32_MAX : IOMMU_PLAIN_REACH; }
 
 /* What an entry checks the sender against: d's requester ID, or the buses of its IDs when a
    bridge sends its requests as its own. 0 without memory. */
@@ -822,7 +822,7 @@ static bool intel_msi_table(struct pci_device *d, struct iommu_irt **t) {
 }
 
 static uint32_t intel_msi_reach(const struct pci_device *d) {
-    return remap && irt_of(d->address.segment) && iommu_seen(d) ? remapped_reach() : 0xFF;
+    return remap && irt_of(d->address.segment) && iommu_seen(d) ? remapped_reach() : IOMMU_PLAIN_REACH;
 }
 
 /* Message n of d arrives through entry first + n: the address carries the handle first with
@@ -871,7 +871,7 @@ static struct ioapic_scope *ioapic_of(uint8_t ioapic_id) {
 }
 
 static uint32_t intel_ioapic_reach(uint8_t ioapic_id) {
-    return remap && ioapic_of(ioapic_id) ? remapped_reach() : 0xFF;
+    return remap && ioapic_of(ioapic_id) ? remapped_reach() : IOMMU_PLAIN_REACH;
 }
 
 /* The pins of an IOAPIC are a run of entries, taken at its first pin's route. The IRTE takes
@@ -879,7 +879,7 @@ static uint32_t intel_ioapic_reach(uint8_t ioapic_id) {
    destination; the pin keeps polarity, trigger, vector (for the EOI of a level pin, 5.1.5.1) and
    mask, with delivery mode 000. arch/ioapic.c's lock held: one route of a pin at a time. */
 static bool intel_ioapic(uint8_t ioapic_id, unsigned pin, unsigned pins, uint32_t dest, uint64_t *rte) {
-    if (!remap) return dest <= 0xFF; /* the plain entry's 8-bit destination */
+    if (!remap) return dest <= IOMMU_PLAIN_REACH; /* the plain entry's 8-bit destination */
     struct ioapic_scope *a = ioapic_of(ioapic_id);
     struct irt_table *t = a ? irt_of(a->segment) : NULL;
     if (!t) {
@@ -1173,7 +1173,7 @@ static bool unit_tables(struct unit *u) {
        bits 31:8 in FEUADDR, which a unit with EIM implements (11.4.7.5) and reads once the pointer
        above set EIME (5.1.6.2), so it is unmasked only then; else an 8-bit destination. */
     struct irq_target to = fault_irq ? irq_target(fault_irq) : (struct irq_target){0};
-    if (ok && fault_irq && (eime || to.apic_id <= 0xFF)) {
+    if (ok && fault_irq && (eime || to.apic_id <= IOMMU_PLAIN_REACH)) {
         wr32(u, R_FEDATA, to.vector);
         wr32(u, R_FEADDR, iommu_msi_plain(to.apic_id & 0xFF));
         wr32(u, R_FEUADDR, eime ? to.apic_id & ~0xFFu : 0);
@@ -1345,7 +1345,7 @@ static bool intel_start(bool translate) {
     /* any CPU the unit's message can name: a 32-bit destination in Extended Interrupt Mode (unit_tables) */
     if (!fault_irq)
         fault_irq = irq_request_msi(&(struct irq_spec){.name = "VT-d faults", .handler = fault_isr, .node = -1}, IRQ_CPU_ANY,
-                                    eime ? UINT32_MAX : 0xFF);
+                                    eime ? UINT32_MAX : IOMMU_PLAIN_REACH);
     uint64_t f = units_hold();
     ok = units_start(translate);
     if (!ok && translate && remap) {

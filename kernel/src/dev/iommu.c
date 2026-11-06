@@ -1122,7 +1122,7 @@ bool iommu_msi_message(struct pci_device *d, unsigned index, unsigned count, con
     struct iommu_irt *t = NULL;
     if (hw && !hw->msi_table(d, &t)) return false;
     if (!t) {
-        if (to.apic_id > 0xFF) return false;
+        if (to.apic_id > IOMMU_PLAIN_REACH) return false;
         *address = iommu_msi_plain(to.apic_id);
         *data = to.vector; /* fixed delivery, edge (SDM 13.11.2) */
         return true;
@@ -1139,14 +1139,14 @@ bool iommu_msi_clear(struct pci_device *d) {
     return true;
 }
 
-uint32_t iommu_msi_reach(const struct pci_device *d) { return hw && !restore_failed ? hw->msi_reach(d) : 0xFF; }
+uint32_t iommu_msi_reach(const struct pci_device *d) { return hw && !restore_failed ? hw->msi_reach(d) : IOMMU_PLAIN_REACH; }
 
 bool iommu_ioapic_entry(uint8_t ioapic_id, unsigned pin, unsigned pins, uint32_t dest, uint64_t *rte) {
     if (restore_failed) return false;
-    return hw ? hw->ioapic(ioapic_id, pin, pins, dest, rte) : dest <= 0xFF;
+    return hw ? hw->ioapic(ioapic_id, pin, pins, dest, rte) : dest <= IOMMU_PLAIN_REACH;
 }
 
-uint32_t iommu_ioapic_reach(uint8_t ioapic_id) { return hw && !restore_failed ? hw->ioapic_reach(ioapic_id) : 0xFF; }
+uint32_t iommu_ioapic_reach(uint8_t ioapic_id) { return hw && !restore_failed ? hw->ioapic_reach(ioapic_id) : IOMMU_PLAIN_REACH; }
 
 
 const char *iommu_resume(void) {

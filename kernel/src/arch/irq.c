@@ -58,6 +58,7 @@ struct irq {
     bool pending;           /* a run owed */
     bool running;           /* a thread runs spec.thread now */
     bool holding;           /* its level line is masked for that run (hold_take) or by IRQ_HOLD */
+    bool unheld;            /* irq_unhold came before the hold its handler returns (hold) */
     bool stopping;
     unsigned gen;           /* the current thread's; an older one ends, a newer one waits */
     unsigned threads;       /* alive */
@@ -77,6 +78,7 @@ struct line {
     struct spinlock lock;   /* holds and dead; taken under an irq's lock */
     unsigned holds;         /* runs woken and not done: the pin masked while above 0 */
     bool dead;              /* masked for good: asserted with no handler taking it (line_count) */
+    bool gone;              /* freed (irq_free): its holds no longer reach the pin, routed anew */
     unsigned delivered, unhandled; /* this window's deliveries, those no handler took; its CPU's alone */
     struct line *next;
 };
@@ -130,7 +132,7 @@ static void hold_take(struct irq *irq) {
     if (!l || !l->level || irq->holding) return;
     irq->holding = true;
     spin_take(&l->lock);
-    if (!l->holds++) ioapic_hold(l->gsi, true);
+    if (!l->holds++ && !l->gone) ioapic_hold(l->gsi, true);
     spin_give(&l->lock);
 }
 
@@ -141,7 +143,7 @@ static void hold_give(struct irq *irq) {
     irq->holding = false;
     struct line *l = irq->line;
     spin_take(&l->lock);
-    if (!--l->holds) ioapic_hold(l->gsi, false);
+    if (!--l->holds && !l->gone) ioapic_hold(l->gsi, false);
     spin_give(&l->lock);
 }
 
@@ -228,17 +230,21 @@ static void thread_wake(struct irq *irq) {
     spin_give(&irq->lock);
 }
 
-/* IRQ_HOLD: a level line masked until irq_unhold. An irq with a thread holds for its runs. */
+/* IRQ_HOLD: a level line masked until irq_unhold. An irq with a thread holds for its runs. The
+   handler made its event seen before it returned, so its owner may have answered it already
+   (irq_unhold before the hold): then there is nothing to hold for. */
 static void hold(struct irq *irq) {
     ASSERT(!irq->spec.thread);
     spin_take(&irq->lock);
-    hold_take(irq);
+    if (irq->unheld) irq->unheld = false;
+    else hold_take(irq);
     spin_give(&irq->lock);
 }
 
 void irq_unhold(struct irq *irq) {
     uint64_t f = spin_lock(&irq->lock);
-    hold_give(irq);
+    if (irq->holding) hold_give(irq);
+    else if (irq->line && irq->line->level) irq->unheld = true;
     spin_unlock(&irq->lock, f);
 }
 
@@ -265,10 +271,10 @@ static void line_count(struct line *l, bool taken) {
     l->delivered = l->unhandled = 0;
     if (!storm) return;
     spin_take(&l->lock);
-    bool first = !l->dead;
+    bool first = !l->dead && !l->gone;
     if (first) {
         l->dead = true;
-        if (!l->holds++) ioapic_hold(l->gsi, true); /* a hold no run gives back */
+        if (!l->holds++) ioapic_hold(l->gsi, true); /* a hold no run gives back, but irq_free's unroute */
     }
     spin_give(&l->lock);
     if (first) kprintf("irq: GSI %u stays asserted and no driver takes it: masked\n", l->gsi);
@@ -536,11 +542,12 @@ bool irq_msi_rewrite(struct irq *irq) {
     return ok;
 }
 
-struct irq *irq_request_gsi(const struct irq_spec *spec, unsigned gsi) {
+struct irq *irq_request_gsi(const struct irq_spec *spec, unsigned gsi, struct gsi_signal source) {
     struct irq *irq = irq_new(spec, KIND_GSI);
     struct line *fresh = kzalloc(sizeof *fresh), *l;
     if (!irq || !fresh) goto fail;
-    mutex_lock(&requests);
+    mutex_lock(&requests); /* the source's signal and the route at once: no other source between */
+    if (!ioapic_gsi_signal(gsi, source)) goto unlock;
     for (l = lines; l && l->gsi != gsi; l = l->next) {}
     struct gsi_signal signal;
     bool made = !l;
@@ -629,6 +636,9 @@ void irq_free(struct irq *irq) {
         while (*at != irq) at = &(*at)->next;
         __atomic_store_n(at, irq->next, __ATOMIC_RELEASE);
         if (!l->irqs) {
+            uint64_t f = spin_lock(&l->lock);
+            l->gone = true;
+            spin_unlock(&l->lock, f);
             ioapic_unroute(l->gsi);
             vector_retire(l->cpu, l->vector);
             if (l->old_vector) vector_retire(l->old_cpu, l->old_vector);
@@ -748,20 +758,34 @@ void irq_init(void) {
 
 void irq_suspend(void) { ioapic_suspend(); }
 
-/* The sleep reset every APIC, its IRR with it: nothing a retired route sent is pending anywhere. */
-static void drained_all(void) {
+/* The other CPUs start again through INIT, which clears their IRR, and this one's was reset where
+   the machine slept: nothing a retired route sent is pending there. Where it did not sleep this
+   CPU looks at its own IRR, as its drain would. */
+static void drained_all(bool this_reset) {
+    unsigned self = cpu_current_index();
     for (unsigned c = 0; c < topology.cpus; c++) {
         struct vectors *vs = &per_cpu(vectors, c);
         uint64_t f = spin_lock(&vs->lock);
         for (unsigned w = 0; w < 256 / 64; w++)
-            for (uint64_t bits = vs->draining[w]; bits; bits &= bits - 1) vector_free(vs, w * 64 + __builtin_ctzll(bits));
-        memset(vs->draining, 0, sizeof vs->draining);
+            for (uint64_t bits = vs->draining[w]; bits; bits &= bits - 1) {
+                unsigned v = w * 64 + __builtin_ctzll(bits);
+                if (c == self && !this_reset) {
+                    drain_one(vs, v);
+                } else {
+                    bit_clear(vs->draining, v);
+                    vector_free(vs, v);
+                }
+            }
         spin_unlock(&vs->lock, f);
     }
 }
 
-void irq_resume(void) {
+void irq_resume(bool slept) {
     pic_disable();
-    drained_all();
+    drained_all(slept);
     ioapic_resume();
+}
+
+void irq_resume_lines(void) {
+    if (!ioapic_remap()) kprintf("irq: an IOAPIC line stays masked after sleep\n");
 }

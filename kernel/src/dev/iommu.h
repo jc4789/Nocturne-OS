@@ -247,5 +247,8 @@ unsigned iommu_dma_bits(const struct iommu_domain *dom);
 bool iommu_fault_report(void);
 /* The plain MSI address for a physical APIC id (bits 19:12, no redirection hint; SDM 13.11.1). */
 static inline uint32_t iommu_msi_plain(uint32_t dest) { return 0xFEE00000u | dest << 12; }
+/* The highest APIC ID an 8-bit destination names one CPU by: FFh is the broadcast (SDM 13.11.1),
+   in x2APIC mode too where the 8 bits come from a plain MSI address or IOAPIC entry. */
+#define IOMMU_PLAIN_REACH 0xFEu
 #define IOMMU_NO_IRTE UINT32_MAX
 

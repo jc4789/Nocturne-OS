@@ -801,8 +801,9 @@ static unsigned bus_irq_enable(struct hal_device *h, const struct irq_spec *spec
     if (!count) return 0;
     unsigned n = d->no_messages ? 0 : pci_irq_enable(d, specs, count, irqs);
     uint32_t gsi;
-    if (n || d->claimed || d->intx || !acpi_pci_gsi(d, &gsi)) return n;
-    if (!(d->intx = irq_request_gsi(&specs[0], gsi))) return 0;
+    struct gsi_signal signal;
+    if (n || d->claimed || d->intx || !acpi_pci_gsi(d, &gsi, &signal)) return n;
+    if (!(d->intx = irq_request_gsi(&specs[0], gsi, signal))) return 0;
     pci_write16(d->address, PCI_COMMAND, pci_read16(d->address, PCI_COMMAND) & ~PCI_COMMAND_INTX_DISABLE);
     if (irqs) irqs[0] = d->intx;
     return 1;

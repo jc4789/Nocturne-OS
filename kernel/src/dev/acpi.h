@@ -8,6 +8,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+struct gsi_signal;
+
 struct acpi_sdt {
     char sig[4];
     uint32_t length;
@@ -216,9 +218,10 @@ bool acpi_pci_proximity(const struct pci_device *d, uint32_t *domain);
 /* The GSI a function's INTx reaches (ACPI 6.5 6.2.13, _PRT): its Interrupt Pin, swizzled at each
    bridge without a _PRT of its own, looked up in the nearest _PRT above it, a GSI there or the
    interrupt of the link device it names (the link given one from its _PRS first, _SRS, when it
-   has none); its signal told to the IOAPICs (ioapic_gsi_signal) for irq_request_gsi. False
-   without a pin, a route, an interrupt the link can be given, or AML. Sleeps. */
-bool acpi_pci_gsi(const struct pci_device *d, uint32_t *gsi);
+   has none), and its signal (the link's line's, else PCI's level, active low and shared) for
+   irq_request_gsi. False without a pin, a route, an interrupt the link can be given, or AML.
+   Sleeps. */
+bool acpi_pci_gsi(const struct pci_device *d, uint32_t *gsi, struct gsi_signal *signal);
 void *acpi_node_child(void *node, uint32_t index);
 /* Whether s is one name segment: 4 characters of A-Z, 0-9 and _, the first not a digit (names of
    fewer characters are padded with _, as "_ON_"). Names starting with _ are ACPI's predefined

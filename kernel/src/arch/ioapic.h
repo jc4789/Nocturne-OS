@@ -24,11 +24,11 @@ uint32_t ioapic_isa_gsi(unsigned isa_irq);
 struct gsi_signal {
     bool level, active_low, shared;
 };
-/* What ACPI says the source on gsi signals (a PCI INTx through _PRT, a namespace device's _CRS):
-   false when the pin is routed already with another signal or exclusively (either side), belongs
-   to no IOAPIC, or is an NMI source. A pin the MADT describes (an override, the SCI) keeps the
-   MADT's trigger and polarity (ACPI 6.5 5.2.12.5). takes: whether signal would be taken now,
-   changing nothing. */
+/* What ACPI says the source on gsi signals (a PCI INTx through _PRT, a namespace device's _CRS),
+   told by the interrupt layer as it routes it (irq_request_gsi): false when the pin is routed
+   already with another signal or exclusively (either side), belongs to no IOAPIC, or is an NMI
+   source. A pin the MADT describes (an override, the SCI) keeps the MADT's trigger and polarity
+   (ACPI 6.5 5.2.12.5). takes: whether signal would be taken now, changing nothing. */
 bool ioapic_gsi_signal(uint32_t gsi, struct gsi_signal signal);
 bool ioapic_gsi_takes(uint32_t gsi, struct gsi_signal signal);
 /* Whether an IOAPIC has gsi for a device, and if so its signal. */
@@ -55,7 +55,8 @@ bool ioapic_remap(void);
 /* Every pin masked in the chips, the routes kept (ioapic_remap and ioapic_resume write them):
    before interrupt remapping changes format, and before a hibernation image takes over. */
 void ioapic_mask_all(void);
-/* Sleep (dev/pm.c): every pin masked before S3; after it (the chips reset), after the IOMMU
-   (iommu_resume), each chip's ID and every pin written again. */
+/* Sleep (dev/pm.c): every pin masked before it; after it, after the IOMMU (iommu_resume), each
+   chip's ID back and every pin still masked, Remote IRR cleared where the CPU that took its
+   interrupt was reset; the entries are written again by ioapic_remap. */
 void ioapic_suspend(void);
 void ioapic_resume(void);
