@@ -1,9 +1,11 @@
 /* The local APIC (arch/apic.h). One mode for every CPU, chosen once on CPU 0 (apic_choose_mode) and
    entered by each CPU itself as it starts (apic_init_cpu): the CPUs come in through the wake page
    in the mode the firmware or INIT left them in (arch/wake.asm reads their IDs from CPUID, which
-   gives them in either mode). Device interrupts reach APIC IDs up to 255 through the plain MSI
-   address and IOAPIC entry, and every APIC ID through interrupt remapping (arch/irq.c,
-   dev/iommu.c). */
+   gives them in either mode). Where x2APIC mode waits for interrupt remapping with 32-bit
+   destinations, every CPU moves to it together once the IOMMU remaps so (apic_x2_follow), and
+   from then on each CPU enters x2APIC mode as it starts. Device interrupts reach APIC IDs up to 255
+   through the plain MSI address and IOAPIC entry, and every APIC ID through interrupt remapping
+   (arch/irq.c, dev/iommu.c). */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/cpu_maker.h"
@@ -15,6 +17,7 @@
 #include "dev/acpi.h"
 #include "mm/heap.h"
 #include "mm/vmm.h"
+#include "sys/clock.h"
 
 #define X2APIC_MSR_BASE 0x800
 #define X2APIC_ICR 0x830   /* 64 bits: the destination in 63:32 (13.12.9) */
@@ -54,13 +57,22 @@
 #define DMAR_INTR_REMAP (1u << 0)
 #define DMAR_X2APIC_OPT_OUT (1u << 1)
 
-static bool x2;                /* the chosen mode: x2APIC, else xAPIC */
-static uint64_t xapic_phys;    /* xAPIC mode: where every CPU's registers are */
+/* A CPU that has not come to the move to x2APIC mode by then has had its interrupts off far longer
+   than any section the kernel runs with them off (arch/spin.h: no holder waits for another CPU),
+   and is taken to be stuck. */
+#define MOVE_WAIT_NS (1000 * NS_PER_MS)
+
+static bool x2;                 /* the CPUs' mode: x2APIC, else xAPIC; only ever false to true */
+static bool x2_waits;           /* xAPIC mode until interrupts are remapped (apic_x2_follow) */
+static bool handed_x2;          /* the firmware handed the first CPU over in x2APIC mode */
+static uint64_t xapic_phys;     /* xAPIC mode: where every CPU's registers are */
 static volatile uint8_t *xapic; /* and the kernel's uncached mapping of them */
 
 bool apic_x2(void) { return x2; }
 
-bool apic_reaches(uint32_t apic_id) { return x2 || apic_id < XAPIC_BROADCAST; }
+bool apic_x2_waits(void) { return x2_waits; }
+
+bool apic_handed_over(uint32_t apic_id) { return handed_x2 || apic_id < XAPIC_BROADCAST; }
 
 void lapic_write(uint32_t reg, uint32_t v) {
     if (x2) wrmsr(X2APIC_MSR_BASE + (reg >> 4), v);
@@ -82,25 +94,38 @@ static bool dmar_x2apic_opt_out(void) {
     return (flags & (DMAR_INTR_REMAP | DMAR_X2APIC_OPT_OUT)) == (DMAR_INTR_REMAP | DMAR_X2APIC_OPT_OUT);
 }
 
-/* The rule of apic_choose_mode (arch/apic.h); why: what decided it. */
-static bool x2_chosen(bool handed_x2, bool has_x2, bool opt_out, bool unremapped, const char **why) {
-    if (handed_x2) return *why = "the firmware handed it over", true;
-    if (!has_x2) return *why = "this CPU has no x2APIC mode", false;
-    if (opt_out) return *why = "the DMAR asks the OS to keep out of x2APIC mode (X2APIC_OPT_OUT)", false;
-    if (!unremapped) return *why = "the firmware handed over xAPIC mode, and x2APIC mode is to follow interrupt remapping, which comes later", false;
-    return *why = "this maker's APIC enters it before interrupt remapping", true;
+/* The modes apic_choose_mode picks among (arch/apic.h). */
+enum apic_plan {
+    APIC_PLAN_X2,             /* x2APIC mode from the start */
+    APIC_PLAN_X2_AFTER_REMAP, /* xAPIC mode until interrupts are remapped with 32-bit destinations */
+    APIC_PLAN_XAPIC,          /* xAPIC mode for good */
+};
+
+/* The rule of apic_choose_mode; why: what decided it. */
+static enum apic_plan apic_plan(bool handed, bool has_x2, bool opt_out, bool unremapped, const char **why) {
+    if (handed) return *why = "the firmware handed it over", APIC_PLAN_X2;
+    if (!has_x2) return *why = "this CPU has no x2APIC mode", APIC_PLAN_XAPIC;
+    if (opt_out) return *why = "the DMAR asks the OS to keep out of x2APIC mode (X2APIC_OPT_OUT)", APIC_PLAN_XAPIC;
+    if (unremapped) return *why = "this maker's APIC enters it before interrupt remapping", APIC_PLAN_X2;
+    *why = "x2APIC mode follows interrupt remapping with 32-bit destinations (SDM 13.12.7)";
+    return APIC_PLAN_X2_AFTER_REMAP;
 }
 
 void apic_choose_mode(void) {
     uint64_t base = rdmsr(IA32_APIC_BASE);
-    bool handed_x2 = (base & (APIC_BASE_ENABLE | APIC_BASE_X2)) == (APIC_BASE_ENABLE | APIC_BASE_X2);
+    handed_x2 = (base & (APIC_BASE_ENABLE | APIC_BASE_X2)) == (APIC_BASE_ENABLE | APIC_BASE_X2);
     const char *why;
-    x2 = x2_chosen(handed_x2, cpu_features.x2apic, dmar_x2apic_opt_out(), cpu_features.maker->x2apic_unremapped, &why);
+    enum apic_plan plan = apic_plan(handed_x2, cpu_features.x2apic, dmar_x2apic_opt_out(),
+                                    cpu_features.maker->x2apic_unremapped, &why);
+    x2 = plan == APIC_PLAN_X2;
+    x2_waits = plan == APIC_PLAN_X2_AFTER_REMAP;
     kprintf("apic: %s mode: %s\n", x2 ? "x2APIC" : "xAPIC", why);
 }
 
 /* x2APIC mode is entered from the enabled xAPIC mode, the disabled state first enabled (SDM
-   13.12.5.1, APM 16.9.1); INIT keeps the mode (13.12.5.1, APM 16.10), reset and so S3 does not. */
+   13.12.5.1, APM 16.9.1); INIT keeps the mode (13.12.5.1, APM 16.10), reset and so S3 does not.
+   From the enabled xAPIC mode only the LDR, a written APIC ID and the ICR's high half are not
+   kept (13.12.5.1): the LVT entries, the timer, the ISR and IRR stay. */
 static bool x2apic_enter(void) {
     uint64_t base = rdmsr(IA32_APIC_BASE);
     if (!(base & APIC_BASE_ENABLE) && !wrmsr_checked(IA32_APIC_BASE, base |= APIC_BASE_ENABLE)) return false;
@@ -109,11 +134,13 @@ static bool x2apic_enter(void) {
 }
 
 /* xAPIC mode, enabled, its registers where CPU 0's are (a CPU's own base may be anywhere, 13.4.5).
-   A CPU found in x2APIC mode is not taken out of it: the firmware hands every CPU over in one mode
-   (13.12.8.1), and xAPIC mode is chosen only when CPU 0 came in xAPIC mode. */
+   A CPU found in x2APIC mode leaves it through the disabled state, the only way out of it
+   (13.12.5.1): the firmware hands every CPU over in one mode (13.12.8.1), but the kernel that
+   restored a hibernation image may have moved them to x2APIC mode (apic_x2_follow). */
 static bool xapic_enter(void) {
     uint64_t base = rdmsr(IA32_APIC_BASE);
-    if (base & APIC_BASE_X2) return false;
+    if (base & APIC_BASE_X2 && !wrmsr_checked(IA32_APIC_BASE, base &= ~(APIC_BASE_X2 | APIC_BASE_ENABLE)))
+        return false;
     uint64_t want = (base & ~APIC_BASE_ADDRESS) | xapic_phys | APIC_BASE_ENABLE;
     if (want != base && !wrmsr_checked(IA32_APIC_BASE, want)) return false;
     return (rdmsr(IA32_APIC_BASE) & (APIC_BASE_ENABLE | APIC_BASE_X2 | APIC_BASE_ADDRESS)) ==
@@ -133,6 +160,7 @@ struct lint_nmi {
 static struct lint_nmi *nmis;
 static unsigned nnmis;
 PERCPU static uint32_t logical_id; /* this CPU's LDR in x2APIC mode; 0 in xAPIC mode (physical IPIs) */
+static enum irq_result apic_move(void *context);
 
 static enum irq_result apic_error(void *context) {
     (void)context;
@@ -171,6 +199,9 @@ void apic_init(void) {
     }
     if (!irq_request_system(&(struct irq_spec){.name = "apic error", .handler = apic_error, .node = -1}, VEC_APIC_ERROR))
         panic("apic: the error vector is taken");
+    if (x2_waits &&
+        !irq_request_system(&(struct irq_spec){.name = "apic mode", .handler = apic_move, .node = -1}, VEC_APIC_MODE))
+        panic("apic: the vector of the move to x2APIC mode is taken");
 }
 
 /* The registers but the APIC ID are not kept across a mode transition (13.12.5.1), nor INIT's
@@ -206,6 +237,62 @@ bool apic_init_cpu(void) {
     return true;
 }
 
+/* ---- the move to x2APIC mode ----
+   Every online CPU at once (apic_x2_follow): the others called in by VEC_APIC_MODE and held in its
+   handler with their interrupts off, so that no CPU sends or takes an IPI, an EOI or a timer write
+   while their modes differ; x2, which lapic_read and lapic_write choose by, turns true once all of
+   them have moved, before any lets go. Every CPU comes: one that waits for a spinlock with its
+   interrupts off comes once the holder gives it back, as holders wait for no other CPU, and the
+   sender of a TLB shootdown waits for its answers with its interrupts on (arch/spin.h). The ISR bit
+   of the handler's own vector is kept across the move (13.12.5.1), so its EOI, in x2APIC mode,
+   ends it. */
+enum move_phase { MOVE_GATHER, MOVE_ENTER, MOVE_DONE };
+static uint32_t move_phase;
+static uint32_t move_arrived, move_entered; /* the other CPUs held in the handler, and those moved */
+
+/* This CPU in x2APIC mode, with its logical ID (13.12.10.2), read before x2 says so. */
+static void move_here(void) {
+    if (!x2apic_enter()) panic("apic: cpu%u did not enter x2APIC mode", cpu_current_index());
+    this_cpu(logical_id) = (uint32_t)rdmsr(X2APIC_MSR_BASE + (LAPIC_LDR >> 4));
+}
+
+static enum irq_result apic_move(void *context) {
+    (void)context;
+    __atomic_add_fetch(&move_arrived, 1, __ATOMIC_ACQ_REL);
+    while (__atomic_load_n(&move_phase, __ATOMIC_ACQUIRE) == MOVE_GATHER) pause();
+    move_here();
+    __atomic_add_fetch(&move_entered, 1, __ATOMIC_ACQ_REL);
+    while (__atomic_load_n(&move_phase, __ATOMIC_ACQUIRE) != MOVE_DONE) pause();
+    return IRQ_HANDLED;
+}
+
+/* The CPU that moves them: until count reaches others; past until, a CPU is stuck. */
+static void move_wait(const uint32_t *count, uint32_t others, uint64_t until, const char *what) {
+    for (uint32_t seen; (seen = __atomic_load_n(count, __ATOMIC_ACQUIRE)) < others; pause())
+        if (clock_now_ns() >= until) panic("apic: %u of %u other CPUs %s x2APIC mode", seen, others, what);
+}
+
+void apic_x2_follow(const char *refused) {
+    if (!x2_waits) return;
+    x2_waits = false;
+    if (refused) {
+        kprintf("apic: xAPIC mode stays: %s\n", refused);
+        return;
+    }
+    ASSERT(!(read_rflags() & 0x200)); /* IF */
+    uint32_t others = cpu_online_count() - 1;
+    if (others) apic_send_ipi_others(VEC_APIC_MODE);
+    uint64_t until = clock_after(MOVE_WAIT_NS);
+    move_wait(&move_arrived, others, until, "came to the move to");
+    __atomic_store_n(&move_phase, MOVE_ENTER, __ATOMIC_RELEASE);
+    move_here();
+    move_wait(&move_entered, others, until, "entered");
+    x2 = true;
+    __atomic_store_n(&move_phase, MOVE_DONE, __ATOMIC_RELEASE);
+    kprintf("apic: x2APIC mode: %u CPUs moved to it once interrupts were remapped with 32-bit destinations\n",
+            others + 1);
+}
+
 uint32_t apic_current_id(void) { return x2 ? lapic_read(LAPIC_ID) : lapic_read(LAPIC_ID) >> 24; }
 
 void apic_eoi(void) { lapic_write(LAPIC_EOI, 0); }
@@ -216,23 +303,24 @@ bool apic_tmr(uint8_t vector) { return lapic_read(LAPIC_TMR + 0x10 * (vector >> 
 
 /* ---- IPIs ---- */
 
-/* One IPI. x2APIC mode: one WRMSR, the stores before it reaching every CPU first (13.12.3: WRMSR
-   to an APIC register is not serializing), so that an IPI never arrives ahead of what it
-   announces. xAPIC mode: the uncached stores keep their order after the earlier ones; the high
-   half, then the low half that sends, with this CPU's interrupts off so that no handler's IPI
-   comes between them, once the previous IPI has left (delivery status idle, 13.6.1). An NMI or a
-   machine check between them that sends is a panic's, which sends no more after. */
+/* One IPI, this CPU's interrupts off from the read of the mode to the write it chooses (the move to
+   x2APIC mode comes in by an interrupt). x2APIC mode: one WRMSR, the stores before it reaching
+   every CPU first (13.12.3: WRMSR to an APIC register is not serializing), so that an IPI never
+   arrives ahead of what it announces. xAPIC mode: the uncached stores keep their order after the
+   earlier ones; the high half, then the low half that sends, no handler's IPI between them, once
+   the previous IPI has left (delivery status idle, 13.6.1). An NMI or a machine check between them
+   that sends is a panic's, which sends no more after. */
 static void icr(uint32_t dest, uint32_t low) {
+    uint64_t f = irq_save();
     if (x2) {
         __asm__ volatile("mfence; lfence" : : : "memory");
         wrmsr(X2APIC_ICR, (uint64_t)dest << 32 | low);
-        return;
+    } else {
+        ASSERT(dest < XAPIC_BROADCAST);
+        while (lapic_read(LAPIC_ICR_LOW) & ICR_PENDING) pause();
+        lapic_write(LAPIC_ICR_HIGH, dest << 24);
+        lapic_write(LAPIC_ICR_LOW, low);
     }
-    ASSERT(dest < XAPIC_BROADCAST);
-    uint64_t f = irq_save();
-    while (lapic_read(LAPIC_ICR_LOW) & ICR_PENDING) pause();
-    lapic_write(LAPIC_ICR_HIGH, dest << 24);
-    lapic_write(LAPIC_ICR_LOW, low);
     irq_restore(f);
 }
 

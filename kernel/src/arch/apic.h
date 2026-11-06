@@ -2,11 +2,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* The local APIC (arch/apic.c), in the one mode apic_choose_mode picks for every CPU: x2APIC mode,
-   its registers the MSRs 800h + offset / 16 (SDM Vol. 3A 13.12, APM Vol. 2 16.11), or xAPIC mode,
-   its registers memory-mapped at offset in a 4-KiB page (13.4.1, APM 16.3.2). lapic_read and
-   lapic_write take the xAPIC offset in either mode. The timer's registers are arch/lapic_timer.c's,
-   a maker's own entries its implementation's (arch/cpu_maker.h). */
+/* The local APIC (arch/apic.c), in one mode on every CPU: x2APIC mode, its registers the MSRs
+   800h + offset / 16 (SDM Vol. 3A 13.12, APM Vol. 2 16.11), or xAPIC mode, its registers
+   memory-mapped at offset in a 4-KiB page (13.4.1, APM 16.3.2). lapic_read and lapic_write take
+   the xAPIC offset in either mode, with this CPU's interrupts off: the mode changes once at most,
+   from xAPIC to x2APIC mode, on every CPU together while each has its interrupts off
+   (apic_x2_follow). The timer's registers are arch/lapic_timer.c's, a maker's own entries its
+   implementation's (arch/cpu_maker.h). */
 
 #define LAPIC_VERSION 0x30
 #define LAPIC_LVT_CMCI 0x2F0
@@ -16,23 +18,36 @@
 void lapic_write(uint32_t reg, uint32_t v);
 uint32_t lapic_read(uint32_t reg);
 
-/* CPU 0 once, after the ACPI tables and before topology_init: the mode of every CPU's APIC from here
-   on, which is x2APIC mode when the firmware handed this CPU over in it (no way leads back to xAPIC
-   mode but through the disabled APIC, SDM 13.12.5.1); else, where the CPU has x2APIC mode, the
-   DMAR does not ask the OS to keep out of it (VT-d 8.1, X2APIC_OPT_OUT) and the maker lets the
-   kernel enter it before interrupts are remapped (cpu_maker.x2apic_unremapped); else xAPIC mode. */
+/* CPU 0 once, after the ACPI tables and before topology_init: the APICs' mode. x2APIC mode where
+   the firmware handed this CPU over in it (no way leads back to xAPIC mode but through the disabled
+   APIC, SDM 13.12.5.1). Else, where the CPU has x2APIC mode and the DMAR does not ask the OS to
+   keep out of it (VT-d 8.1, X2APIC_OPT_OUT): x2APIC mode at once where the maker lets the kernel
+   enter it before interrupts are remapped (cpu_maker.x2apic_unremapped), else xAPIC mode until
+   interrupts are remapped with 32-bit destinations (apic_x2_waits). Else xAPIC mode. */
 void apic_choose_mode(void);
 bool apic_x2(void); /* the CPUs run their APICs in x2APIC mode */
-/* An APIC ID the chosen mode sends to: in xAPIC mode the 8-bit IDs but FFh, the broadcast. */
-bool apic_reaches(uint32_t apic_id);
+/* The CPUs are in xAPIC mode and move to x2APIC mode once the IOMMU remaps every interrupt with
+   32-bit destinations (SDM 13.12.7: Extended Interrupt Mode before x2APIC mode). */
+bool apic_x2_waits(void);
+/* The IOMMU at boot (dev/iommu.c), its units on and no IOAPIC pin or driver's message through them
+   yet, interrupts off: refused NULL when the units remap every interrupt with 32-bit destinations,
+   and every online CPU moves to x2APIC mode then, all of them called in together, each with its
+   interrupts off, so that none sends or takes an interrupt while their modes differ; else the CPUs
+   stay in xAPIC mode, the reason logged. Nothing where none waits (apic_x2_waits). */
+void apic_x2_follow(const char *refused);
+/* A processor with this APIC ID may be one the firmware handed over: in xAPIC mode only those below
+   FFh, the broadcast (SDM 13.12.8.1: the firmware leaves the others off), which stay the only ones
+   when the CPUs move to x2APIC mode later. */
+bool apic_handed_over(uint32_t apic_id);
 
 /* CPU 0 once (irq_init), after the MADT, the heap and the kernel's page tables: the NMI inputs the
-   MADT names, the error vector's handler, the registers' page in xAPIC mode. */
+   MADT names, the error vector's handler, the registers' page in xAPIC mode, and where the CPUs
+   wait for x2APIC mode the vector that calls them in to move (VEC_APIC_MODE). */
 void apic_init(void);
-/* Each CPU as it starts, and again after S3 (which resets it): its APIC in the chosen mode, the task
+/* Each CPU as it starts, and again after S3 (which resets it): its APIC in the CPUs' mode, the task
    priority open, every LVT entry masked (the maker's own too) but the error one and the NMI inputs
    the MADT names, the APIC enabled with the spurious vector. False when this CPU's APIC cannot be
-   put in the chosen mode. */
+   put in that mode. */
 bool apic_init_cpu(void);
 uint32_t apic_current_id(void);
 void apic_eoi(void); /* the end of the interrupt this CPU is handling (arch/irq.c) */
@@ -46,9 +61,9 @@ bool apic_tmr(uint8_t vector);
 /* IPIs: fixed delivery of vector, edge, to CPUs by topology's index (arch/topology.h). set: a CPU
    set (arch/cpuset.h), in x2APIC mode in as few ICR writes as the logical clusters allow (up to 16
    CPUs each, SDM 13.12.10.2), in xAPIC mode one each by its APIC ID; others: every online CPU but
-   this one. Any CPU, any context, no wait for the IPI to be taken: in x2APIC mode one WRMSR each
-   (the ICR has no delivery status, 13.12.9); in xAPIC mode, interrupts off, the two halves of the
-   ICR after the previous IPI left (13.6.1). */
+   this one. Any CPU, any context, no wait for the IPI to be taken: interrupts off for each, in
+   x2APIC mode one WRMSR (the ICR has no delivery status, 13.12.9), in xAPIC mode the two halves of
+   the ICR after the previous IPI left (13.6.1). */
 void apic_send_ipi(unsigned cpu, uint8_t vector);
 void apic_send_ipi_set(const uint64_t *cpus, uint8_t vector);
 void apic_send_ipi_others(uint8_t vector);

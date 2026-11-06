@@ -29,6 +29,7 @@
 #define VEC_SYSTEM_FIRST  0xF0
 #define VEC_LOG           0xF0 /* a CPU's own, after it wrote a record holding a spinlock: wakes the log's thread (sys/log.c) */
 #define VEC_IRQ_DRAIN     0xF1 /* look at the vectors this CPU's routes left (arch/irq.c) */
+#define VEC_APIC_MODE     0xF2 /* every CPU's APIC to x2APIC mode together, once (arch/apic.c, apic_x2_follow) */
 #define VEC_MCE_THRESHOLD 0xFA /* the machine-check banks' corrected errors (arch/mca.h) */
 #define VEC_TIMER         0xFB /* each CPU's wake device (arch/lapic_timer.c, sys/alarm.c) */
 #define VEC_RESCHED       0xFC /* look at this CPU's run queue (sys/sched.c) */

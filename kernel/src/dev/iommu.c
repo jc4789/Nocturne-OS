@@ -12,6 +12,7 @@
    change hw, restore_failed and lost_in_sleep, which the others only read. */
 #include "kernel.h"
 #include "abi.h"
+#include "arch/apic.h"
 #include "arch/cpu.h"
 #include "arch/irq.h"
 #include "arch/ioapic.h"
@@ -129,9 +130,11 @@ static bool units_abandon(void) {
     return plain;
 }
 
-/* Units are found also with the boot setting off, or when the firmware's descriptions could not be kept: a
-   VT-d unit that requires interrupt remapping (ECAP.IRREQ) blocks every interrupt message while
-   it is off (5.1.4), so such units are started with interrupt remapping alone. */
+/* Units are found also with the boot setting off, or when the firmware's descriptions could not be
+   kept: the boot setting is DMA translation's, and units that remap interrupts apart from it
+   (VT-d) are started remapping them alone, which keeps a device from sending any vector, lets a
+   unit that requires remapping (ECAP.IRREQ, 5.1.4) deliver at all, and is what x2APIC mode waits
+   for on Intel's CPUs (SDM 13.12.7, arch/apic.h). */
 void iommu_init(void) {
     const char *off = !boot_setting(N_BOOT_IOMMU) ? "off (the boot record says so)" : NULL; /* why DMA is not translated */
     bool amd_plain = false, intel_plain = false;
@@ -148,6 +151,7 @@ void iommu_init(void) {
                      off ? off : acpi_find("IVRS", 0) || acpi_find("DMAR", 0)
                          ? "not used (rejected tables, all units confirmed off)"
                          : "none described (no IVRS or DMAR)");
+        apic_x2_follow("no IOMMU remaps interrupts");
         return;
     }
     if (!off && described_lost) off = "not used (the firmware's descriptions were not all kept)";
@@ -159,6 +163,11 @@ void iommu_init(void) {
     uint64_t irq = irq_save();
     ioapic_mask_all();
     bool started = hw->start(!off);
+    /* x2APIC mode after the remapping with 32-bit destinations it waits for (SDM 13.12.7), before
+       an IOAPIC pin or a driver's message goes through the units */
+    apic_x2_follow(!started             ? "the IOMMU did not start"
+                   : !hw->x2apic_ready ? "the IOMMU does not remap interrupts with 32-bit destinations"
+                                       : NULL);
     if (started) started = ioapic_remap();
     if (!started) {
         /* No table remains active once they are off: the original plain requests go back,
