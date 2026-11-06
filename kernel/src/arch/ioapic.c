@@ -33,7 +33,7 @@ struct pin {
     bool held;       /* masked by its line (ioapic_hold) */
     bool nmi;        /* an NMI source: delivered as an NMI to CPU 0, no device's */
     bool described;  /* its signal the MADT's (an override, the SCI, an NMI source): ACPI's _CRS and _PRT keep it */
-    bool level, active_low;
+    struct gsi_signal signal;
 };
 
 struct ioapic {
@@ -79,8 +79,8 @@ static struct ioapic *owner(uint32_t gsi, uint32_t *n) {
 static uint64_t plain_entry(const struct pin *p) {
     if (!p->routed && !p->nmi) return RTE_MASK;
     uint64_t rte = p->nmi ? DELIV_NMI : p->vector; /* fixed delivery: 000b */
-    if (p->active_low) rte |= RTE_ACTIVELOW;
-    if (p->level && !p->nmi) rte |= RTE_LEVEL; /* an NMI is edge-triggered */
+    if (p->signal.active_low) rte |= RTE_ACTIVELOW;
+    if (p->signal.level && !p->nmi) rte |= RTE_LEVEL; /* an NMI is edge-triggered */
     if (p->held) rte |= RTE_MASK;
     return rte | (uint64_t)(p->dest <= 0xFF ? p->dest : 0) << 56;
 }
@@ -106,7 +106,7 @@ static bool pin_write(struct ioapic *io, uint32_t n) {
     bool ok = !(p->routed || p->nmi) || iommu_ioapic_entry(io->id, n, io->pins, p->dest, &rte);
     if (!ok) rte = RTE_MASK;
     wr(io, REG_RTE(n), rd(io, REG_RTE(n)) | RTE_MASK); /* masked as it is: its vector kept for the EOI */
-    if (p->level) remote_irr_wait(io, n);
+    if (p->signal.level) remote_irr_wait(io, n);
     wr(io, REG_RTE(n), RTE_MASK | (uint32_t)rte); /* masked while the destination changes */
     wr(io, REG_RTE(n) + 1, (uint32_t)(rte >> 32));
     wr(io, REG_RTE(n), (uint32_t)rte);
@@ -114,11 +114,13 @@ static bool pin_write(struct ioapic *io, uint32_t n) {
 }
 
 /* The signal of an ISA source the MPS INTI flags describe: the bus's own (00) is edge and active
-   high, except for the SCI, level and active low (ACPI 6.5 5.2.9, SCI_INT). */
+   high, except for the SCI, level and active low (ACPI 6.5 5.2.9, SCI_INT). The flags say nothing
+   of sharing: a level source is shared, as the SCI is. */
 static void inti_signal(struct pin *p, uint16_t flags, bool sci) {
     unsigned polarity = ACPI_INTI_POLARITY(flags), trigger = ACPI_INTI_TRIGGER(flags);
-    p->active_low = polarity == ACPI_INTI_BUS ? sci : polarity == ACPI_INTI_LOW;
-    p->level = trigger == ACPI_INTI_BUS ? sci : trigger == ACPI_INTI_LOW;
+    p->signal.active_low = polarity == ACPI_INTI_BUS ? sci : polarity == ACPI_INTI_LOW;
+    p->signal.level = trigger == ACPI_INTI_BUS ? sci : trigger == ACPI_INTI_LOW;
+    p->signal.shared = p->signal.level;
 }
 
 static void add(const struct acpi_madt_ioapic *a) {
@@ -149,7 +151,8 @@ static void add(const struct acpi_madt_ioapic *a) {
     }
     *io = (struct ioapic){.regs = regs, .gsi_base = a->gsi_base, .pins = pins, .id = a->id, .version = (uint8_t)ver};
     for (uint32_t n = 0; n < pins; n++) { /* ISA's identity below 16, PCI's INTx above */
-        io->pin[n].level = io->pin[n].active_low = a->gsi_base + n >= 16;
+        bool pci = a->gsi_base + n >= 16;
+        io->pin[n].signal = (struct gsi_signal){.level = pci, .active_low = pci, .shared = pci};
     }
     unsigned at = 0;
     while (at < nios && ios[at]->gsi_base < io->gsi_base) at++;
@@ -185,13 +188,15 @@ void ioapic_init(void) {
         } else if (e->type == ACPI_MADT_NMI_SOURCE && e->length >= sizeof *s && (io = owner(s->gsi, &n))) {
             struct pin *p = &io->pin[n];
             p->nmi = p->described = true;
-            p->active_low = ACPI_INTI_POLARITY(s->flags) == ACPI_INTI_LOW;
+            p->signal.active_low = ACPI_INTI_POLARITY(s->flags) == ACPI_INTI_LOW;
             p->dest = topology.cpu[0].apic_id;
         }
     }
     struct ioapic *io;
-    if (!sci_overridden && sci != UINT32_MAX && (io = owner(sci, &n)))
-        io->pin[n].level = io->pin[n].active_low = io->pin[n].described = true;
+    if (!sci_overridden && sci != UINT32_MAX && (io = owner(sci, &n))) {
+        io->pin[n].signal = (struct gsi_signal){.level = true, .active_low = true, .shared = true};
+        io->pin[n].described = true;
+    }
     for (unsigned i = 0; i < nios; i++) {
         io = ios[i];
         uint64_t f = spin_lock(&io->lock);
@@ -211,28 +216,45 @@ uint32_t ioapic_isa_gsi(unsigned isa_irq) {
     return isa_irq;
 }
 
-bool ioapic_gsi_signal(uint32_t gsi, bool level, bool active_low) {
+/* A routed pin takes another source only when both are shared, with the same signal unless the
+   MADT describes the pin. io->lock held. */
+static bool pin_takes(const struct pin *p, struct gsi_signal s) {
+    if (p->nmi) return false;
+    if (!p->routed) return true;
+    if (!p->signal.shared || !s.shared) return false;
+    return p->described || (p->signal.level == s.level && p->signal.active_low == s.active_low);
+}
+
+bool ioapic_gsi_signal(uint32_t gsi, struct gsi_signal signal) {
     uint32_t n;
     struct ioapic *io = owner(gsi, &n);
     if (!io) return false;
     uint64_t f = spin_lock(&io->lock);
     struct pin *p = &io->pin[n];
-    bool ok = !p->nmi && (p->described || !p->routed || (p->level == level && p->active_low == active_low));
-    if (ok && !p->described) {
-        p->level = level;
-        p->active_low = active_low;
-    }
+    bool ok = pin_takes(p, signal);
+    if (ok && !p->described) p->signal = signal;
+    else if (ok && !p->routed) p->signal.shared = p->signal.level && signal.shared;
     spin_unlock(&io->lock, f);
     return ok;
 }
 
-bool ioapic_gsi_owned(uint32_t gsi, bool *level) {
+bool ioapic_gsi_takes(uint32_t gsi, struct gsi_signal signal) {
+    uint32_t n;
+    struct ioapic *io = owner(gsi, &n);
+    if (!io) return false;
+    uint64_t f = spin_lock(&io->lock);
+    bool ok = pin_takes(&io->pin[n], signal);
+    spin_unlock(&io->lock, f);
+    return ok;
+}
+
+bool ioapic_gsi_owned(uint32_t gsi, struct gsi_signal *signal) {
     uint32_t n;
     struct ioapic *io = owner(gsi, &n);
     if (!io) return false;
     uint64_t f = spin_lock(&io->lock);
     bool ok = !io->pin[n].nmi;
-    *level = io->pin[n].level;
+    *signal = io->pin[n].signal;
     spin_unlock(&io->lock, f);
     return ok;
 }

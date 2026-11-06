@@ -187,18 +187,18 @@ bool acpi_sleep_supported(unsigned state); /* the firmware has \_Sn */
 bool acpi_sleep_prepare(unsigned state);
 bool acpi_sleep_enter(unsigned state);
 /* After S3: wake_prepare with interrupts off, right after the CPU is back (SLP_TYP back to S0);
-   wake with interrupts on before the drivers resume (PCI interrupt links via _SRS, then _WAK). */
+   wake with interrupts on before the drivers resume (_WAK).
+   acpi_links_restore: after a sleep the firmware ran (S3, a hibernation image restored), with
+   interrupts off and frozen, before any PCI function has its configuration back or the CPU takes
+   an interrupt: every PCI interrupt link set again as it was (_SRS), one never routed disabled
+   (_DIS). The chipset forgets them in S3; a restored image's are not the booting kernel's. */
 void acpi_wake_prepare(unsigned state);
 void acpi_wake(unsigned state);
+void acpi_links_restore(void);
 /* Around a sleep, from before the devices stop until they are all back: AML that waits (Sleep,
    Acquire, Wait in _WAK) spins instead of letting another thread at a device not back yet. on
    first lets queued GPE and Notify work finish, so no method holds a lock across the sleep. */
 void acpi_freeze(bool on);
-/* The PCI interrupt links' settings, kept for acpi_wake (prepare keeps them for S3). Hibernation
-   keeps them itself: after a restore the booting kernel's routing is not necessarily the image's.
-   forget drops them (a hibernation that did not happen). */
-void acpi_links_save(void);
-void acpi_links_forget(void);
 bool acpi_reset(void);
 
 /* ---- a PCI function's part of the namespace (n_hal_pci_acpi_eval, dev/pciuser.c) ----
@@ -215,9 +215,9 @@ void *acpi_pci_host(const struct pci_device *d);
 bool acpi_pci_proximity(const struct pci_device *d, uint32_t *domain);
 /* The GSI a function's INTx reaches (ACPI 6.5 6.2.13, _PRT): its Interrupt Pin, swizzled at each
    bridge without a _PRT of its own, looked up in the nearest _PRT above it, a GSI there or the
-   current interrupt of the link device it names; its signal told to the IOAPICs
-   (ioapic_gsi_signal) for irq_request_gsi. False without a pin, a route, a link setting, or AML.
-   Sleeps. */
+   interrupt of the link device it names (the link given one from its _PRS first, _SRS, when it
+   has none); its signal told to the IOAPICs (ioapic_gsi_signal) for irq_request_gsi. False
+   without a pin, a route, an interrupt the link can be given, or AML. Sleeps. */
 bool acpi_pci_gsi(const struct pci_device *d, uint32_t *gsi);
 void *acpi_node_child(void *node, uint32_t index);
 /* Whether s is one name segment: 4 characters of A-Z, 0-9 and _, the first not a digit (names of

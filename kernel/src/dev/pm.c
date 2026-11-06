@@ -289,11 +289,13 @@ static bool machine_sleep(void (*enter)(void), unsigned state, enum pm_action ac
     vm_resume(); /* the hypervisor's other overlay pages and its interrupts, after the LAPIC */
     alarm_resume(); /* CPU 0's wake device, after its LAPIC */
     acpi_wake_prepare(state);
+    /* the INTx wiring before any function's configuration (its interrupt enable) is back, and
+       before this CPU takes an interrupt: no level reaches a pin through a link not set again */
+    if (slept) acpi_links_restore();
     pci_resume(slept, units_lost != NULL);
     irq_restore(f);
     /* a hibernation's snapshot is no sleep: the firmware heard of none */
     if (state == 3 || slept) acpi_wake(state);
-    else acpi_links_forget();
     smp_resume();
     const char *lost = hal_resume_all();
     input_resumed();
@@ -349,7 +351,6 @@ static void sleep_now(bool hibernate) {
     }
     if (why) {
     } else if (hibernate) {
-        acpi_links_save();
         slept = machine_sleep(hibernate_snapshot, 4, action, &why, &detail, &lost_told);
         cpus_back = true;
         if (!slept && !why) {

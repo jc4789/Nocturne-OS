@@ -64,7 +64,8 @@ struct irq {
     struct wait_queue wq, done;
 };
 
-/* A GSI's line: the irqs on one IOAPIC pin, in request order, a level one shared unless alone. */
+/* A GSI's line: the irqs on one IOAPIC pin, in request order; shared when its signal is level and
+   shared (arch/ioapic.h) and no request asked for it alone. */
 struct line {
     unsigned gsi, cpu;
     uint8_t vector;
@@ -541,14 +542,16 @@ struct irq *irq_request_gsi(const struct irq_spec *spec, unsigned gsi) {
     if (!irq || !fresh) goto fail;
     mutex_lock(&requests);
     for (l = lines; l && l->gsi != gsi; l = l->next) {}
-    bool level, made = !l;
+    struct gsi_signal signal;
+    bool made = !l;
     if (made) {
-        if (!ioapic_gsi_owned(gsi, &level)) goto unlock;
+        if (!ioapic_gsi_owned(gsi, &signal)) goto unlock;
         l = fresh;
-        *l = (struct line){.gsi = gsi, .level = level, .alone = spec->alone, .reach = ioapic_gsi_reach(gsi)};
+        *l = (struct line){.gsi = gsi, .level = signal.level, .alone = spec->alone || !(signal.level && signal.shared),
+                           .reach = ioapic_gsi_reach(gsi)};
         if (!place(spec->node, IRQ_CPU_ANY, 1, l->reach, true, &l->cpu, &l->vector)) goto unlock;
-    } else if (!l->level || l->alone || spec->alone) {
-        goto unlock; /* an edge line is no one else's: two sources' edges would merge */
+    } else if (l->alone || spec->alone) {
+        goto unlock; /* an edge line is no one else's (two sources' edges would merge), nor an exclusive one */
     }
     irq->line = l;
     irq->reach = l->reach;

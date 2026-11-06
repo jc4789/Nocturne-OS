@@ -342,7 +342,7 @@ uacpi_status uacpi_kernel_handle_firmware_request(uacpi_firmware_request *r) {
 static uacpi_interrupt_handler sci_handler;
 static uacpi_handle sci_ctx;
 static struct irq *sci;
-static uint32_t sci_gsi;
+static uint32_t sci_irq = UINT32_MAX, sci_gsi; /* SCI_INT as the FADT gives it (an ISA IRQ), and its GSI */
 static unsigned sci_running;
 
 static enum irq_result sci_entry(void *context) {
@@ -362,6 +362,7 @@ uacpi_status uacpi_kernel_install_interrupt_handler(uacpi_u32 irq, uacpi_interru
     if (sci) return UACPI_STATUS_UNIMPLEMENTED;
     sci_handler = h;
     sci_ctx = ctx;
+    sci_irq = irq;
     sci_gsi = ioapic_isa_gsi(irq);
     sci = irq_request_gsi(&(struct irq_spec){.name = "ACPI SCI", .handler = sci_entry, .node = -1}, sci_gsi);
     if (!sci) return UACPI_STATUS_INTERNAL_ERROR;
@@ -449,6 +450,313 @@ static void acpi_worker(void *arg) {
     }
 }
 
+/* ---- PCI interrupt links (PNP0C0F; ACPI 6.5 6.2.13) ----
+   A _PRT entry that names a link device is wired to the link's resource descriptor number Source
+   Index: one of its interrupt descriptors, a line here. Each link is read once, at AML init (or
+   when a _PRT names one without the PNP0C0F ID): a line whose _CRS holds one interrupt that _PRS
+   lists keeps it. A link with a line without one is routed when a function first needs it: each
+   such line takes, from its _PRS descriptor (the first of dependent alternatives), an interrupt
+   the IOAPICs take with that descriptor's signal, the one the fewest lines are on already, and
+   only an empty one when either side is exclusive. An ISA IRQ only where the firmware itself put
+   a link or the SCI: an ISA device on the others is edge-triggered and need not be in the
+   namespace. _SRS gets the link's _CRS with every line's interrupt in it (6.2.16: the same
+   descriptors in the same order; 6.4.3.6: an Extended Interrupt one with one interrupt), and
+   gets it again after a sleep, before any function's interrupt can come; a link never routed is
+   disabled then (_DIS, 6.2.3), as no function uses it.
+   links_mutex orders reading and routing. acpi_links_restore reads without it, nothing else
+   running then: the list and each setting are published whole. */
+struct link_line {
+    uint32_t index;  /* its place among the link's resource descriptors: the _PRT's Source Index */
+    uint32_t number; /* as its descriptor holds it, an ISA IRQ (IRQ) or a GSI (Extended Interrupt); 0: none */
+    uint32_t gsi;
+    bool extended; /* the form of the _CRS descriptor, which _SRS keeps */
+    struct gsi_signal signal;
+};
+
+struct link {
+    struct link *next;
+    uacpi_namespace_node *node;
+    uacpi_resources *setting; /* _CRS with every line's interrupt: what the link is set to; NULL: not routed */
+    unsigned nlines;
+    struct link_line line[];
+};
+
+static struct mutex links_mutex;
+static struct link *links;
+static uint16_t pci_isa_irqs; /* the ISA IRQs the firmware put a link or the SCI on */
+
+static bool is_interrupt(const uacpi_resource *r) {
+    return r->type == UACPI_RESOURCE_TYPE_IRQ || r->type == UACPI_RESOURCE_TYPE_EXTENDED_IRQ;
+}
+
+static unsigned interrupt_count(const uacpi_resource *r) {
+    return r->type == UACPI_RESOURCE_TYPE_IRQ ? r->irq.num_irqs : r->extended_irq.num_irqs;
+}
+
+static uint32_t interrupt_number(const uacpi_resource *r, unsigned i) {
+    return r->type == UACPI_RESOURCE_TYPE_IRQ ? r->irq.irqs[i] : r->extended_irq.irqs[i];
+}
+
+/* 6.4.2.1: an IRQ descriptor without its information byte is edge, active high, exclusive, as
+   uACPI reads it. */
+static struct gsi_signal interrupt_signal(const uacpi_resource *r) {
+    bool irq = r->type == UACPI_RESOURCE_TYPE_IRQ;
+    uint8_t triggering = irq ? r->irq.triggering : r->extended_irq.triggering;
+    uint8_t polarity = irq ? r->irq.polarity : r->extended_irq.polarity;
+    uint8_t sharing = irq ? r->irq.sharing : r->extended_irq.sharing;
+    return (struct gsi_signal){.level = triggering == UACPI_TRIGGERING_LEVEL,
+                               .active_low = polarity == UACPI_POLARITY_ACTIVE_LOW,
+                               .shared = sharing == UACPI_SHARED};
+}
+
+static uint32_t line_gsi(bool extended, uint32_t number) { return extended ? number : ioapic_isa_gsi(number); }
+
+/* The lines of a _CRS in order: counted when link is NULL, else read into it. _CRS holding more
+   than one interrupt in a descriptor holds none (firmware reports its _PRS so when unrouted). */
+struct line_walk {
+    struct link *link;
+    uint32_t at;
+    unsigned lines;
+};
+
+static uacpi_iteration_decision line_read(void *user, uacpi_resource *r) {
+    struct line_walk *w = user;
+    uint32_t at = w->at++;
+    if (!is_interrupt(r)) return UACPI_ITERATION_DECISION_CONTINUE;
+    if (w->link) {
+        struct link_line *line = &w->link->line[w->lines];
+        *line = (struct link_line){.index = at,
+                                   .number = interrupt_count(r) == 1 ? interrupt_number(r, 0) : 0,
+                                   .extended = r->type == UACPI_RESOURCE_TYPE_EXTENDED_IRQ,
+                                   .signal = interrupt_signal(r)};
+    }
+    w->lines++;
+    return UACPI_ITERATION_DECISION_CONTINUE;
+}
+
+/* The _PRS descriptor of line number want: the want-th interrupt descriptor, of a dependent set
+   only the first set's (the others are alternatives to it). */
+struct possible_walk {
+    unsigned want, seen, sets;
+    bool in_set;
+    const uacpi_resource *found;
+};
+
+static uacpi_iteration_decision possible_at(void *user, uacpi_resource *r) {
+    struct possible_walk *w = user;
+    if (r->type == UACPI_RESOURCE_TYPE_START_DEPENDENT) {
+        w->sets++;
+        w->in_set = true;
+    } else if (r->type == UACPI_RESOURCE_TYPE_END_DEPENDENT) {
+        w->in_set = false;
+    } else if (is_interrupt(r) && !(w->in_set && w->sets > 1) && w->seen++ == w->want) {
+        w->found = r;
+        return UACPI_ITERATION_DECISION_BREAK;
+    }
+    return UACPI_ITERATION_DECISION_CONTINUE;
+}
+
+static const uacpi_resource *possible_line(uacpi_resources *prs, unsigned line) {
+    struct possible_walk w = {.want = line};
+    if (prs) uacpi_for_each_resource(prs, possible_at, &w);
+    return w.found;
+}
+
+static bool possible_lists(const uacpi_resource *r, uint32_t number) {
+    for (unsigned i = 0; r && i < interrupt_count(r); i++)
+        if (interrupt_number(r, i) == number) return true;
+    return false;
+}
+
+/* The link node as its _CRS and _PRS describe it now, on the list. NULL without a _CRS, an
+   interrupt in it, or memory. links_mutex held. */
+static struct link *link_read(uacpi_namespace_node *node) {
+    uacpi_resources *crs, *prs;
+    if (uacpi_get_current_resources(node, &crs) != UACPI_STATUS_OK) return NULL;
+    struct line_walk w = {0};
+    uacpi_for_each_resource(crs, line_read, &w);
+    struct link *l = w.lines ? kzalloc(sizeof *l + w.lines * sizeof l->line[0]) : NULL;
+    if (!l) {
+        uacpi_free_resources(crs);
+        return NULL;
+    }
+    l->node = node;
+    l->nlines = w.lines;
+    w = (struct line_walk){.link = l};
+    uacpi_for_each_resource(crs, line_read, &w);
+    if (uacpi_get_possible_resources(node, &prs) != UACPI_STATUS_OK) prs = NULL;
+    bool every = true;
+    for (unsigned i = 0; i < l->nlines; i++) {
+        struct link_line *line = &l->line[i];
+        if (prs && !possible_lists(possible_line(prs, i), line->number)) line->number = 0;
+        if (line->number) line->gsi = line_gsi(line->extended, line->number);
+        if (line->number && line->number < 16) pci_isa_irqs |= 1u << line->number;
+        every &= line->number != 0;
+    }
+    uacpi_free_resources(prs);
+    if (every) l->setting = crs;
+    else uacpi_free_resources(crs);
+    l->next = links;
+    __atomic_store_n(&links, l, __ATOMIC_RELEASE);
+    return l;
+}
+
+static uacpi_iteration_decision found_link(void *user, uacpi_namespace_node *node, uacpi_u32 depth) {
+    (void)depth;
+    if (link_read(node)) (*(unsigned *)user)++;
+    else kprintf("acpi: PCI interrupt link %.4s has no interrupt to read\n", uacpi_namespace_node_name(node).text);
+    return UACPI_ITERATION_DECISION_CONTINUE;
+}
+
+/* Every link of the namespace, as the firmware left it. AML init. */
+static void links_find(void) {
+    unsigned found = 0, routed = 0;
+    if (sci_irq < 16) pci_isa_irqs |= 1u << sci_irq;
+    mutex_lock(&links_mutex);
+    uacpi_find_devices("PNP0C0F", found_link, &found);
+    for (struct link *l = links; l; l = l->next) routed += l->setting != NULL;
+    mutex_unlock(&links_mutex);
+    if (found) kprintf("acpi: %u PCI interrupt links, %u routed by the firmware\n", found, routed);
+}
+
+static struct link *link_of(uacpi_namespace_node *node) {
+    for (struct link *l = links; l; l = l->next)
+        if (l->node == node) return l;
+    return link_read(node);
+}
+
+/* The lines on gsi, and whether one of them holds it alone. links_mutex held. */
+static unsigned gsi_lines(uint32_t gsi, bool *exclusive) {
+    unsigned on = 0;
+    *exclusive = false;
+    for (struct link *l = links; l; l = l->next)
+        for (unsigned i = 0; i < l->nlines; i++) {
+            const struct link_line *line = &l->line[i];
+            if (!line->number || line->gsi != gsi) continue;
+            on++;
+            *exclusive |= !line->signal.shared;
+        }
+    return on;
+}
+
+/* Line i of l, which has no interrupt, given the best its _PRS descriptor lists in the form of
+   its _CRS one; false when none will do. links_mutex held. */
+static bool line_choose(struct link *l, unsigned i, uacpi_resources *prs) {
+    struct link_line *line = &l->line[i];
+    const uacpi_resource *r = possible_line(prs, i);
+    if (!r || (r->type == UACPI_RESOURCE_TYPE_EXTENDED_IRQ) != line->extended) return false;
+    struct gsi_signal signal = interrupt_signal(r);
+    uint32_t best = 0;
+    unsigned best_on = UINT32_MAX;
+    for (unsigned c = 0; c < interrupt_count(r); c++) {
+        uint32_t number = interrupt_number(r, c), gsi = line_gsi(line->extended, number);
+        bool exclusive;
+        if (!number || (number < 16 && !(pci_isa_irqs & 1u << number))) continue;
+        unsigned on = gsi_lines(gsi, &exclusive);
+        if (exclusive || (on && !signal.shared) || on >= best_on || !ioapic_gsi_takes(gsi, signal)) continue;
+        best = number;
+        best_on = on;
+    }
+    if (!best) return false;
+    *line = (struct link_line){.index = line->index,
+                               .number = best,
+                               .gsi = line_gsi(line->extended, best),
+                               .extended = line->extended,
+                               .signal = signal};
+    return true;
+}
+
+/* Every line's interrupt into the descriptors of a _CRS. An IRQ descriptor whose mask was empty
+   has room for one IRQ only if uACPI's alignment left it; an Extended Interrupt one always has
+   one (6.4.3.6). */
+struct template_walk {
+    const struct link *link;
+    uint32_t at;
+    unsigned lines;
+    bool ok;
+};
+
+static uacpi_iteration_decision template_put(void *user, uacpi_resource *r) {
+    struct template_walk *w = user;
+    uint32_t at = w->at++;
+    if (!is_interrupt(r)) return UACPI_ITERATION_DECISION_CONTINUE;
+    const struct link_line *line = w->lines < w->link->nlines ? &w->link->line[w->lines++] : NULL;
+    if (!line || line->index != at) w->ok = false;
+    else if (r->type == UACPI_RESOURCE_TYPE_IRQ && r->length > __builtin_offsetof(uacpi_resource, irq.irqs)) {
+        r->irq.irqs[0] = (uint8_t)line->number;
+        r->irq.num_irqs = 1;
+    } else if (r->type == UACPI_RESOURCE_TYPE_EXTENDED_IRQ && r->extended_irq.num_irqs) {
+        r->extended_irq.irqs[0] = line->number;
+        r->extended_irq.num_irqs = 1;
+    } else {
+        w->ok = false;
+    }
+    return w->ok ? UACPI_ITERATION_DECISION_CONTINUE : UACPI_ITERATION_DECISION_BREAK;
+}
+
+/* Each line of l without an interrupt given one, and the link set to them all (_SRS). Nothing
+   changed when it fails. links_mutex held. */
+static bool link_route(struct link *l) {
+    uacpi_resources *crs = NULL, *prs = NULL;
+    struct link_line *was = kmalloc(l->nlines * sizeof *was);
+    bool ok = was && uacpi_get_current_resources(l->node, &crs) == UACPI_STATUS_OK;
+    if (ok) {
+        memcpy(was, l->line, l->nlines * sizeof *was);
+        if (uacpi_get_possible_resources(l->node, &prs) != UACPI_STATUS_OK) prs = NULL;
+    }
+    for (unsigned i = 0; ok && i < l->nlines; i++)
+        if (!l->line[i].number) ok = line_choose(l, i, prs);
+    struct template_walk w = {.link = l, .ok = ok};
+    if (ok) uacpi_for_each_resource(crs, template_put, &w);
+    ok = w.ok && w.lines == l->nlines && uacpi_set_resources(l->node, crs) == UACPI_STATUS_OK;
+    uacpi_object_name name = uacpi_namespace_node_name(l->node);
+    if (ok) {
+        __atomic_store_n(&l->setting, crs, __ATOMIC_RELEASE);
+        crs = NULL;
+        for (unsigned i = 0; i < l->nlines; i++)
+            kprintf("acpi: PCI interrupt link %.4s line %u routed to GSI %u (%s, active %s, %s)\n", name.text, i,
+                    l->line[i].gsi, l->line[i].signal.level ? "level" : "edge",
+                    l->line[i].signal.active_low ? "low" : "high", l->line[i].signal.shared ? "shared" : "exclusive");
+    } else {
+        if (was && crs) memcpy(l->line, was, l->nlines * sizeof *was);
+        kprintf("acpi: PCI interrupt link %.4s cannot be routed\n", name.text);
+    }
+    uacpi_free_resources(crs);
+    uacpi_free_resources(prs);
+    kfree(was);
+    return ok;
+}
+
+/* The interrupt of line Source Index of link node, the link routed first if it is not. Sleeps. */
+static bool link_gsi(uacpi_namespace_node *node, uint32_t index, uint32_t *gsi, struct gsi_signal *signal) {
+    mutex_lock(&links_mutex);
+    struct link *l = link_of(node);
+    bool ok = l && (l->setting || link_route(l));
+    const struct link_line *line = NULL;
+    for (unsigned i = 0; ok && i < l->nlines && !line; i++)
+        if (l->line[i].index == index) line = &l->line[i];
+    if (line) {
+        *gsi = line->gsi;
+        *signal = line->signal;
+    }
+    mutex_unlock(&links_mutex);
+    return line != NULL;
+}
+
+void acpi_links_restore(void) {
+    if (!aml_ready) return;
+    unsigned set = 0, disabled = 0, failed = 0;
+    for (struct link *l = __atomic_load_n(&links, __ATOMIC_ACQUIRE); l; l = l->next) {
+        uacpi_resources *setting = __atomic_load_n(&l->setting, __ATOMIC_ACQUIRE);
+        uacpi_status st = setting ? uacpi_set_resources(l->node, setting) : uacpi_eval(l->node, "_DIS", UACPI_NULL, UACPI_NULL);
+        if (st == UACPI_STATUS_OK && setting) set++;
+        else if (st == UACPI_STATUS_OK) disabled++;
+        else if (setting || st != UACPI_STATUS_NOT_FOUND) failed++;
+    }
+    if (set || disabled || failed)
+        kprintf("acpi: PCI interrupt links: %u set again, %u disabled, %u failed\n", set, disabled, failed);
+}
+
 /* ---- events and sleep ---- */
 
 /* The power button is told (dev/pm.h); the machine service says what it means. Interrupt context
@@ -507,6 +815,7 @@ void acpi_aml_init(void) {
     if (!aml_ok(uacpi_set_interrupt_model(UACPI_INTERRUPT_MODEL_IOAPIC), "telling the firmware of the IOAPICs"))
         return;
     if (!aml_ok(uacpi_namespace_initialize(), "initialising devices")) return;
+    links_find();
     uacpi_bool hw_reduced = false;
     uacpi_is_platform_reduced_hardware(&hw_reduced);
     bool fixed = !hw_reduced &&
@@ -532,39 +841,8 @@ bool acpi_sleep_supported(unsigned state) {
     return uacpi_namespace_node_find(UACPI_NULL, path, &node) == UACPI_STATUS_OK;
 }
 
-/* PCI interrupt links (PNP0C0F): the chipset's routing of INTx to IRQs comes back cleared from
-   S3, so each link's current setting (_CRS) is kept and given back to it (_SRS) on waking. */
-#define LINKS_MAX 32
-static struct link {
-    uacpi_namespace_node *node;
-    uacpi_resources *res;
-} links[LINKS_MAX];
-static unsigned nlinks;
-
-static uacpi_iteration_decision found_link(void *user, uacpi_namespace_node *node, uacpi_u32 depth) {
-    (void)user;
-    (void)depth;
-    uacpi_namespace_node *srs;
-    if (nlinks == LINKS_MAX || uacpi_namespace_node_find(node, "_SRS", &srs) != UACPI_STATUS_OK)
-        return UACPI_ITERATION_DECISION_CONTINUE;
-    if (uacpi_get_current_resources(node, &links[nlinks].res) == UACPI_STATUS_OK) links[nlinks++].node = node;
-    return UACPI_ITERATION_DECISION_CONTINUE;
-}
-
-void acpi_links_save(void) {
-    if (!aml_ready) return;
-    acpi_links_forget();
-    uacpi_find_devices("PNP0C0F", found_link, NULL);
-}
-
-void acpi_links_forget(void) {
-    for (unsigned i = 0; i < nlinks; i++) uacpi_free_resources(links[i].res);
-    nlinks = 0;
-}
-
 bool acpi_sleep_prepare(unsigned state) {
     if (!aml_ready) return false;
-    if (state == 3) acpi_links_save();
     uacpi_status st = uacpi_prepare_for_sleep_state((uacpi_sleep_state)state);
     if (st != UACPI_STATUS_OK) kprintf("acpi: preparing S%u failed: %s\n", state, uacpi_status_to_string(st));
     return st == UACPI_STATUS_OK;
@@ -597,13 +875,8 @@ void acpi_wake_prepare(unsigned state) {
 
 void acpi_wake(unsigned state) {
     if (!aml_ready) return;
-    unsigned routed = 0;
-    for (unsigned i = 0; i < nlinks; i++)
-        if (uacpi_set_resources(links[i].node, links[i].res) == UACPI_STATUS_OK) routed++;
     uacpi_status st = uacpi_wake_from_sleep_state((uacpi_sleep_state)state);
     if (st != UACPI_STATUS_OK) kprintf("acpi: waking from S%u: %s\n", state, uacpi_status_to_string(st));
-    if (nlinks) kprintf("acpi: %u of %u PCI interrupt links set again\n", routed, nlinks);
-    acpi_links_forget();
 }
 
 bool acpi_reset(void) { return aml_ready && uacpi_reboot() == UACPI_STATUS_OK; }
@@ -685,45 +958,16 @@ void *acpi_pci_node(const struct pci_device *d) {
     return node;
 }
 
-/* The interrupt descriptor number index of a link device's current resources (_CRS): its first
-   interrupt, a small IRQ descriptor's an ISA IRQ, an extended one's a GSI. */
-struct link_irq {
-    uint32_t index, at, gsi;
-    bool found, level, low;
-};
-
-static uacpi_iteration_decision link_irq_at(void *user, uacpi_resource *r) {
-    struct link_irq *l = user;
-    if (l->at++ != l->index) return UACPI_ITERATION_DECISION_CONTINUE;
-    if (r->type == UACPI_RESOURCE_TYPE_IRQ && r->irq.num_irqs) {
-        l->gsi = ioapic_isa_gsi(r->irq.irqs[0]);
-        l->level = r->irq.triggering == UACPI_TRIGGERING_LEVEL;
-        l->low = r->irq.polarity == UACPI_POLARITY_ACTIVE_LOW;
-        l->found = true;
-    } else if (r->type == UACPI_RESOURCE_TYPE_EXTENDED_IRQ && r->extended_irq.num_irqs) {
-        l->gsi = r->extended_irq.irqs[0];
-        l->level = r->extended_irq.triggering == UACPI_TRIGGERING_LEVEL;
-        l->low = r->extended_irq.polarity == UACPI_POLARITY_ACTIVE_LOW;
-        l->found = true;
-    }
-    return UACPI_ITERATION_DECISION_BREAK;
-}
-
-/* The entry of a _PRT for device dev's pin (0 = INTA): a GSI, level and active low, or the
-   interrupt its link device has now (ACPI 6.5 6.2.13). */
+/* The entry of a _PRT for device dev's pin (0 = INTA): a GSI wired to it, which PCI's INTx drive
+   level, active low and shared, or the line of the link device it names (ACPI 6.5 6.2.13). */
 static bool prt_gsi(const uacpi_pci_routing_table *t, uint8_t dev, unsigned pin, uint32_t *gsi) {
     for (size_t i = 0; i < t->num_entries; i++) {
         const uacpi_pci_routing_table_entry *e = &t->entries[i];
         if (e->address >> 16 != dev || e->pin != pin) continue;
-        if (!e->source) {
-            *gsi = e->index;
-            return ioapic_gsi_signal(e->index, true, true);
-        }
-        struct link_irq l = {.index = e->index};
-        if (uacpi_for_each_device_resource(e->source, "_CRS", link_irq_at, &l) != UACPI_STATUS_OK || !l.found)
-            return false;
-        *gsi = l.gsi;
-        return ioapic_gsi_signal(l.gsi, l.level, l.low);
+        struct gsi_signal signal = {.level = true, .active_low = true, .shared = true};
+        if (!e->source) *gsi = e->index;
+        else if (!link_gsi(e->source, e->index, gsi, &signal)) return false;
+        return ioapic_gsi_signal(*gsi, signal);
     }
     return false;
 }

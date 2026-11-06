@@ -68,8 +68,9 @@ struct irq;
    irq_request_msi_block: count (a power of two up to 32) vectors in one aligned run on one CPU,
    for MSI's multiple messages (PCI Local Bus 3.0, 6.8.1.3: message n is data + n), specs[i] for
    message i: false when it cannot.
-   irq_request_gsi: the IOAPIC pin's, its trigger and polarity as the MADT and ACPI describe them
-   (arch/ioapic.h), its reach the pin's; a level pin is shared, an edge pin is not.
+   irq_request_gsi: the IOAPIC pin's, its trigger, polarity and sharing as the MADT and ACPI
+   describe them (arch/ioapic.h), its reach the pin's; a level shared pin is shared unless a request
+   asks for it alone (spec.alone), an edge or exclusive one is not.
    irq_request_system: a system vector (VEC_SYSTEM_FIRST up to VEC_APIC_ERROR) on every CPU, for
    the local APIC's own sources and the IPIs; a handler, no thread. Any time after the heap.
    Any CPU; the MSI and GSI requests and irq_free sleep (a thread, a mutex), never from an
