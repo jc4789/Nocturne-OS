@@ -7,6 +7,7 @@
 struct pci_reset;
 struct irq;
 struct iommu_guest;
+struct iommu_irt;
 /* Where a function answers. A segment group has buses of its own, so a bus, device and function
    say nothing without it (ACPI MCFG, _SEG). */
 struct pci_address {
@@ -47,6 +48,11 @@ struct pci_device {
        remapped it did not come back from a sleep (pci_resume). */
     struct irq **msi_irqs, **msix_irqs;
     uint8_t msi_count;
+    /* Its messages' interrupt remapping entries (dev/iommu.c): message n's is irte[n] of table irt,
+       IOMMU_NO_IRTE for none; irte_room of them. NULL while its messages go plain or are off. */
+    struct iommu_irt *irt;
+    uint32_t *irte;
+    unsigned irte_room;
     bool kernel_owned; /* a kernel driver enabled it (pci_enable_busmaster, hal_enable): no app may claim it */
     /* Its place in the device tree (hal/hal.h): the function is a HAL device of bus N_BUS_PCI, whose
        implementation reaches it through pci_device_of. The bus operations are pci_bus_ops. */

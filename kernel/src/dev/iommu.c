@@ -208,6 +208,109 @@ void iommu_entry_write(volatile uint64_t *e, uint64_t v) {
     if (!hw->coherent) iommu_cache_flush(e, sizeof *e);
 }
 
+/* ---- interrupt remapping tables ---- */
+/* The tables' given-out maps and the functions' entries (irte, irt): a leaf, never held over a
+   back end's call. */
+static struct spinlock irt_lock;
+
+bool iommu_irt_make(struct iommu_irt *t, unsigned size, unsigned entry_bytes) {
+    ASSERT(size && !(size & (size - 1)));
+    size_t bytes = (size_t)size * entry_bytes;
+    uint64_t *used = kzalloc(ALIGN_UP(size, 64) / 8);
+    uint64_t phys = used ? iommu_alloc_pages(ALIGN_UP(bytes, PAGE_SIZE) / PAGE_SIZE) : 0;
+    if (!phys) {
+        kfree(used);
+        return false;
+    }
+    if (!hw->coherent) iommu_cache_flush(phys_to_virt(phys), bytes);
+    *t = (struct iommu_irt){.phys = phys, .size = size, .entry_bytes = entry_bytes, .used = used};
+    return true;
+}
+
+void iommu_irt_free(struct iommu_irt *t) {
+    pmm_free_contig(t->phys, ALIGN_UP((size_t)t->size * t->entry_bytes, PAGE_SIZE) / PAGE_SIZE);
+    kfree(t->used);
+    *t = (struct iommu_irt){0};
+}
+
+static bool irt_run_free(const struct iommu_irt *t, unsigned first, unsigned count) {
+    for (unsigned i = first; i < first + count; i++)
+        if (t->used[i / 64] >> (i % 64) & 1) return false;
+    return true;
+}
+
+int iommu_irt_take(struct iommu_irt *t, unsigned count) {
+    ASSERT(count && !(count & (count - 1)) && count <= t->size);
+    uint64_t f = spin_lock(&irt_lock);
+    int found = -1;
+    for (unsigned first = 0; first < t->size && found < 0; first += count) {
+        if (count < 64 && t->used[first / 64] == UINT64_MAX) {
+            first = (first | 63) + 1 - count; /* a full word: on to the next */
+            continue;
+        }
+        if (!irt_run_free(t, first, count)) continue;
+        for (unsigned i = first; i < first + count; i++) t->used[i / 64] |= 1ull << (i % 64);
+        found = (int)first;
+    }
+    spin_unlock(&irt_lock, f);
+    return found;
+}
+
+void iommu_irt_give(struct iommu_irt *t, unsigned first, unsigned count) {
+    uint64_t f = spin_lock(&irt_lock);
+    for (unsigned i = first; i < first + count; i++) t->used[i / 64] &= ~(1ull << (i % 64));
+    spin_unlock(&irt_lock, f);
+}
+
+/* d's entries room for index + count messages, IOMMU_NO_IRTE where none. irt_lock held. */
+static bool messages_room(struct pci_device *d, unsigned index, unsigned count) {
+    if (index + count <= d->irte_room) return true;
+    unsigned room = MAX(index + count, MAX(32u, (unsigned)d->msix_entries));
+    uint32_t *grown = kmalloc(room * sizeof *grown);
+    if (!grown) return false;
+    for (unsigned i = 0; i < room; i++) grown[i] = i < d->irte_room ? d->irte[i] : IOMMU_NO_IRTE;
+    kfree(d->irte);
+    d->irte = grown;
+    d->irte_room = room;
+    return true;
+}
+
+/* The entries of d's messages index .. index + count - 1 in t: those it has (a message written
+   again), else count taken for them. -1 when t has no run free, d's are in another table, or
+   without memory. */
+static int messages_entries(struct pci_device *d, struct iommu_irt *t, unsigned index, unsigned count) {
+    uint64_t f = spin_lock(&irt_lock);
+    bool ok = (!d->irt || d->irt == t) && messages_room(d, index, count);
+    uint32_t first = ok ? d->irte[index] : IOMMU_NO_IRTE;
+    spin_unlock(&irt_lock, f);
+    if (!ok) return -1;
+    if (first != IOMMU_NO_IRTE) return (int)first;
+    int taken = iommu_irt_take(t, count);
+    if (taken < 0) {
+        kprintf("iommu: %04x:%02x:%02x.%x: no interrupt remapping entries left for %u message%s\n",
+                PCI_ADDRESS_ARGS(d->address), count, count == 1 ? "" : "s");
+        return -1;
+    }
+    f = spin_lock(&irt_lock);
+    d->irt = t;
+    for (unsigned i = 0; i < count; i++) d->irte[index + i] = (uint32_t)taken + i;
+    spin_unlock(&irt_lock, f);
+    return taken;
+}
+
+/* d's entries given back to their table and forgotten. */
+static void messages_forget(struct pci_device *d) {
+    uint64_t f = spin_lock(&irt_lock);
+    for (unsigned i = 0; i < d->irte_room; i++)
+        if (d->irte[i] != IOMMU_NO_IRTE) d->irt->used[d->irte[i] / 64] &= ~(1ull << (d->irte[i] % 64));
+    uint32_t *gone = d->irte;
+    d->irte = NULL;
+    d->irte_room = 0;
+    d->irt = NULL;
+    spin_unlock(&irt_lock, f);
+    kfree(gone);
+}
+
 /* ---- page tables ---- */
 static unsigned shift_of(unsigned level) { return 12 + 9 * (level - 1); }
 
@@ -776,7 +879,8 @@ static void domain_id_free(uint16_t id) {
 /* On no list, no unit walking its tables any more. */
 static void domain_release(struct iommu_domain *dom) {
     tables_free(dom->root, dom->levels);
-    if (dom->irt) pmm_free(dom->irt);
+    if (dom->d && dom->d->irt == &dom->irt) messages_forget(dom->d); /* its clear went unconfirmed */
+    if (dom->irt.phys) iommu_irt_free(&dom->irt);
     if (dom->id != 1) domain_id_free(dom->id); /* 1 is the back end's own, never given out */
     kfree(dom->members);
     kfree(dom->ids);
@@ -852,10 +956,14 @@ static void guests_stop(const struct iommu_domain *dom) {
 
 void iommu_guests_stop(const struct iommu_domain *dom) { guests_stop(dom); }
 
+/* A guest in a formed domain sends no message: the domain's remapping entries are the claimed
+   function's (AMD-Vi: one table for every ID of the group). */
 void iommu_guests_start(struct iommu_domain *dom, bool formed) {
     for (unsigned i = 0; i < dom->nmembers; i++) {
-        const struct iommu_guest *guest = dom->members[i]->guest;
-        if (guest) guest->start(formed ? dom : NULL, guest->ctx);
+        struct pci_device *m = dom->members[i];
+        if (!m->guest) continue;
+        m->no_messages = formed;
+        m->guest->start(formed ? dom : NULL, m->guest->ctx);
     }
 }
 
@@ -981,20 +1089,34 @@ bool iommu_msi_message(struct pci_device *d, unsigned index, unsigned count, con
                        uint32_t *address, uint32_t *data) {
     if (restore_failed) return false;
     struct irq_target to = irq_target(irq);
-    if (hw) return hw->msi(d, index, count, to.vector, to.apic_id, address, data);
-    if (to.apic_id > 0xFF) return false;
-    uint64_t plain;
-    irq_msi_message(irq, &plain, data);
-    *address = (uint32_t)plain;
+    struct iommu_irt *t = NULL;
+    if (hw && !hw->msi_table(d, &t)) return false;
+    if (!t) {
+        if (to.apic_id > 0xFF) return false;
+        *address = iommu_msi_plain(to.apic_id);
+        *data = to.vector; /* fixed delivery, edge (SDM 13.11.2) */
+        return true;
+    }
+    int first = messages_entries(d, t, index, count);
+    return first >= 0 && hw->msi_write(d, t, (unsigned)first, count, to.vector, to.apic_id, address, data);
+}
+
+bool iommu_msi_clear(struct pci_device *d) {
+    if (restore_failed) return false;
+    if (!d->irt) return true;
+    if (!hw->msi_erase(d->irt, d->irte, d->irte_room)) return false; /* kept: a unit may still use them */
+    messages_forget(d);
     return true;
 }
 
-bool iommu_msi_clear(struct pci_device *d) { return !restore_failed && (!hw || hw->msi_clear(d)); }
+uint32_t iommu_msi_reach(const struct pci_device *d) { return hw && !restore_failed ? hw->msi_reach(d) : 0xFF; }
 
-bool iommu_ioapic_entry(uint8_t ioapic_id, uint32_t gsi, uint32_t dest, uint64_t *rte) {
+bool iommu_ioapic_entry(uint8_t ioapic_id, unsigned pin, unsigned pins, uint32_t dest, uint64_t *rte) {
     if (restore_failed) return false;
-    return hw ? hw->ioapic(ioapic_id, gsi, dest, rte) : dest <= 0xFF;
+    return hw ? hw->ioapic(ioapic_id, pin, pins, dest, rte) : dest <= 0xFF;
 }
+
+uint32_t iommu_ioapic_reach(uint8_t ioapic_id) { return hw && !restore_failed ? hw->ioapic_reach(ioapic_id) : 0xFF; }
 
 
 const char *iommu_resume(void) {

@@ -80,20 +80,25 @@ bool iommu_unmap(struct iommu_domain *dom, const uint64_t *frames, uint64_t base
 
 /* Interrupt messages (dev/pci.c). The address and data that make message `index` of d (the
    first of `count` for MSI, whose message n arrives as the irq's vector + n, arch/irq.h; an MSI-X
-   entry with count 1) arrive where irq is delivered (irq_target): the remappable form where the
-   units remap that function's interrupts, the plain one otherwise (irq_msi_message). False when
-   it cannot be delivered.
-   clear: the function's messages lead nowhere any more (its MSI and MSI-X are off); false when
-   the units did not confirm that, so that its vectors may still be reached. */
+   entry with count 1) arrive where irq is delivered (irq_target): through the units' remapping
+   entries where they remap that function's interrupts, which the message keeps while it is
+   written again (a move, a sleep), the plain form otherwise (an 8-bit destination, SDM 13.11.1).
+   False when it cannot be delivered.
+   clear: the function's messages lead nowhere any more (its MSI and MSI-X are off), its entries
+   given back; false when the units did not confirm that, so that its vectors may still be reached.
+   reach: the highest APIC ID a message of d can name (irq_request_msi's reach). */
 struct irq;
 bool iommu_msi_message(struct pci_device *d, unsigned index, unsigned count, const struct irq *irq,
                        uint32_t *address, uint32_t *data);
 bool iommu_msi_clear(struct pci_device *d);
-/* An IOAPIC redirection entry (arch/ioapic.c) for GSI gsi of the IOAPIC with this MADT id to the
-   CPU with APIC ID dest, given in the plain format (an 8-bit destination there, 0 above 255) and
-   made what to write: remappable where interrupt remapping covers the IOAPICs. False when it
-   cannot be delivered (the pin then stays masked). */
-bool iommu_ioapic_entry(uint8_t ioapic_id, uint32_t gsi, uint32_t dest, uint64_t *rte);
+uint32_t iommu_msi_reach(const struct pci_device *d);
+/* An IOAPIC redirection entry (arch/ioapic.c) for pin `pin` of the `pins` of the IOAPIC with this
+   MADT id to the CPU with APIC ID dest, given in the plain format (an 8-bit destination there, 0
+   above 255) and made what to write: remappable where interrupt remapping covers the IOAPICs.
+   False when it cannot be delivered (the pin then stays masked). reach: the highest APIC ID its
+   entries can name. */
+bool iommu_ioapic_entry(uint8_t ioapic_id, unsigned pin, unsigned pins, uint32_t dest, uint64_t *rte);
+uint32_t iommu_ioapic_reach(uint8_t ioapic_id);
 /* Sleep (dev/pm.c): the units come back reset; resume programs them again from the tables in
    memory, before the IOAPICs and devices are, and only after the machine really slept (an
    aborted sleep leaves them on). NULL once they are back. Units that do not come back are
@@ -107,6 +112,19 @@ const char *iommu_resume(void);
 bool iommu_shutdown(void); /* false: do not overwrite the hardware's live tables */
 
 /* ---- for the back ends ---- */
+/* An interrupt remapping table of the back end's (one a VT-d segment shares, one an AMD-Vi
+   requester ID set has): size entries (a power of two) of entry_bytes, zeroed, at phys, and which
+   of them are given out (dev/iommu.c, under a lock of its own). make: false without memory. take: count (a power of two) entries aligned to count, the
+   first of them, or -1 when no such run is free. */
+struct iommu_irt {
+    uint64_t phys;
+    unsigned size, entry_bytes;
+    uint64_t *used;
+};
+bool iommu_irt_make(struct iommu_irt *t, unsigned size, unsigned entry_bytes);
+void iommu_irt_free(struct iommu_irt *t);
+int iommu_irt_take(struct iommu_irt *t, unsigned count);
+void iommu_irt_give(struct iommu_irt *t, unsigned first, unsigned count);
 #define IOMMU_READ  1u
 #define IOMMU_WRITE 2u
 struct iommu_domain {
@@ -125,6 +143,7 @@ struct iommu_domain {
     bool written;  /* the back end changed the units' entries for its IDs: blocked before it is freed */
     bool blocked;  /* the units confirmed nothing of the group gets through */
     bool unwanted; /* freed while its block was unconfirmed: freed once a block is confirmed */
+    struct iommu_irt irt; /* AMD-Vi: the claim's own interrupt remapping table (VT-d shares one a segment) */
 };
 /* The calls below come from any CPU: attach and block with dev/iommu.c's attach_mutex held,
    flush with the domain's map mutex, ioapic under arch/ioapic.c's lock, msi and msi_clear from
@@ -159,10 +178,20 @@ struct iommu_hw {
     bool (*attach)(struct iommu_domain *dom);
     bool (*block)(struct iommu_domain *dom);
     bool (*flush)(struct iommu_domain *dom, bool unmapped); /* after its page tables changed */
-    bool (*msi)(struct pci_device *d, unsigned index, unsigned count, uint8_t vector, uint32_t dest,
-                uint32_t *address, uint32_t *data);
-    bool (*msi_clear)(struct pci_device *d);
-    bool (*ioapic)(uint8_t ioapic_id, uint32_t gsi, uint32_t dest, uint64_t *rte);
+    /* Interrupt remapping of messages, whose entries dev/iommu.c gives out of the back end's tables.
+       msi_table: *t the table d's messages go through (made where d has none yet, AMD-Vi), NULL
+       when they go plain; false when they cannot be delivered. msi_write: entries first .. first + count - 1 of t, message n of d to vector
+       + n at dest; the address and data of message 0; false when the units did not confirm it.
+       msi_erase: entries[0 .. count - 1] of t not present (IOMMU_NO_IRTE skipped), true once the
+       units confirmed it. msi_reach: the
+       highest APIC ID d's messages can name. */
+    bool (*msi_table)(struct pci_device *d, struct iommu_irt **t);
+    bool (*msi_write)(struct pci_device *d, struct iommu_irt *t, unsigned first, unsigned count, uint8_t vector,
+                      uint32_t dest, uint32_t *address, uint32_t *data);
+    bool (*msi_erase)(struct iommu_irt *t, const uint32_t *entries, unsigned count);
+    uint32_t (*msi_reach)(const struct pci_device *d);
+    bool (*ioapic)(uint8_t ioapic_id, unsigned pin, unsigned pins, uint32_t dest, uint64_t *rte);
+    uint32_t (*ioapic_reach)(uint8_t ioapic_id);
     bool (*resume)(void);
     bool (*shutdown)(void);
 };
@@ -206,5 +235,7 @@ unsigned iommu_dma_bits(const struct iommu_domain *dom);
 /* Whether to log one more blocked request: a few a second, so a device that keeps sending
    them cannot drown the log. */
 bool iommu_fault_report(void);
-/* The plain MSI address for a physical APIC id (bits 19:12, no redirection hint). */
+/* The plain MSI address for a physical APIC id (bits 19:12, no redirection hint; SDM 13.11.1). */
 static inline uint32_t iommu_msi_plain(uint32_t dest) { return 0xFEE00000u | dest << 12; }
+#define IOMMU_NO_IRTE UINT32_MAX
+

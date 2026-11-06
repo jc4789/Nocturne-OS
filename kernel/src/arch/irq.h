@@ -8,9 +8,14 @@
    own: every CPU has its table of what its vectors deliver, so the vectors grow with the CPUs.
    The system vectors are the same on every CPU, at the top. A device's are given per CPU from
    VEC_DEVICE_FIRST to VEC_DEVICE_LAST, its CPU chosen in the device's node (fewest vectors in
-   use) among the CPUs its interrupts can name: an APIC ID above 255 only where interrupt
-   remapping carries 32-bit destinations (iommu_irq_wide), the plain MSI address and the IOAPIC's
-   redirection entry holding 8 bits (SDM 13.11.1; 82093AA). No driver has a fixed vector. */
+   use) among the CPUs its interrupts can name. What a source can name is its reach, the highest
+   APIC ID its route carries: 0xFF for a plain MSI address or IOAPIC redirection entry (SDM
+   13.11.1; 82093AA), more where the IOMMU remaps the source (dev/iommu.h, iommu_msi_reach and
+   iommu_ioapic_reach). No driver has a fixed vector.
+
+   A vector a source was routed to is not given out again until its CPU has seen that nothing of
+   the old route is still pending there (VEC_IRQ_DRAIN): the CPU looks at its own IRR (SDM
+   13.8.4) for it, and one still pending is taken as the stray it is when it comes. */
 #include <stdbool.h>
 #include <stdint.h>
 #include "arch/cpu.h"
@@ -21,6 +26,7 @@
 #define VEC_DEVICE_LAST   0xEF
 #define VEC_SYSTEM_FIRST  0xF0
 #define VEC_LOG           0xF0 /* a CPU's own, after it wrote a record holding a spinlock: wakes the log's thread (sys/log.c) */
+#define VEC_IRQ_DRAIN     0xF1 /* look at the vectors this CPU's routes left (arch/irq.c) */
 #define VEC_MCE_THRESHOLD 0xFA /* the machine-check banks' corrected errors (arch/mca.h) */
 #define VEC_TIMER         0xFB /* each CPU's wake device (arch/lapic_timer.c, sys/alarm.c) */
 #define VEC_RESCHED       0xFC /* look at this CPU's run queue (sys/sched.c) */
@@ -28,13 +34,14 @@
 #define VEC_APIC_ERROR    0xFE /* the local APIC's error LVT entry (arch/apic.c) */
 #define VEC_SPURIOUS      0xFF /* the local APIC's spurious vector: no handler, no EOI (13.9) */
 
-enum irq_result { IRQ_NONE, IRQ_HANDLED, IRQ_WAKE_THREAD };
+enum irq_result { IRQ_NONE, IRQ_HANDLED, IRQ_WAKE_THREAD, IRQ_HOLD };
 struct irq_spec {
     const char *name;
     enum irq_result (*handler)(void *context);   /* hard: short, interrupts off */
     void (*thread)(void *context);               /* optional: runs in the irq's own kernel thread */
     void *context;
     int node;                                    /* the device's NUMA node, -1 when unknown */
+    bool alone;                                  /* a GSI's: its line is shared with no other irq */
 };
 struct irq;
 
@@ -42,33 +49,42 @@ struct irq;
    EOI follows it (SDM 13.8.5). IRQ_WAKE_THREAD runs the thread once more, in a kernel thread of
    the irq's own bound to the irq's CPU (kthread_create_on); without a handler every interrupt
    wakes it. A level-triggered line stays masked from its hard handler until every thread it
-   woke has run. Lines are shared: each handler of one says whether the interrupt was its device's.
+   woke has run. IRQ_HOLD: handled, and a level line stays masked until irq_unhold (the handler
+   cannot quiet its device, whose owner does it later); on an edge line or a message it is
+   IRQ_HANDLED. Lines are shared unless a spec says alone: each handler of one says whether the
+   interrupt was its device's. A level line that keeps coming with no handler taking it is masked
+   for good, and said once: nothing would ever quiet it.
 
    cpu: the CPU to deliver to (topology's index), or IRQ_CPU_ANY for the layer's choice; a CPU
-   that is offline, has no vector free, or whose APIC ID the interrupt cannot name is refused.
+   that is offline, has no vector free, or whose APIC ID is beyond the source's reach is refused.
    NULL when no CPU it may name has a vector free, or without memory. A spec has a handler, a
    thread, or both.
-   irq_request_msi: a vector whose message the caller writes (irq_msi_message: the plain form
-   for a destination of 8 bits, irq_target for an interrupt remapping entry).
+   irq_request_msi: a vector whose message the caller writes (the IOMMU makes it,
+   iommu_msi_message, from irq_target); reach: the highest APIC ID that message can name
+   (iommu_msi_reach), UINT32_MAX for a source that is the CPU's own.
    irq_request_msi_block: count (a power of two up to 32) vectors in one aligned run on one CPU,
    for MSI's multiple messages (PCI Local Bus 3.0, 6.8.1.3: message n is data + n), specs[i] for
    message i: false when it cannot.
    irq_request_gsi: the IOAPIC pin's, its trigger and polarity as the MADT and ACPI describe them
-   (arch/ioapic.h); a level pin is shared, an edge pin is not.
+   (arch/ioapic.h), its reach the pin's; a level pin is shared, an edge pin is not.
    irq_request_system: a system vector (VEC_SYSTEM_FIRST up to VEC_APIC_ERROR) on every CPU, for
    the local APIC's own sources and the IPIs; a handler, no thread. Any time after the heap.
    Any CPU; the MSI and GSI requests and irq_free sleep (a thread, a mutex), never from an
    interrupt. */
 #define IRQ_CPU_ANY UINT32_MAX
-struct irq *irq_request_msi(const struct irq_spec *spec, unsigned cpu);
-bool irq_request_msi_block(const struct irq_spec *specs, unsigned count, unsigned cpu, struct irq **irqs);
+struct irq *irq_request_msi(const struct irq_spec *spec, unsigned cpu, uint32_t reach);
+bool irq_request_msi_block(const struct irq_spec *specs, unsigned count, unsigned cpu, uint32_t reach,
+                           struct irq **irqs);
 struct irq *irq_request_gsi(const struct irq_spec *spec, unsigned gsi);
 struct irq *irq_request_system(const struct irq_spec *spec, unsigned vector);
 /* Returns once no handler or thread of it runs on any CPU, nor will (its source the caller turned
    off first: a message that still comes is a stray). Never from its own handler or thread. */
 void irq_free(struct irq *irq);
-/* To that CPU: a GSI's entry is written again; a message by its writer (irq_msi_writer), false
-   for one without, and for a block's (its vectors stay together) and a system vector. */
+/* The level line its handler held (IRQ_HOLD) opens again once no other run holds it. Any context. */
+void irq_unhold(struct irq *irq);
+/* To that CPU: a GSI's entry is written again; a message by its writer (irq_msi_writer). False
+   for a message without a writer, a block's (its vectors stay together), a line other irqs share
+   (where it goes is not one owner's choice), a system vector, and a CPU beyond its reach. */
 bool irq_set_cpu(struct irq *irq, unsigned cpu);
 /* Where it is delivered: the CPU (topology's index), its APIC ID, the vector; a system vector's
    CPU is IRQ_CPU_ANY (every one). */
@@ -79,8 +95,8 @@ struct irq_target {
 };
 struct irq_target irq_target(const struct irq *irq);
 /* Whoever writes the message of a message-signalled irq (dev/pci.c): irq_set_cpu calls write to
-   put the new one in place (irq_msi_message, irq_target say the new target by then); false
-   when it could not, the old one then kept. */
+   put the new one in place (irq_target says the new target by then); false when it could not,
+   the old one then kept. */
 void irq_msi_writer(struct irq *irq, bool (*write)(struct irq *irq, void *writer), void *writer);
 /* The writer puts the message in place again where it stands, its source having forgotten it. False
    for one without a writer, and when it could not. */

@@ -13,13 +13,15 @@
    SCI (shareable, level, active low), and otherwise the ISA identity below GSI 16, PCI's level and
    active low above. An NMI source (5.2.12.6) is delivered as an NMI to CPU 0 and given to no
    device. A redirection entry names an 8-bit destination: an APIC ID above 255 only through
-   interrupt remapping (dev/iommu.h, iommu_ioapic_entry), which every entry passes. Any CPU; each
+   interrupt remapping (dev/iommu.h, iommu_ioapic_entry), which every entry passes. unroute returns
+   once the chip has the masked entry. Any CPU; each
    IOAPIC has its lock, taken before the IOMMU back end's (iommu_ioapic_entry is called under it). */
 void ioapic_init(void); /* CPU 0 once (irq_init), after the MADT and the heap: every pin masked */
 /* An ISA IRQ's GSI: the MADT's override for it, else the same number. */
 uint32_t ioapic_isa_gsi(unsigned isa_irq);
-/* What ACPI says the source on gsi signals (a PCI INTx through _PRT): false when the pin is routed
-   with another signal already, belongs to no IOAPIC, or is an NMI source. */
+/* What ACPI says the source on gsi signals (a PCI INTx through _PRT, a device's _CRS): false when
+   the pin is routed with another signal already, belongs to no IOAPIC, or is an NMI source. A pin
+   the MADT describes (an override, the SCI) keeps the MADT's signal (ACPI 6.5 5.2.12.5). */
 bool ioapic_gsi_signal(uint32_t gsi, bool level, bool active_low);
 /* Whether an IOAPIC has gsi for a device, and if so whether it is level-triggered. */
 bool ioapic_gsi_owned(uint32_t gsi, bool *level);
@@ -27,6 +29,8 @@ bool ioapic_gsi_owned(uint32_t gsi, bool *level);
    interrupt remapping cannot deliver it (the pin then masked). unroute: masked, routed nowhere. */
 bool ioapic_route(uint32_t gsi, uint8_t vector, uint32_t dest);
 void ioapic_unroute(uint32_t gsi);
+/* The highest APIC ID gsi's entry can name (iommu_ioapic_reach of its IOAPIC); 0 for no IOAPIC's. */
+uint32_t ioapic_gsi_reach(uint32_t gsi);
 /* Masked while held, whatever its route (a level line whose threads have not run, arch/irq.c);
    any context, interrupts off. */
 void ioapic_hold(uint32_t gsi, bool held);

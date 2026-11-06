@@ -29,6 +29,7 @@ struct pin {
     bool routed;     /* a vector's (ioapic_route) */
     bool held;       /* masked by its line (ioapic_hold) */
     bool nmi;        /* an NMI source: delivered as an NMI to CPU 0, no device's */
+    bool described;  /* its signal the MADT's (an override, the SCI, an NMI source): ACPI's _CRS and _PRT keep it */
     bool level, active_low;
 };
 
@@ -85,7 +86,7 @@ static uint64_t plain_entry(const struct pin *p) {
 static bool pin_write(struct ioapic *io, uint32_t n) {
     struct pin *p = &io->pin[n];
     uint64_t rte = plain_entry(p);
-    bool ok = !(p->routed || p->nmi) || iommu_ioapic_entry(io->id, io->gsi_base + n, p->dest, &rte);
+    bool ok = !(p->routed || p->nmi) || iommu_ioapic_entry(io->id, n, io->pins, p->dest, &rte);
     if (!ok) rte = RTE_MASK;
     wr(io, REG_RTE(n), RTE_MASK | (uint32_t)rte); /* masked while the destination changes */
     wr(io, REG_RTE(n) + 1, (uint32_t)(rte >> 32));
@@ -160,16 +161,18 @@ void ioapic_init(void) {
         struct ioapic *io;
         if (e->type == ACPI_MADT_OVERRIDE && e->length >= sizeof *o && !o->bus && (io = owner(o->gsi, &n))) {
             inti_signal(&io->pin[n], o->flags, o->source == sci);
+            io->pin[n].described = true;
             sci_overridden |= o->source == sci;
         } else if (e->type == ACPI_MADT_NMI_SOURCE && e->length >= sizeof *s && (io = owner(s->gsi, &n))) {
             struct pin *p = &io->pin[n];
-            p->nmi = true;
+            p->nmi = p->described = true;
             p->active_low = ACPI_INTI_POLARITY(s->flags) == ACPI_INTI_LOW;
             p->dest = topology.cpu[0].apic_id;
         }
     }
     struct ioapic *io;
-    if (!sci_overridden && sci != UINT32_MAX && (io = owner(sci, &n))) io->pin[n].level = io->pin[n].active_low = true;
+    if (!sci_overridden && sci != UINT32_MAX && (io = owner(sci, &n)))
+        io->pin[n].level = io->pin[n].active_low = io->pin[n].described = true;
     for (unsigned i = 0; i < nios; i++) {
         io = ios[i];
         uint64_t f = spin_lock(&io->lock);
@@ -195,8 +198,8 @@ bool ioapic_gsi_signal(uint32_t gsi, bool level, bool active_low) {
     if (!io) return false;
     uint64_t f = spin_lock(&io->lock);
     struct pin *p = &io->pin[n];
-    bool ok = !p->nmi && (!p->routed || (p->level == level && p->active_low == active_low));
-    if (ok) {
+    bool ok = !p->nmi && (p->described || !p->routed || (p->level == level && p->active_low == active_low));
+    if (ok && !p->described) {
         p->level = level;
         p->active_low = active_low;
     }
@@ -237,7 +240,14 @@ void ioapic_unroute(uint32_t gsi) {
     uint64_t f = spin_lock(&io->lock);
     io->pin[n].routed = false;
     pin_write(io, n);
+    (void)rd(io, REG_RTE(n)); /* the masking write has reached the chip: nothing more leaves the pin */
     spin_unlock(&io->lock, f);
+}
+
+uint32_t ioapic_gsi_reach(uint32_t gsi) {
+    uint32_t n;
+    struct ioapic *io = owner(gsi, &n);
+    return io ? iommu_ioapic_reach(io->id) : 0;
 }
 
 /* The entry's mask bit alone: it is the same bit in the remappable format (VT-d 5.1.5.1), and the
