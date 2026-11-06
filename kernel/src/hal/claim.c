@@ -147,23 +147,6 @@ bool hal_claim_dma_unmap(struct hal_claim *c, const uint64_t *frames, uint64_t b
 
 /* ---- 割り込み ---- */
 
-/* claim の message n。irq が向かう CPU で走る。 */
-static enum irq_result claim_isr(void *context) {
-    struct claim_message *m = context;
-    struct hal_claim *c = m->claim;
-    spin_take(&c->irq_lock);
-    if (m->n < c->vectors) {
-        uint64_t *word = &c->vec->pending[m->n / 64], bit = 1ull << (m->n % 64);
-        if (!(*word & bit)) {
-            *word |= bit;
-            __atomic_store_n(&c->pending, c->pending + 1, __ATOMIC_RELEASE);
-        }
-        wq_wake_all(&c->wq);
-        object_notify(&c->object);
-    }
-    spin_give(&c->irq_lock);
-    return IRQ_HANDLED;
-}
 
 static void interrupts_off(struct hal_claim *c) {
     if (!c->vectors) return;

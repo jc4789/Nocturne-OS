@@ -128,12 +128,6 @@
 #define DMAR_DMA_REMAP_OPT_OUT (1u << 3)
 
 /* interrupt remapping table */
-#define IRT_ENTRIES    4096
-#define IRT_S          11 /* IRTA.S: 2^(S+1) entries */
-#define IOAPIC_ENTRIES 256
-#define MSI_BLOCK_LOG2 5
-#define MSI_BLOCK      (1u << MSI_BLOCK_LOG2)
-#define MSI_BLOCKS     ((int)((IRT_ENTRIES - IOAPIC_ENTRIES) / MSI_BLOCK))
 #define IRTE_P         1ull
 #define IRTE_DM        (1ull << 2) /* logical destination */
 #define IRTE_TM        (1ull << 4) /* level */
@@ -199,7 +193,6 @@ static struct irq *fault_irq; /* the fault events' (fault_isr) */
 struct irt_table {
     uint16_t segment;
     uint64_t phys;
-    const struct pci_device *msi_owner[MSI_BLOCKS];
 };
 static struct irt_table *irts;
 static size_t nirts, irts_room;
@@ -808,100 +801,6 @@ static uint64_t irte_source(const struct pci_device *d) {
     return source;
 }
 
-static int msi_block(struct irt_table *t, const struct pci_device *d, bool create) {
-    int free = -1;
-    for (int b = 0; b < MSI_BLOCKS; b++) {
-        if (t->msi_owner[b] == d) return b;
-        if (!t->msi_owner[b] && free < 0) free = b;
-    }
-    if (!create) return -1;
-    if (free < 0) {
-        kprintf("iommu: no interrupt remapping entries left for %04x:%02x:%02x.%x\n", PCI_ADDRESS_ARGS(d->address));
-        return -1;
-    }
-    t->msi_owner[free] = d;
-    return free;
-}
-
-static bool msi_release(struct irt_table *t, const struct pci_device *d) {
-    uint64_t f = spin_lock(&tables_lock);
-    int b = msi_block(t, d, false);
-    unsigned first = IOAPIC_ENTRIES + (unsigned)(b < 0 ? 0 : b) * MSI_BLOCK;
-    for (unsigned i = 0; b >= 0 && i < MSI_BLOCK; i++) irte_write(t, first + i, 0, 0);
-    spin_unlock(&tables_lock, f);
-    if (b < 0) return true;
-    bool ok = on_every_unit(iec_flush, &(struct iec_range){t->segment, first, MSI_BLOCK_LOG2});
-    if (ok) { /* else kept: an entry may still be cached */
-        f = spin_lock(&tables_lock);
-        t->msi_owner[b] = NULL;
-        spin_unlock(&tables_lock, f);
-    }
-    return ok;
-}
-
-/* Message n of d's block arrives through entry block + index + n: the address carries the
-   block entry of message 0, the data the subhandle the function adds the message number to.
-   The entries' source is worked out (an allocation) before tables_lock. */
-static bool intel_msi(struct pci_device *d, unsigned index, unsigned count, uint8_t vector, uint32_t dest,
-                      uint32_t *address, uint32_t *data) {
-    struct irt_table *t = remap ? irt_of(d->address.segment) : NULL;
-    if (!t) {
-        if (dest > 0xFF) return false; /* the 8-bit destination of a plain message */
-        *address = iommu_msi_plain(dest);
-        *data = vector;
-        return true;
-    }
-    uint64_t source = irte_source(d);
-    if (!source || index + count > MSI_BLOCK) return false;
-    uint64_t f = spin_lock(&tables_lock);
-    int b = msi_block(t, d, true);
-    unsigned first = IOAPIC_ENTRIES + (unsigned)(b < 0 ? 0 : b) * MSI_BLOCK, at = first + index;
-    for (unsigned i = 0; b >= 0 && i < count; i++)
-        irte_write(t, at + i, IRTE_P | IRTE_VECTOR(vector + i) | irte_dest(dest), source);
-    spin_unlock(&tables_lock, f);
-    if (b < 0) return false;
-    bool ok = on_every_unit(iec_flush, &(struct iec_range){t->segment, first, MSI_BLOCK_LOG2});
-    *address = 0xFEE00000u | (at & 0x7FFF) << 5 | 1u << 4 | 1u << 3 | (at >> 15 & 1) << 2; /* remappable, SHV */
-    *data = 0;
-    return ok;
-}
-
-static bool intel_msi_clear(struct pci_device *d) {
-    struct irt_table *t = remap ? irt_of(d->address.segment) : NULL;
-    return !t || msi_release(t, d);
-}
-
-/* Pin `gsi` is entry gsi; the IRTE takes what the plain entry said (delivery mode, logical
-   destination, trigger, vector) and the 32-bit destination dest, the pin keeps polarity, trigger,
-   vector (for the EOI of a level pin) and mask, with delivery mode 000. */
-static bool intel_ioapic(uint8_t ioapic_id, uint32_t gsi, uint32_t dest, uint64_t *rte) {
-    if (!remap) return dest <= 0xFF; /* the plain entry's 8-bit destination */
-    if (gsi >= IOAPIC_ENTRIES) {
-        kprintf("iommu: GSI %u is beyond the IOAPIC entries: left masked\n", gsi);
-        return false;
-    }
-    uint64_t source = 0, v = *rte;
-    struct irt_table *t = NULL;
-    for (size_t i = 0; i < nioapics; i++)
-        if (ioapics[i].id == ioapic_id) {
-            source = IRTE_SID(ioapics[i].sid, 1);
-            t = irt_of(ioapics[i].segment);
-        }
-    if (!source || !t) {
-        kprintf("iommu: IOAPIC %u is under no VT-d unit: GSI %u left masked\n", ioapic_id, gsi);
-        return false;
-    }
-    uint64_t f = spin_lock(&tables_lock);
-    irte_write(t, gsi, IRTE_P | (v >> 11 & 1 ? IRTE_DM : 0) | (v >> 15 & 1 ? IRTE_TM : 0) | IRTE_DLM(v >> 8 & 7) |
-                           IRTE_VECTOR(v) | irte_dest(dest), source);
-    spin_unlock(&tables_lock, f);
-    if (!on_every_unit(iec_flush, &(struct iec_range){t->segment, gsi, 0})) {
-        kprintf("iommu: the units did not confirm the entry of GSI %u: left masked\n", gsi);
-        return false;
-    }
-    *rte = (v & RTE_KEPT) | RTE_REMAPPABLE | (uint64_t)(gsi & 0x7FFF) << 49 | (uint64_t)(gsi >> 15 & 1) << 11;
-    return true;
-}
 
 /* ---- domains ---- */
 static uint64_t intel_table(uint64_t phys, unsigned level) {
@@ -1485,7 +1384,6 @@ const struct iommu_hw *iommu_intel_probe(bool *plain_safe) {
                 "mode: interrupts are not remapped\n");
         remap = false;
     }
-    intel.irq_wide = remap; /* every message and IOAPIC entry goes through the table, 32-bit destinations */
     intel.interrupt_remapping_required = irreq;
     if (parse_lost) {
         kprintf("iommu: the DMAR scope or structure is not supported: VT-d not used\n");

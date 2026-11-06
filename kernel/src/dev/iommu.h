@@ -94,10 +94,6 @@ bool iommu_msi_clear(struct pci_device *d);
    made what to write: remappable where interrupt remapping covers the IOAPICs. False when it
    cannot be delivered (the pin then stays masked). */
 bool iommu_ioapic_entry(uint8_t ioapic_id, uint32_t gsi, uint32_t dest, uint64_t *rte);
-/* Every interrupt route the units give now carries a 32-bit destination: messages and IOAPIC
-   pins alike are remapped in x2APIC format (VT-d Extended Interrupt Mode). Without it a device's
-   interrupt names an APIC ID of 8 bits only (arch/irq.c). Any CPU. */
-bool iommu_irq_wide(void);
 /* Sleep (dev/pm.c): the units come back reset; resume programs them again from the tables in
    memory, before the IOAPICs and devices are, and only after the machine really slept (an
    aborted sleep leaves them on). NULL once they are back. Units that do not come back are
@@ -129,7 +125,6 @@ struct iommu_domain {
     bool written;  /* the back end changed the units' entries for its IDs: blocked before it is freed */
     bool blocked;  /* the units confirmed nothing of the group gets through */
     bool unwanted; /* freed while its block was unconfirmed: freed once a block is confirmed */
-    uint64_t irt;  /* AMD-Vi: its interrupt remapping table (VT-d shares one among all functions) */
 };
 /* The calls below come from any CPU: attach and block with dev/iommu.c's attach_mutex held,
    flush with the domain's map mutex, ioapic under arch/ioapic.c's lock, msi and msi_clear from
@@ -141,7 +136,6 @@ struct iommu_domain {
 struct iommu_hw {
     const char *name;
     bool interrupt_remapping_required; /* stopped units cannot deliver plain interrupts (VT-d IRREQ) */
-    bool irq_wide; /* set by probe: every message and IOAPIC entry is remapped with a 32-bit destination */
     bool coherent;   /* the units snoop their table reads; else every written entry is flushed */
     unsigned levels; /* of a claimed function's page tables */
     unsigned iova_bits; /* usable input address width shared by every translating unit */

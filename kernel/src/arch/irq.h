@@ -62,7 +62,6 @@ struct irq;
 #define IRQ_CPU_ANY UINT32_MAX
 struct irq *irq_request_msi(const struct irq_spec *spec, unsigned cpu);
 bool irq_request_msi_block(const struct irq_spec *specs, unsigned count, unsigned cpu, struct irq **irqs);
-void irq_msi_message(const struct irq *irq, uint64_t *address, uint32_t *data);
 struct irq *irq_request_gsi(const struct irq_spec *spec, unsigned gsi);
 struct irq *irq_request_system(const struct irq_spec *spec, unsigned vector);
 /* Returns once no handler or thread of it runs on any CPU, nor will (its source the caller turned

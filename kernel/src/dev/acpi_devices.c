@@ -31,28 +31,6 @@ extern const struct hal_claim_ops hal_claim_plain;
 
 static struct acpi_device *of(struct hal_device *d) { return (struct acpi_device *)d; }
 
-static unsigned acpi_irq_enable(struct hal_device *d, const struct irq_spec *specs, unsigned count, struct irq **irqs) {
-    struct acpi_device *a = of(d);
-    unsigned most = MIN(count, a->gsi_slots);
-    if (!most) return 0;
-    a->irqs = kzalloc(most * sizeof *a->irqs);
-    if (!a->irqs) return 0;
-    unsigned got = 0;
-    for (; got < most; got++) {
-        const struct n_hal_resource *r = hal_resource(d, N_HAL_GSI, got);
-        if (!ioapic_gsi_signal((uint32_t)r->base, r->flags & N_HAL_GSI_LEVEL, r->flags & N_HAL_GSI_ACTIVE_LOW)) break;
-        struct irq *irq = irq_request_gsi(&specs[got], (unsigned)r->base);
-        if (!irq) break;
-        a->irqs[got] = irq;
-        if (irqs) irqs[got] = irq;
-    }
-    a->irq_count = got;
-    if (!got) {
-        kfree(a->irqs);
-        a->irqs = NULL;
-    }
-    return got;
-}
 
 static bool acpi_irq_disable(struct hal_device *d) {
     struct acpi_device *a = of(d);

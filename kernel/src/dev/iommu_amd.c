@@ -87,7 +87,6 @@
 #define RING_BYTES 4096           /* command buffer and event log: 256 entries of 16 bytes */
 #define RING_LEN   (8ull << 56)   /* log2 of their entry count */
 #define DT_BYTES   (65536 * 32)
-#define IRT_LOG2   5              /* a claim's 32 vectors */
 /* Every blocked entry's DomainID: iommu.c keeps ID 1 for the back end. Entries that share an ID
    must agree on Mode and root (Table 7), and a released claim's ID is soon another's. */
 #define BLOCK_DOMAIN 1
@@ -742,40 +741,6 @@ static void irte_store(volatile uint64_t *e, uint64_t lo, uint64_t hi) {
     while (!stored);
 }
 
-static bool irt_write(struct iommu_domain *dom, unsigned first, unsigned count, uint8_t vector, uint32_t dest,
-                      bool on) {
-    uint8_t *irt = phys_to_virt(dom->irt);
-    const size_t size = 16;
-    for (unsigned i = 0; i < count; i++) {
-        uint8_t v = (uint8_t)(vector + i);
-        irte_store((volatile uint64_t *)(irt + (first + i) * size), on ? 1u | (uint64_t)(dest & 0xFFFFFF) << 8 : 0,
-                   on ? v | (uint64_t)(dest >> 24) << 56 : 0);
-    }
-    if (!amd.coherent) iommu_cache_flush(irt + first * size, count * size);
-    return on_every_unit(irt_flush, dom);
-}
-
-static bool amd_msi(struct pci_device *d, unsigned index, unsigned count, uint8_t vector, uint32_t dest,
-                    uint32_t *address, uint32_t *data) {
-    struct iommu_domain *dom = iommu_domain_of(d);
-    if (dest > 0xFF && !dom) return false;
-    *address = iommu_msi_plain(dom ? 0 : dest);
-    *data = dom ? index : vector;
-    if (!dom) return true;
-    return index < 1u << IRT_LOG2 && count && count <= (1u << IRT_LOG2) - index &&
-           irt_write(dom, index, count, vector, dest, true);
-}
-
-static bool amd_msi_clear(struct pci_device *d) {
-    struct iommu_domain *dom = iommu_domain_of(d);
-    return !dom || irt_write(dom, 0, 1u << IRT_LOG2, 0, 0, false);
-}
-
-/* AMD-Vi remaps no IOAPIC pin here: the entry stays the plain one, its destination of 8 bits. */
-static bool amd_ioapic(uint8_t ioapic_id, uint32_t gsi, uint32_t dest, uint64_t *rte) {
-    (void)ioapic_id, (void)gsi, (void)rte;
-    return dest <= 0xFF;
-}
 
 /* ---- the units ---- */
 /* Off, also when the firmware left it on, then on with this code's tables. Bypasses stay off:

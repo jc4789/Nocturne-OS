@@ -283,22 +283,6 @@ static uint8_t vectors_take(unsigned cpu, unsigned count) {
     return found;
 }
 
-/* The slot emptied and the vector given back; wait_dispatch before freeing what it held. */
-static void vector_give(unsigned cpu, uint8_t v) {
-    struct vectors *vs = &per_cpu(vectors, cpu);
-    uint64_t f = spin_lock(&vs->lock);
-    __atomic_store_n(&vs->slot[v], 0, __ATOMIC_RELEASE);
-    bit_clear(vs->used, v);
-    __atomic_store_n(&vs->count, vs->count - 1, __ATOMIC_RELAXED);
-    spin_unlock(&vs->lock, f);
-}
-
-/* A device's interrupt can name the CPU: online, and an APIC ID of 8 bits unless interrupt
-   remapping carries 32 (SDM 13.11.1; 82093AA). */
-static bool nameable(unsigned cpu) {
-    return cpu < topology.cpus && cpu_online_at(cpu) && (topology.cpu[cpu].apic_id <= 0xFF || iommu_irq_wide());
-}
-
 /* A CPU for count vectors and the vectors on it: hint when it is a CPU, else in node first (any
    node when -1) the CPU with the fewest device vectors in use, the next fewest when that one has
    no aligned run free. requests held: the counts move only under it. */
@@ -381,13 +365,6 @@ fail:
 struct irq *irq_request_msi(const struct irq_spec *spec, unsigned cpu) {
     struct irq *irq;
     return irq_request_msi_block(spec, 1, cpu, &irq) ? irq : NULL;
-}
-
-/* The plain message (SDM 13.11.1, 13.11.2): the APIC ID in address bits 19:12, physical, no
-   redirection hint; fixed delivery and edge in the data with the vector. */
-void irq_msi_message(const struct irq *irq, uint64_t *address, uint32_t *data) {
-    *address = 0xFEE00000u | (uint64_t)(topology.cpu[irq->cpu].apic_id & 0xFF) << 12;
-    *data = irq->vector;
 }
 
 void irq_msi_writer(struct irq *irq, bool (*write)(struct irq *irq, void *writer), void *writer) {

@@ -996,7 +996,6 @@ bool iommu_ioapic_entry(uint8_t ioapic_id, uint32_t gsi, uint32_t dest, uint64_t
     return hw ? hw->ioapic(ioapic_id, gsi, dest, rte) : dest <= 0xFF;
 }
 
-bool iommu_irq_wide(void) { return !restore_failed && hw && hw->irq_wide; }
 
 const char *iommu_resume(void) {
     if (!hw || hw->resume()) return NULL;

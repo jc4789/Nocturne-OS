@@ -786,23 +786,6 @@ bool pci_requests_done(const struct pci_device *d) {
 }
 
 /* ---- the bus operations of the device tree (hal/hal.h) ---- */
-/* A message where the function has one (MSI-X, then MSI) and may send it, else its INTx: the one
-   specs[0]'s handler answers, the line shared with whatever else sits on it. */
-static unsigned bus_irq_enable(struct hal_device *h, const struct irq_spec *specs, unsigned count, struct irq **irqs) {
-    struct pci_device *d = pci_device_of(h);
-    unsigned n = d->no_messages ? 0 : pci_irq_enable(d, specs, count, irqs);
-    if (n) return n;
-    uint32_t gsi;
-    if (!count || d->intx || !acpi_pci_gsi(d, &gsi)) return 0;
-    pci_write16(d->address, PCI_COMMAND, pci_read16(d->address, PCI_COMMAND) & ~PCI_COMMAND_INTX_DISABLE);
-    d->intx = irq_request_gsi(&specs[0], gsi);
-    if (!d->intx) {
-        intx_disable(d);
-        return 0;
-    }
-    if (irqs) irqs[0] = d->intx;
-    return 1;
-}
 
 static bool bus_irq_disable(struct hal_device *h) {
     struct pci_device *d = pci_device_of(h);
