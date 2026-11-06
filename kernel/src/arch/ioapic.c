@@ -14,6 +14,8 @@
 #define REG_ID     0x00
 #define REG_VER    0x01
 #define REG_RTE(n) (0x10 + 2 * (n))
+#define EOIR_WORD  (0x40 / 4) /* the EOI register, at +40h from version 20h on */
+#define VERSION_EOIR 0x20
 
 /* A redirection entry (82093AA 3.2.4): vector 7:0, delivery mode 10:8, polarity 13 (1: active
    low), trigger 15 (1: level), mask 16, destination 63:56 */
@@ -39,6 +41,7 @@ struct ioapic {
     uint32_t gsi_base, pins;
     uint32_t saved_id; /* the ID register across S3 (the chip comes back reset) */
     uint8_t id;        /* the MADT's: the one the DMAR's scopes name (its register may differ) */
+    uint8_t version;
     /* IOREGSEL/IOWIN (a register access is two) and the pins; before the IOMMU back end's lock */
     struct spinlock lock;
     struct pin pin[];
@@ -144,7 +147,7 @@ static void add(const struct acpi_madt_ioapic *a) {
         kprintf("ioapic: id %u at %x: no memory for it, ignored\n", a->id, a->address);
         return;
     }
-    *io = (struct ioapic){.regs = regs, .gsi_base = a->gsi_base, .pins = pins, .id = a->id};
+    *io = (struct ioapic){.regs = regs, .gsi_base = a->gsi_base, .pins = pins, .id = a->id, .version = (uint8_t)ver};
     for (uint32_t n = 0; n < pins; n++) { /* ISA's identity below 16, PCI's INTx above */
         io->pin[n].level = io->pin[n].active_low = a->gsi_base + n >= 16;
     }
@@ -264,6 +267,21 @@ uint32_t ioapic_gsi_reach(uint32_t gsi) {
     uint32_t n;
     struct ioapic *io = owner(gsi, &n);
     return io ? iommu_ioapic_reach(io->id) : 0;
+}
+
+void ioapic_eoi(uint32_t gsi, uint8_t vector) {
+    uint32_t n;
+    struct ioapic *io = owner(gsi, &n);
+    if (!io) return;
+    if (io->version >= VERSION_EOIR) {
+        mmio_write32(io->regs + EOIR_WORD, vector);
+        return;
+    }
+    spin_take(&io->lock);
+    uint32_t lo = rd(io, REG_RTE(n));
+    wr(io, REG_RTE(n), (lo | RTE_MASK) & ~RTE_LEVEL);
+    wr(io, REG_RTE(n), lo);
+    spin_give(&io->lock);
 }
 
 /* The entry's mask bit alone: it is the same bit in the remappable format (VT-d 5.1.5.1), and the

@@ -38,6 +38,10 @@ uint32_t apic_current_id(void);
 void apic_eoi(void); /* the end of the interrupt this CPU is handling (arch/irq.c) */
 /* vector is pending at this CPU's APIC: its bit in the IRR (SDM 13.8.4, APM 16.6.3). Interrupts off. */
 bool apic_irr(uint8_t vector);
+/* The interrupt this CPU took on vector came as level-triggered: its bit in the TMR, which the
+   APIC sets on accepting a level interrupt and clears on an edge one, and by which its EOI goes on
+   to the IOAPICs (SDM 13.8.4). Before the EOI, interrupts off. */
+bool apic_tmr(uint8_t vector);
 
 /* IPIs: fixed delivery of vector, edge, to CPUs by topology's index (arch/topology.h). set: a CPU
    set (arch/cpuset.h), in x2APIC mode in as few ICR writes as the logical clusters allow (up to 16

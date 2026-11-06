@@ -31,6 +31,12 @@ bool ioapic_route(uint32_t gsi, uint8_t vector, uint32_t dest);
 void ioapic_unroute(uint32_t gsi);
 /* The highest APIC ID gsi's entry can name (iommu_ioapic_reach of its IOAPIC); 0 for no IOAPIC's. */
 uint32_t ioapic_gsi_reach(uint32_t gsi);
+/* The end of a level interrupt of gsi on vector that the CPU took as edge-triggered (apic_tmr), so
+   that its APIC's EOI never reached the IOAPICs: interrupt remapping may deliver it without its
+   trigger mode. Remote IRR cleared in the pin, through the IOAPIC's EOI register where it has one
+   (version 20h and up), else by turning the masked entry edge-triggered and back, which clears it.
+   On the CPU that took it, after its EOI, interrupts off. */
+void ioapic_eoi(uint32_t gsi, uint8_t vector);
 /* Masked while held, whatever its route (a level line whose threads have not run, arch/irq.c);
    any context, interrupts off. */
 void ioapic_hold(uint32_t gsi, bool held);

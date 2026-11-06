@@ -11,7 +11,9 @@
    use) among the CPUs its interrupts can name. What a source can name is its reach, the highest
    APIC ID its route carries: 0xFF for a plain MSI address or IOAPIC redirection entry (SDM
    13.11.1; 82093AA), more where the IOMMU remaps the source (dev/iommu.h, iommu_msi_reach and
-   iommu_ioapic_reach). No driver has a fixed vector.
+   iommu_ioapic_reach). No driver has a fixed vector. The IOAPICs' lines are each given a vector
+   number no other line has on any CPU: a level interrupt's EOI reaches every IOAPIC with its
+   number alone (arch/irq.c), so the GSI lines share at most the device vectors of one CPU.
 
    A vector a source was routed to is not given out again until its CPU has seen that nothing of
    the old route is still pending there (VEC_IRQ_DRAIN): the CPU looks at its own IRR (SDM

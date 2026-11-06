@@ -68,6 +68,9 @@ static struct hal_device *gpu_device;
 static uint64_t bus(uint64_t phys) { return hal_dma_address(gpu_device, phys); }
 static struct virtio_common *common;
 static volatile uint16_t *notify;
+/* ISR status (virtio 1.x 4.1.4.5), read by the handler on INTx alone: bit 0 says the queue raised
+   it, and the read lowers the line. NULL with MSI-X, which leaves it unused. */
+static volatile uint8_t *isr_status;
 static struct descriptor *desc;
 static struct avail *avail;
 static struct used *used;
@@ -102,6 +105,8 @@ static bool gpu_copy(void *destination,const void *source,size_t bytes) {
 
 static enum irq_result gpu_isr(void *context) {
     (void)context;
+    volatile uint8_t *isr = __atomic_load_n(&isr_status, __ATOMIC_ACQUIRE);
+    if (isr && !(mmio_read8(isr) & 1)) return IRQ_NONE; /* a shared line's other device */
     __atomic_fetch_add(&completions, 1, __ATOMIC_SEQ_CST);
     wq_wake_all(&completion_wait);
     return IRQ_HANDLED;
@@ -153,6 +158,8 @@ static bool transport_init(struct hal_device *d) {
             if (type == 1 && !common) {
                 common = cap_map(d, cap, &length);
                 if (!common || length < sizeof *common) return false;
+            } else if (type == 3 && !isr_status) {
+                isr_status = cap_map(d, cap, &length);
             } else if (type == 2 && !notify_base) {
                 if (len < 20) return false;
                 notify_base = cap_map(d, cap, &notify_length);
@@ -206,12 +213,20 @@ static bool transport_init(struct hal_device *d) {
     uint64_t notify_off = (uint64_t)mmio_read16(&common->queue_notify_off) * notify_multiplier;
     if (notify_length < 2 || notify_off > notify_length - 2) return false;
     notify = (volatile uint16_t *)(notify_base + notify_off);
-    /* the queue's MSI-X entry 0 (virtio 1.x, 4.1.4.3): a device without MSI-X is read again instead */
+    /* The queue's interrupt: MSI-X entry 0 (virtio 1.x 4.1.4.3), or INTx with ISR status (4.1.4.5),
+       which the handler reads from the first delivery on. Without either the ring is read again
+       instead. */
     if(hal_irq_max(d) &&
        hal_irq_enable(d,&(struct irq_spec){.name="virtio-gpu",.handler=gpu_isr},1,NULL)){
-        mmio_write16(&common->queue_msix_vector, 0);
-        if(mmio_read16(&common->queue_msix_vector)==0){completion_irq=true;avail->flags=0;}
-        else hal_irq_disable(d);
+        if(pci_device_of(d)->intx){
+            if(isr_status){completion_irq=true;avail->flags=0;}
+            else hal_irq_disable(d);
+        }else{
+            __atomic_store_n(&isr_status, NULL, __ATOMIC_RELEASE);
+            mmio_write16(&common->queue_msix_vector, 0);
+            if(mmio_read16(&common->queue_msix_vector)==0){completion_irq=true;avail->flags=0;}
+            else hal_irq_disable(d);
+        }
     }
     mmio_write16(&common->queue_enable, 1);
     mmio_write8(&common->device_status, 1 | 2 | 8 | 4);

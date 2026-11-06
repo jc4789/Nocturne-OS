@@ -35,6 +35,7 @@
 #define R_CONTROL   0x0018
 #define R_EXCL_BASE 0x0020
 #define R_EFR       0x0030
+#define R_EFR2      0x01A0
 #define R_PERF_OPT  0x016C
 #define R_VSTATUS   0x0190
 #define R_CMD_HEAD  0x2000
@@ -58,6 +59,7 @@
 #define CTL_GALOG_EN    (1ull << 28)
 #define CTL_GAINT_EN    (1ull << 29)
 #define CTL_MARC_EN     (1ull << 40)
+#define CTL_INT_REMAP_2K (1ull << 43) /* NumIntRemapMode 01b: 2048 entries a function (Table 19) */
 #define CTL_BLK_STOP_MRK_EN (1ull << 41)
 #define CTL_XT_EN       (1ull << 50)
 #define CTL_VCMD_EN     (1ull << 52)
@@ -83,6 +85,7 @@
 #define EFR_IA       (1ull << 6)  /* INVALIDATE_IOMMU_ALL */
 #define EFR_MARC_MASK (3ull << 42) /* MarcSup: 00 is unsupported; 01/10 specify aperture counts */
 #define EFR_PERF_OPT (1ull << 45) /* the performance optimization register (3.4.9) */
+#define EFR2_INT_REMAP_SUP(e) ((e) >> 8 & 3) /* NumIntRemapSup (3.4.13): 01b, 2048 entries a function */
 #define PERF_OPT_EN  (1u << 13)
 #define CAP_NP_CACHE (1u << 26) /* caches not-present entries: a map needs an invalidation too */
 #define CAP_EFR      (1u << 27)
@@ -90,8 +93,8 @@
 #define RING_BYTES 4096           /* command buffer and event log: 256 entries of 16 bytes */
 #define RING_LEN   (8ull << 56)   /* log2 of their entry count */
 #define DT_BYTES   (65536 * 32)
-#define IRT_LOG2   11             /* IntTabLen's largest: 2048 entries (Table 9) */
 #define IRTE_BYTES 16             /* the 128-bit entry of GAEn (Figure 19) */
+#define IOAPIC_IRT_LOG2 8         /* an IOAPIC's table: one entry per vector number */
 /* Every blocked entry's DomainID: iommu.c keeps ID 1 for the back end. Entries that share an ID
    must agree on Mode and root (Table 7), and a released claim's ID is soon another's. */
 #define BLOCK_DOMAIN 1
@@ -105,6 +108,12 @@
 #define DTE_IV       (1ull << 0)
 #define DTE_IRT_LEN(n) ((uint64_t)(n) << 1)
 #define DTE_INT_REMAP (2ull << 60) /* IntCtl: fixed and arbitrated interrupts remapped; 00 aborts */
+/* the passes of DTE bits 184-186, 190 and 191 (Table 7), from the IVHD's DTE setting (Table 104:
+   INITPass bit 0, EIntPass 1, NMIPass 2, Lint0Pass 6, Lint1Pass 7) */
+#define IVHD_NMI_PASS 4u
+static uint64_t dte_passes(uint8_t setting) {
+    return (uint64_t)(setting & 7) << 56 | (uint64_t)(setting >> 6 & 3) << 62;
+}
 /* I/O page table entry: what a request may do is what every entry on its way allows */
 #define PTE_PR (1ull << 0)
 #define PTE_IR (1ull << 61)
@@ -140,6 +149,7 @@ struct unit {
        logging where the register differs, and program confirming XTEn and GAEn, which the
        register's lack makes reserved or ignored (3.4, offset 0018h). */
     uint64_t efr, mmio_efr;
+    uint64_t efr2;         /* MMIO Offset 01A0h, 0 where reserved (EFRSup clear) */
     uint8_t msi_num;       /* event-log MSI-X entry, IVHD IOMMU info[4:0] */
     bool hat_dis, event_irq;
     uint64_t cmd, events;  /* rings */
@@ -167,6 +177,11 @@ struct unit {
 static struct unit *units;
 static size_t nunits, units_room;
 static bool np_cache; /* a unit caches not-present entries */
+static bool no_translation; /* a unit cannot translate host addresses: interrupt remapping alone */
+/* Entries a function's remapping table has (log2): 2048 where every unit remaps that many
+   (NumIntRemapSup, then NumIntRemapMode), else 512. A message's data bits 10:0 are the index, but
+   with 512 its bits 10:8 are also the message type, fixed or arbitrated only (Table 19). */
+static unsigned irt_log2;
 /* Every unit has GAEn, which selects the 128-bit remapping entry with its 32-bit destination, all
    units using one entry size (2.2.5.2), and XTEn where the CPUs are in x2APIC mode (2.2.5.3,
    apic_x2). */
@@ -191,6 +206,21 @@ struct kernel_irt {
 };
 static struct kernel_irt *kernel_irts;
 static struct spinlock kernel_irts_lock;
+/* The IOAPICs the IVRS names (special device 48h, variety 01h, Table 107): the requester ID their
+   messages carry, the passes the firmware gives them (byte 3), and their remapping table. The
+   message of a pin is its entry's vector in data bits 7:0 and its delivery mode in 10:8 (fixed,
+   000b), so the index is the entry's vector (2.2.5.1): the entry keeps the vector the CPU takes,
+   and the EOI of a level pin, which carries that vector to every IOAPIC, finds the pin with it.
+   arch/irq.c gives each IOAPIC line a number no other line has. remapped once its DTE points at
+   its table (amd_start); then the pins are written through it under arch/ioapic.c's lock. */
+struct ioapic_source {
+    uint8_t ioapic_id, passes;
+    struct iommu_id id;
+    struct iommu_irt t;
+    bool remapped;
+};
+static struct ioapic_source *ioapic_sources;
+static size_t nioapic_sources, ioapic_sources_room;
 static uint64_t sems;
 static size_t sem_pages;
 
@@ -230,6 +260,19 @@ static void listed_add(struct unit *u, uint16_t first, uint16_t last, bool cover
     if (cover) iommu_cover(u->segment, first, last);
     struct span *s = kappend(&u->listed, &u->nlisted, &u->listed_room, sizeof *s);
     if (s) *s = (struct span){first, last};
+    else parse_lost = true;
+}
+
+/* An IOAPIC once: the firmware names one with one ID. */
+static void ioapic_source_add(uint8_t ioapic_id, uint8_t passes, struct iommu_id id) {
+    for (size_t i = 0; i < nioapic_sources; i++)
+        if (ioapic_sources[i].ioapic_id == ioapic_id) {
+            if (ioapic_sources[i].id.segment != id.segment || ioapic_sources[i].id.requester != id.requester)
+                parse_lost = true;
+            return;
+        }
+    struct ioapic_source *s = kappend(&ioapic_sources, &nioapic_sources, &ioapic_sources_room, sizeof *s);
+    if (s) *s = (struct ioapic_source){.ioapic_id = ioapic_id, .passes = passes, .id = id};
     else parse_lost = true;
 }
 
@@ -274,6 +317,7 @@ static void parse_devices(struct unit *u, const uint8_t *b, uint32_t at, uint32_
         case 0x48:
             iommu_kernel_id((struct iommu_id){u->segment, u16(b + at + 5)});
             listed_add(u, u16(b + at + 5), u16(b + at + 5), false);
+            if (b[at + 7] == 1) ioapic_source_add(b[at + 4], b[at + 3], (struct iommu_id){u->segment, u16(b + at + 5)});
             break;
         case 0xF0:
             iommu_kernel_id((struct iommu_id){u->segment, id}); /* ACPI-named platform device: not a PCI claim's requester */
@@ -703,7 +747,7 @@ static void kernel_irts_leave(const struct iommu_domain *dom);
 
 /* The group's IDs leave the kernel's tables: their entries are the claim's from here on. */
 static bool amd_attach(struct iommu_domain *dom) {
-    if (!iommu_irt_make(&dom->irt, 1u << IRT_LOG2, IRTE_BYTES)) {
+    if (!iommu_irt_make(&dom->irt, 1u << irt_log2, IRTE_BYTES)) {
         kprintf("iommu: no memory for an interrupt remapping table\n");
         return false;
     }
@@ -713,7 +757,7 @@ static bool amd_attach(struct iommu_domain *dom) {
     kernel_irts_leave(dom);
     for (unsigned i = 0; i < dom->nids; i++)
         dte_write(dom->ids[i], DTE_V | DTE_TV | DTE_MODE(dom->levels) | dom->root | DTE_IR | DTE_IW, dom->id,
-                  DTE_IV | DTE_IRT_LEN(IRT_LOG2) | dom->irt.phys | DTE_INT_REMAP);
+                  DTE_IV | DTE_IRT_LEN(irt_log2) | dom->irt.phys | DTE_INT_REMAP);
     return on_every_unit(entry_flush, dom);
 }
 
@@ -787,7 +831,7 @@ static bool kernel_irt_join(struct kernel_irt *k, const struct iommu_id *ids, un
     }
     spin_unlock(&kernel_irts_lock, f);
     if (!ok) return false;
-    for (unsigned i = 0; i < n; i++) dte_write(ids[i], 0, 0, DTE_IV | DTE_IRT_LEN(IRT_LOG2) | k->t.phys | DTE_INT_REMAP);
+    for (unsigned i = 0; i < n; i++) dte_write(ids[i], 0, 0, DTE_IV | DTE_IRT_LEN(irt_log2) | k->t.phys | DTE_INT_REMAP);
     return on_every_unit(ids_flush, &(struct id_list){ids, n, true});
 }
 
@@ -800,7 +844,7 @@ static struct iommu_irt *kernel_irt_of(struct pci_device *d) {
     struct kernel_irt *k = kernel_irt_holding(ids, n);
     spin_unlock(&kernel_irts_lock, f);
     bool fresh = !k;
-    if (fresh && (k = kzalloc(sizeof *k)) && !iommu_irt_make(&k->t, 1u << IRT_LOG2, IRTE_BYTES)) {
+    if (fresh && (k = kzalloc(sizeof *k)) && !iommu_irt_make(&k->t, 1u << irt_log2, IRTE_BYTES)) {
         kfree(k);
         k = NULL;
     }
@@ -870,15 +914,53 @@ static bool amd_msi_erase(struct pci_device *d, struct iommu_irt *t, const uint3
     return ok;
 }
 
-/* AMD-Vi remaps no IOAPIC pin here: the entry stays the plain one, its destination of 8 bits. */
+static struct ioapic_source *remapped_ioapic(uint8_t ioapic_id) {
+    for (size_t i = 0; i < nioapic_sources; i++)
+        if (ioapic_sources[i].ioapic_id == ioapic_id) return ioapic_sources[i].remapped ? &ioapic_sources[i] : NULL;
+    return NULL;
+}
+
+/* A pin's entry through its IOAPIC's table (struct ioapic_source): the remapping entry at the
+   vector's index with the destination, the pin's entry keeping vector, polarity, trigger and mask.
+   An NMI source passes unmapped (Table 10) with the plain entry's 8-bit destination where the
+   firmware lets its NMIs pass. An IOAPIC the IVRS does not name stays plain. */
 static bool amd_ioapic(uint8_t ioapic_id, unsigned pin, unsigned pins, uint32_t dest, uint64_t *rte) {
-    (void)ioapic_id, (void)pin, (void)pins, (void)rte;
-    return dest <= 0xFF;
+    (void)pin, (void)pins;
+    struct ioapic_source *s = remapped_ioapic(ioapic_id);
+    if (!s) return dest <= 0xFF;
+    uint64_t v = *rte;
+    unsigned mode = v >> 8 & 7;
+    if (mode == 4) return dest <= 0xFF && (s->passes & IVHD_NMI_PASS);
+    ASSERT(mode == 0);
+    uint8_t vector = (uint8_t)v;
+    iommu_entry_write16((volatile uint64_t *)((uint8_t *)phys_to_virt(s->t.phys) + vector * IRTE_BYTES),
+                        1u | (uint64_t)(dest & 0xFFFFFF) << 8, vector | (uint64_t)(dest >> 24) << 56);
+    if (!on_every_unit(ids_flush, &(struct id_list){&s->id, 1, false})) {
+        kprintf("iommu: the units did not confirm the entry of IOAPIC %u's vector %02x\n", ioapic_id, vector);
+        return false;
+    }
+    *rte = v & ~(0xFFull << 56); /* the destination is the remapping entry's */
+    return true;
 }
 
 static uint32_t amd_ioapic_reach(uint8_t ioapic_id) {
-    (void)ioapic_id;
-    return 0xFF;
+    return remapped_ioapic(ioapic_id) && apic_x2() ? UINT32_MAX : 0xFF;
+}
+
+/* Each IOAPIC the IVRS names gets its table and its DTE pointing at it: interrupts remapped, its
+   passes the firmware's, no DMA (V 0). Its pins are masked meanwhile (iommu_init) and written
+   through it after (ioapic_remap). One without the memory stays plain. */
+static void ioapic_sources_remap(void) {
+    for (size_t i = 0; i < nioapic_sources; i++) {
+        struct ioapic_source *s = &ioapic_sources[i];
+        if (!s->t.phys && !iommu_irt_make(&s->t, 1u << IOAPIC_IRT_LOG2, IRTE_BYTES)) {
+            kprintf("iommu: no memory for IOAPIC %u's remapping table: its pins reach APIC IDs up to 255\n", s->ioapic_id);
+            continue;
+        }
+        dte_write(s->id, 0, 0, DTE_IV | DTE_IRT_LEN(IOAPIC_IRT_LOG2) | s->t.phys | DTE_INT_REMAP | dte_passes(s->passes));
+        s->remapped = on_every_unit(ids_flush, &(struct id_list){&s->id, 1, true});
+        if (!s->remapped) kprintf("iommu: the units did not confirm IOAPIC %u's device table entry\n", s->ioapic_id);
+    }
 }
 
 
@@ -923,7 +1005,7 @@ static bool program(struct unit *u) {
     /* the IVHD flags HtTunEn, PassPW, ResPassPW, Isoc and Coherent are the firmware's settings
        for control bits 1, 8, 9, 11 and 10 */
     uint64_t ctl = kept | CTL_IOMMU_EN | CTL_EVENTLOG_EN | CTL_CMDBUF_EN;
-    uint64_t modes = CTL_GA_EN | (apic_x2() ? CTL_XT_EN : 0); /* 2.2.5.3; GAMEn 000b: remapping only */
+    uint64_t modes = CTL_GA_EN | (apic_x2() ? CTL_XT_EN : 0) | (irt_log2 == 11 ? CTL_INT_REMAP_2K : 0); /* 2.2.5.3; GAMEn 000b: remapping only */
     ctl |= modes;
     if (u->flags & 1) ctl |= 1ull << 1;
     if (u->flags & 2) ctl |= 1ull << 8;
@@ -935,8 +1017,8 @@ static bool program(struct unit *u) {
     /* the IVHD's XTSup and GASup, which this follows (1.3), confirmed: without the register's,
        XTEn is reserved and GAEn ignored (3.4, offset 0018h) */
     if ((rd(u, R_CONTROL) & modes) != modes) {
-        kprintf("iommu: unit at %lx did not take its interrupt remapping format (GAEn%s)\n", u->base,
-                apic_x2() ? ", XTEn" : "");
+        kprintf("iommu: unit at %lx did not take its interrupt remapping format (GAEn%s%s)\n", u->base,
+                apic_x2() ? ", XTEn" : "", irt_log2 == 11 ? ", NumIntRemapMode" : "");
         return false;
     }
     return commands_started(u);
@@ -1044,10 +1126,12 @@ static void event_interrupts_enable(void) {
     }
 }
 
-/* Only with translation: interrupts pass a unit that is off as they are (an AMD-Vi unit has
-   nothing like VT-d's ECAP.IRREQ), so there is no reason to start one without. */
+/* Started also without translation: interrupt remapping is what carries a device's interrupt to
+   an APIC ID above 255. The device table starts empty: V 0 and IV 0, every DMA and interrupt
+   passing as it is (Tables 8, 9), until a kernel function's messages, an IOAPIC or a claim gets
+   its entry. */
 static bool amd_start(bool translate) {
-    if (!translate) return false;
+    translate &= !no_translation;
     sem_pages = ALIGN_UP(nunits * sizeof(uint64_t), PAGE_SIZE) / PAGE_SIZE;
     sems = iommu_alloc_pages(sem_pages);
     bool ok = sems != 0;
@@ -1082,10 +1166,13 @@ static bool amd_start(bool translate) {
         return false;
     }
     event_interrupts_enable();
-    amd.translating = true;
-    kprintf("iommu: AMD-Vi on, %lu unit%s; %lu alias%s, %u reserved range%s: every function passes through "
-            "until an app claims it\n", (unsigned long)nunits, nunits == 1 ? "" : "s", (unsigned long)naliases,
-            naliases == 1 ? "" : "es", iommu_reserved_count(), iommu_reserved_count() == 1 ? "" : "s");
+    ioapic_sources_remap();
+    amd.translating = translate;
+    kprintf("iommu: AMD-Vi on, %lu unit%s, %u-entry remapping tables, %lu IOAPIC%s; %lu alias%s, %u reserved "
+            "range%s%s\n", (unsigned long)nunits, nunits == 1 ? "" : "s", 1u << irt_log2,
+            (unsigned long)nioapic_sources, nioapic_sources == 1 ? "" : "s", (unsigned long)naliases,
+            naliases == 1 ? "" : "es", iommu_reserved_count(), iommu_reserved_count() == 1 ? "" : "s",
+            translate ? ": every function passes through until an app claims it" : "");
     return true;
 }
 
@@ -1144,6 +1231,7 @@ const struct iommu_hw *iommu_amd_probe(bool *plain_safe) {
         goto rejected;
     }
     amd.coherent = true;
+    irt_log2 = 11; /* lowered by a unit without NumIntRemapSup 01b */
     unsigned summary_va = (ivinfo >> 15) & 0x7F, summary_pa = (ivinfo >> 8) & 0x7F;
     /* IVinfo summarizes all units. A defined firmware width remains an upper bound;
        a missing/reserved summary field cannot describe one. Start at the largest
@@ -1155,8 +1243,8 @@ const struct iommu_hw *iommu_amd_probe(bool *plain_safe) {
     for (size_t i = 0; i < nunits; i++) {
         struct unit *u = &units[i];
         if (u->hat_dis) {
-            kprintf("iommu: unit at %lx cannot translate host addresses\n", u->base);
-            goto rejected;
+            kprintf("iommu: unit at %lx cannot translate host addresses: AMD-Vi remaps interrupts only\n", u->base);
+            no_translation = true;
         }
         if (!(u->regs = vmm_map_mmio(u->base, MMIO_BYTES))) {
             kprintf("iommu: the registers of the AMD-Vi unit at %lx cannot be mapped: AMD-Vi not used\n", u->base);
@@ -1166,6 +1254,7 @@ const struct iommu_hw *iommu_amd_probe(bool *plain_safe) {
         uint32_t header = u->fn ? pci_read32(u->fn->address, u->cap)
                                 : CAP_NP_CACHE | (ivinfo & 1 ? CAP_EFR : 0);
         u->mmio_efr = ((header & CAP_EFR) || (ivinfo & 1)) ? rd(u, R_EFR) : 0;
+        u->efr2 = ((header & CAP_EFR) || (ivinfo & 1)) ? rd(u, R_EFR2) : 0;
         uint32_t info = u->fn ? pci_read32(u->fn->address, u->cap + 0x10) : ivinfo;
         unsigned va = (info >> 15) & 0x7F, pa = (info >> 8) & 0x7F;
         /* Only these widths are defined by Capability+10h (3.2, pp203-204). No guessed
@@ -1179,6 +1268,7 @@ const struct iommu_hw *iommu_amd_probe(bool *plain_safe) {
         /* HATS: the most levels the IVHD allows (a reserved 11b in the register is superseded) */
         max_levels = MIN(max_levels, 4u + ((unsigned)(u->efr >> 10) & 3));
         np_cache |= (header & CAP_NP_CACHE) != 0;
+        if (EFR2_INT_REMAP_SUP(u->efr2) != 1) irt_log2 = 9;
         amd.coherent &= (u->flags & 32) != 0;
         uint64_t control = rd(u, R_CONTROL);
         struct pci_address at = u->fn ? u->fn->address : (struct pci_address){u->segment, 0, 0, 0};

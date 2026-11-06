@@ -23,6 +23,7 @@
 #define LAPIC_EOI 0xB0
 #define LAPIC_LDR 0xD0     /* the logical x2APIC ID, read-only (13.12.10.2) */
 #define LAPIC_SVR 0xF0
+#define LAPIC_TMR 0x180    /* 8 registers of 32 bits, 10h apart (13.8.4, Figure 13-20) */
 #define LAPIC_IRR 0x200    /* 8 registers of 32 bits, 10h apart (13.8.4) */
 #define LAPIC_ESR 0x280
 #define LAPIC_ICR_LOW 0x300  /* xAPIC mode: the write that sends (13.6.1) */
@@ -210,6 +211,8 @@ uint32_t apic_current_id(void) { return x2 ? lapic_read(LAPIC_ID) : lapic_read(L
 void apic_eoi(void) { lapic_write(LAPIC_EOI, 0); }
 
 bool apic_irr(uint8_t vector) { return lapic_read(LAPIC_IRR + 0x10 * (vector >> 5)) & (1u << (vector & 31)); }
+
+bool apic_tmr(uint8_t vector) { return lapic_read(LAPIC_TMR + 0x10 * (vector >> 5)) & (1u << (vector & 31)); }
 
 /* ---- IPIs ---- */
 

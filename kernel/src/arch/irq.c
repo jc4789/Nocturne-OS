@@ -14,7 +14,14 @@
    A vector that a route named goes back to the free ones only from its own CPU (vector_retire,
    VEC_IRQ_DRAIN): the source is off by then, so what of it can still come is already in that CPU's
    IRR, and the vector is free once the IRR no longer holds it (an interrupt pending there is taken
-   as the stray it is when it comes, and frees it then). */
+   as the stray it is when it comes, and frees it then).
+
+   A GSI line's vector number is no other GSI line's on any CPU, while it is used or drains. The
+   EOI of a level interrupt goes to every IOAPIC with its vector alone (SDM 13.8.5; AMD's APIC has
+   no way to keep it back, APM 16.3.5), and clears Remote IRR in each pin whose entry has that
+   vector (82093AA 3.2.4): two level pins sharing a number on two CPUs would end each other's
+   interrupts early. AMD-Vi finds an IOAPIC pin's remapping entry by that number too
+   (dev/iommu_amd.c). */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/apic.h"
@@ -87,8 +94,13 @@ struct vectors {
     uintptr_t slot[256];    /* struct irq *, or struct line * | SLOT_LINE */
     uint64_t strays[256 / 64]; /* vectors reported once as having nothing behind them */
     uint64_t draining[256 / 64]; /* used, their routes gone, the IRR not yet seen clear of them */
+    uint64_t gsi[256 / 64];      /* used by a GSI line: their numbers in gsi_numbers */
 };
 static PERCPU struct vectors vectors;
+/* The vector numbers the GSI lines use on any CPU (the comment at the top). A leaf, taken under a
+   CPU's vectors lock. */
+static uint64_t gsi_numbers[256 / 64];
+static struct spinlock gsi_numbers_lock;
 static PERCPU uint64_t dispatches; /* odd while this CPU runs handlers */
 static PERCPU struct regs *frame;
 
@@ -261,13 +273,24 @@ static void line_count(struct line *l, bool taken) {
     if (first) kprintf("irq: GSI %u stays asserted and no driver takes it: masked\n", l->gsi);
 }
 
+/* Vector v of the CPU whose vs this is goes back to the free ones, its number to the GSI lines'
+   when a line had it. vs->lock held. */
+static void vector_free(struct vectors *vs, unsigned v) {
+    bit_clear(vs->used, v);
+    __atomic_store_n(&vs->count, vs->count - 1, __ATOMIC_RELAXED);
+    if (!bit_test(vs->gsi, v)) return;
+    bit_clear(vs->gsi, v);
+    spin_take(&gsi_numbers_lock);
+    bit_clear(gsi_numbers, v);
+    spin_give(&gsi_numbers_lock);
+}
+
 /* The vector is free again once this CPU's IRR does not hold it: what the retired route sent
    before its source went off has come. vs is this CPU's, its lock held. */
 static void drain_one(struct vectors *vs, unsigned v) {
     if (apic_irr((uint8_t)v)) return;
     bit_clear(vs->draining, v);
-    bit_clear(vs->used, v);
-    __atomic_store_n(&vs->count, vs->count - 1, __ATOMIC_RELAXED);
+    vector_free(vs, v);
 }
 
 /* VEC_IRQ_DRAIN: the vectors whose routes this CPU was told are gone. */
@@ -295,7 +318,8 @@ static void vector_empty(unsigned v) {
 /* Every CPU's interrupts (vector 32 and up), on its interrupt stack with interrupts off: their
    handlers, then the EOI, at the end of the handling and before IRET (SDM 13.8.5), so that the
    APIC holds back this vector's and lower priority classes meanwhile (13.8.3). The spurious vector
-   sets no in-service bit and takes no EOI (13.9). */
+   sets no in-service bit and takes no EOI (13.9). A level line's IOAPIC gets one EOI: the APIC's,
+   where it took the interrupt as level (apic_tmr), else the IOAPIC's own (ioapic_eoi). */
 void isr_interrupt(struct regs *r) {
     unsigned v = (unsigned)r->vector;
     if (v == VEC_SPURIOUS) return;
@@ -306,6 +330,7 @@ void isr_interrupt(struct regs *r) {
     struct regs *outer = this_cpu(frame);
     this_cpu(frame) = r;
     uintptr_t s;
+    uint32_t eoi_gsi = UINT32_MAX;
     if (v >= VEC_SYSTEM_FIRST) {
         s = (uintptr_t)__atomic_load_n(&system_slot[v - VEC_SYSTEM_FIRST], __ATOMIC_ACQUIRE);
     } else {
@@ -318,13 +343,17 @@ void isr_interrupt(struct regs *r) {
         for (struct irq *irq = __atomic_load_n(&l->irqs, __ATOMIC_ACQUIRE); irq;
              irq = __atomic_load_n(&irq->next, __ATOMIC_ACQUIRE))
             taken |= run(irq);
-        if (l->level) line_count(l, taken);
+        if (l->level) {
+            line_count(l, taken);
+            if (!apic_tmr((uint8_t)v)) eoi_gsi = l->gsi;
+        }
     } else if (s) {
         run((struct irq *)s);
     }
     this_cpu(frame) = outer;
     __atomic_fetch_add(count, 1, __ATOMIC_RELEASE);
     apic_eoi();
+    if (eoi_gsi != UINT32_MAX) ioapic_eoi(eoi_gsi, (uint8_t)v);
     if (!s) vector_empty(v);
 }
 
@@ -355,8 +384,7 @@ static void vector_release(unsigned cpu, uint8_t v) {
     struct vectors *vs = &per_cpu(vectors, cpu);
     uint64_t f = spin_lock(&vs->lock);
     __atomic_store_n(&vs->slot[v], 0, __ATOMIC_RELEASE);
-    bit_clear(vs->used, v);
-    __atomic_store_n(&vs->count, vs->count - 1, __ATOMIC_RELAXED);
+    vector_free(vs, v);
     spin_unlock(&vs->lock, f);
 }
 
@@ -377,16 +405,28 @@ static bool nameable(unsigned cpu, uint32_t reach) {
     return cpu < topology.cpus && cpu_online_at(cpu) && topology.cpu[cpu].apic_id <= reach;
 }
 
+/* Number v for a GSI line on the CPU whose vs this is, if no line has it on any CPU. vs->lock held. */
+static bool gsi_number_take(struct vectors *vs, unsigned v) {
+    spin_take(&gsi_numbers_lock);
+    bool free = !bit_test(gsi_numbers, v);
+    if (free) bit_set(gsi_numbers, v);
+    spin_give(&gsi_numbers_lock);
+    if (free) bit_set(vs->gsi, v);
+    return free;
+}
+
 /* count vectors (a power of two) aligned to count among cpu's device vectors, taken: the first,
-   or 0 when no such run is free. The lowest free one, the lowest priority class (13.8.3). */
-static uint8_t vectors_take(unsigned cpu, unsigned count) {
+   or 0 when no such run is free. The lowest free one, the lowest priority class (13.8.3). A GSI
+   line's (gsi, count 1): a number no line has on any CPU. */
+static uint8_t vectors_take(unsigned cpu, unsigned count, bool gsi) {
+    ASSERT(!gsi || count == 1);
     struct vectors *vs = &per_cpu(vectors, cpu);
     uint8_t found = 0;
     uint64_t f = spin_lock(&vs->lock);
     for (unsigned v = (unsigned)ALIGN_UP(VEC_DEVICE_FIRST, count); !found && v + count - 1 <= VEC_DEVICE_LAST; v += count) {
         unsigned i = 0;
         while (i < count && !bit_test(vs->used, v + i)) i++;
-        if (i < count) continue;
+        if (i < count || (gsi && !gsi_number_take(vs, v))) continue;
         for (i = 0; i < count; i++) bit_set(vs->used, v + i);
         __atomic_store_n(&vs->count, vs->count + count, __ATOMIC_RELAXED);
         found = (uint8_t)v;
@@ -397,11 +437,12 @@ static uint8_t vectors_take(unsigned cpu, unsigned count) {
 
 /* A CPU within reach for count vectors and the vectors on it: hint when it is a CPU, else in node
    first (any node when -1) the CPU with the fewest device vectors in use, the next fewest when that
-   one has no aligned run free. requests held: the counts move only under it. */
-static bool place(int node, unsigned hint, unsigned count, uint32_t reach, unsigned *cpu, uint8_t *vector) {
+   one has no aligned run free. gsi: for a GSI line (vectors_take). requests held: the counts move
+   only under it. */
+static bool place(int node, unsigned hint, unsigned count, uint32_t reach, bool gsi, unsigned *cpu, uint8_t *vector) {
     if (hint != IRQ_CPU_ANY) {
         *cpu = hint;
-        return nameable(hint, reach) && (*vector = vectors_take(hint, count)) != 0;
+        return nameable(hint, reach) && (*vector = vectors_take(hint, count, gsi)) != 0;
     }
     for (int pass = node < 0; pass < 2; pass++) {
         unsigned after_count = 0, after_cpu = 0; /* past (count, index) pairs already tried */
@@ -418,7 +459,7 @@ static bool place(int node, unsigned hint, unsigned count, uint32_t reach, unsig
                 }
             }
             if (best == topology.cpus) break;
-            if ((*vector = vectors_take(best, count))) {
+            if ((*vector = vectors_take(best, count, gsi))) {
                 *cpu = best;
                 return true;
             }
@@ -452,7 +493,7 @@ bool irq_request_msi_block(const struct irq_spec *specs, unsigned count, unsigne
     for (i = 0; i < count; i++)
         if (!(made[i] = irq_new(&specs[i], KIND_MSI))) goto fail;
     mutex_lock(&requests);
-    if (!place(specs[0].node, cpu, count, reach, &at, &v)) {
+    if (!place(specs[0].node, cpu, count, reach, false, &at, &v)) {
         mutex_unlock(&requests);
         goto fail;
     }
@@ -505,7 +546,7 @@ struct irq *irq_request_gsi(const struct irq_spec *spec, unsigned gsi) {
         if (!ioapic_gsi_owned(gsi, &level)) goto unlock;
         l = fresh;
         *l = (struct line){.gsi = gsi, .level = level, .alone = spec->alone, .reach = ioapic_gsi_reach(gsi)};
-        if (!place(spec->node, IRQ_CPU_ANY, 1, l->reach, &l->cpu, &l->vector)) goto unlock;
+        if (!place(spec->node, IRQ_CPU_ANY, 1, l->reach, true, &l->cpu, &l->vector)) goto unlock;
     } else if (!l->level || l->alone || spec->alone) {
         goto unlock; /* an edge line is no one else's: two sources' edges would merge */
     }
@@ -607,7 +648,7 @@ void irq_free(struct irq *irq) {
 
 static bool msi_move(struct irq *irq, unsigned cpu) {
     uint8_t v;
-    if (!place(irq->spec.node, cpu, 1, irq->reach, &cpu, &v)) return false;
+    if (!place(irq->spec.node, cpu, 1, irq->reach, false, &cpu, &v)) return false;
     if (irq->old_vector) vector_retire(irq->old_cpu, irq->old_vector); /* the move before this one's */
     irq->old_vector = 0;
     slot_set(cpu, v, (uintptr_t)irq); /* there before any message names it */
@@ -630,7 +671,7 @@ static bool msi_move(struct irq *irq, unsigned cpu) {
 
 static bool line_move(struct line *l, unsigned cpu) {
     uint8_t v;
-    if (!place(-1, cpu, 1, l->reach, &cpu, &v)) return false;
+    if (!place(-1, cpu, 1, l->reach, true, &cpu, &v)) return false;
     if (l->old_vector) vector_retire(l->old_cpu, l->old_vector);
     l->old_vector = 0;
     slot_set(cpu, v, (uintptr_t)l | SLOT_LINE);
@@ -709,12 +750,9 @@ static void drained_all(void) {
     for (unsigned c = 0; c < topology.cpus; c++) {
         struct vectors *vs = &per_cpu(vectors, c);
         uint64_t f = spin_lock(&vs->lock);
-        for (unsigned w = 0; w < 256 / 64; w++) {
-            unsigned n = (unsigned)__builtin_popcountll(vs->draining[w]);
-            vs->used[w] &= ~vs->draining[w];
-            vs->draining[w] = 0;
-            __atomic_store_n(&vs->count, vs->count - n, __ATOMIC_RELAXED);
-        }
+        for (unsigned w = 0; w < 256 / 64; w++)
+            for (uint64_t bits = vs->draining[w]; bits; bits &= bits - 1) vector_free(vs, w * 64 + __builtin_ctzll(bits));
+        memset(vs->draining, 0, sizeof vs->draining);
         spin_unlock(&vs->lock, f);
     }
 }

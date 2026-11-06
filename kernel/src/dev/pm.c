@@ -252,7 +252,9 @@ static void enter_s3(void) { acpi_sleep_enter(3); }
    sleep (S3 woke up, or a hibernation image was restored), false when enter() returned or a device
    did not stop (*why and *detail say which; enter() is then not called). On CPU 0, every other CPU parked
    (smp_suspend): from the freeze to the thaw no other thread runs, the devices are down or not
-   back yet. The interrupts this saves and restores are CPU 0's own. */
+   back yet. The interrupts this saves and restores are CPU 0's own. The other CPUs start again
+   (smp_resume) once the interrupt controllers are back and before any device is: a device's
+   interrupts go to any CPU, and one sent to a CPU still held in INIT is lost. */
 static bool machine_sleep(void (*enter)(void), unsigned state, enum pm_action action, enum n_power_reason *why,
                           const char **detail, bool *lost_told) {
     acpi_freeze(true);
@@ -292,6 +294,7 @@ static bool machine_sleep(void (*enter)(void), unsigned state, enum pm_action ac
     /* a hibernation's snapshot is no sleep: the firmware heard of none */
     if (state == 3 || slept) acpi_wake(state);
     else acpi_links_forget();
+    smp_resume();
     const char *lost = hal_resume_all();
     input_resumed();
     acpi_freeze(false);
@@ -338,7 +341,7 @@ static void sleep_now(bool hibernate) {
     /* no transfer is cut off by the controllers losing their state, and after a snapshot nothing
        but the image reaches the disks */
     blk_hold();
-    bool parked = false, slept = false, lost_told = false;
+    bool parked = false, slept = false, lost_told = false, cpus_back = false; /* machine_sleep started them */
     if (!flush_disks()) why = N_POWER_REASON_DISK_FLUSH; /* asleep or in an image, it could be lost */
     if (!why) {
         parked = true;
@@ -348,6 +351,7 @@ static void sleep_now(bool hibernate) {
     } else if (hibernate) {
         acpi_links_save();
         slept = machine_sleep(hibernate_snapshot, 4, action, &why, &detail, &lost_told);
+        cpus_back = true;
         if (!slept && !why) {
             /* the snapshot: the machine as it is from here on never comes back */
             say(N_POWER_SAVING, action, N_POWER_REASON_NONE, NULL, false);
@@ -361,10 +365,12 @@ static void sleep_now(bool hibernate) {
         }
     } else if (!acpi_sleep_prepare(3)) {
         why = N_POWER_REASON_FIRMWARE;
-    } else if (!(slept = machine_sleep(enter_s3, 3, action, &why, &detail, &lost_told)) && !why) {
-        why = N_POWER_REASON_FIRMWARE;
+    } else {
+        slept = machine_sleep(enter_s3, 3, action, &why, &detail, &lost_told);
+        cpus_back = true;
+        if (!slept && !why) why = N_POWER_REASON_FIRMWARE;
     }
-    if (parked) smp_resume();
+    if (parked && !cpus_back) smp_resume();
     blk_release();
     hal_claims_resume();
     hal_power_end();
