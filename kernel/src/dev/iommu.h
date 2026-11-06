@@ -167,10 +167,13 @@ struct iommu_hw {
     bool (*is_leaf)(uint64_t entry, unsigned level); /* do not follow a large-page leaf as a table */
     /* Tables made, units on. False does not prove the units are off: the caller must confirm
        shutdown before treating hardware-owned tables/queues as stopped. translate false (N_BOOT_IOMMU off, or the firmware's
-       descriptions not all kept): only a unit that must remap interrupts is started, remapping
-       them alone, and false when there is none. */
+       descriptions not all kept): units that remap interrupts apart from DMA (VT-d) are started
+       remapping them alone, and false where none does. */
     bool (*start)(bool translate);
     bool translating; /* set by start: DMA passes the units' page tables, claims can be isolated */
+    /* set by start: every interrupt is remapped with 32-bit destinations (VT-d Extended Interrupt
+       Mode), what x2APIC mode waits for where the CPU's maker asks for that first (arch/apic.h) */
+    bool x2apic_ready;
     /* The ID the firmware says requests with this one arrive as (AMD-Vi IVRS aliases), or NULL */
     struct iommu_id (*alias)(struct iommu_id id);
     /* attach: true once the units confirmed the domain. dom->written says whether anything of the

@@ -312,7 +312,7 @@ void smp_init(void) {
     }
     if (!(rows = kmalloc(topology.cpus * sizeof *rows))) panic("smp: no memory to start the CPUs");
     /* each one's scheduler first, then all of them at once; topology counts only the APIC IDs the
-       APICs' mode sends to (apic_reaches) */
+       firmware handed over (apic_handed_over) */
     unsigned count = 0;
     for (unsigned i = 1; i < topology.cpus; i++) {
         if (!sched_cpu_prepare(i)) {

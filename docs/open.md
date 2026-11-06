@@ -78,7 +78,6 @@
 - `nvrm` の帰線とフリップの糸が fair 級である（`ports/nvidia` に `n_thread_schedule` が無い）。
 - カーネルの機能は IOMMU を素通りする（`kernel/src/dev/iommu.h:9-10`）。絞る口が無い（`kernel/src/dev/iommu.c:647`）。
 - EOI の broadcast（`kernel/src/arch/apic.c` は SVR の Suppress EOI Broadcast を立てない）と CPU ごとの vector が重なる：ある CPU の level の割り込みの EOI が、同じ番号を別の CPU で使う別の pin の Remote IRR を早めに消し、その pin は処理中に一度余分に届きうる。directed EOI（IOAPIC の版 20h 以上の EOI レジスター）が要る。
-- Intel でファームウェアが xAPIC で渡した機械は、割り込みの再割り当てが立った後も xAPIC のまま（`kernel/src/arch/apic.c` の `x2_chosen`）。SDM 13.12.8.1 の後からの移り方が無い。
 - ACPI の link：`LINKS_MAX` が 32 の固定（`kernel/src/dev/acpi.c:537`）で、33 個目からは眠りの後に設定し直されない。_CRS に IRQ の無い link を _PRS から選んで _SRS しない（`kernel/src/dev/acpi.c:722`）ので、その機能は INTx を得られない。
 - `kernel/src/vm/virtio_gpu.c` の `gpu_isr` は ISR status を読まずにいつも HANDLED を返す：MSI-X の無い virtio-gpu が INTx を受けると線が下りない。
 - PCI に抜き差しと AER が無い。

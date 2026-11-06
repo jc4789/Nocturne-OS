@@ -49,8 +49,9 @@ struct cpu_maker {
     void (*mask_own_lvt)(void);
     /* The kernel may move the APICs to x2APIC mode before interrupts are remapped: the maker's
        manual asks for nothing before it (arch/apic.h, apic_choose_mode). False where it asks for
-       remapping with extended IDs first (SDM vol. 3A 13.12.7), which comes after the APICs here
-       (dev/iommu.c), and where no manual here says. */
+       remapping with 32-bit destinations first (SDM vol. 3A 13.12.7), and where no manual here
+       says: the CPUs then wait in xAPIC mode and move together once the IOMMU remaps so
+       (apic_x2_follow). */
     bool x2apic_unremapped;
 };
 

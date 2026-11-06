@@ -10,9 +10,11 @@
    pin is an entry of the segment's table, the largest the format has (IRTA.S 15: 64K entries),
    checked against the requester ID of its source. Its entries are given out as the sources come
    (dev/iommu.c): a run for each IOAPIC's pins, one for each MSI block, one for each MSI-X entry.
-   The units remap in the CPUs' APIC mode (arch/apic.h, apic_x2): x2APIC mode is Extended
-   Interrupt Mode (IRTA.EIME, 32-bit destinations, each unit's EIM), xAPIC mode its 8-bit
-   destinations (9.10). */
+   The units remap in Extended Interrupt Mode (IRTA.EIME, 32-bit destinations, each unit's EIM,
+   9.10) where the CPUs are in x2APIC mode or move to it once the units remap so (arch/apic.h,
+   apic_x2_waits: SDM 13.12.7 asks for EIME before x2APIC mode), else with 8-bit xAPIC
+   destinations. EIME is set with the table's pointer and never changed while remapping is on
+   (11.4.10). */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/apic.h"
@@ -182,9 +184,9 @@ static struct ioapic_scope {
 static size_t nioapics, ioapics_room;
 static uint8_t dmar_flags;
 static unsigned host_bits;
-/* remap: interrupts are remapped, in Extended Interrupt Mode where the CPUs are in x2APIC mode
-   (11.4.10, apic_x2) */
-static bool remap, caching_mode, write_buffers, parse_lost;
+/* remap: interrupts are remapped; eime: in Extended Interrupt Mode, with x2APIC destinations
+   (11.4.10: "x2APIC mode is active"), where the CPUs are in x2APIC mode or wait for it */
+static bool remap, eime, caching_mode, write_buffers, parse_lost;
 static bool units_incomplete; /* separate from unsupported/malformed device-scope policy */
 static bool irreq; /* a unit requires interrupt remapping (ECAP.IRREQ) */
 static unsigned iec_mask = 15; /* the largest IEC invalidation mask every unit takes (MHMV) */
@@ -779,10 +781,10 @@ static void irte_write(struct irt_table *t, unsigned index, uint64_t lo, uint64_
 
 /* The destination field (9.10): an x2APIC ID in bits 63:32 in Extended Interrupt Mode, an xAPIC
    ID in bits 47:40 otherwise. */
-static uint64_t irte_dest(uint32_t dest) { return apic_x2() ? (uint64_t)dest << 32 : (uint64_t)(dest & 0xFF) << 40; }
+static uint64_t irte_dest(uint32_t dest) { return eime ? (uint64_t)dest << 32 : (uint64_t)(dest & 0xFF) << 40; }
 
 /* The highest APIC ID an entry names: 32 bits in Extended Interrupt Mode, 8 otherwise. */
-static uint32_t remapped_reach(void) { return apic_x2() ? UINT32_MAX : 0xFF; }
+static uint32_t remapped_reach(void) { return eime ? UINT32_MAX : 0xFF; }
 
 /* What an entry checks the sender against: d's requester ID, or the buses of its IDs when a
    bridge sends its requests as its own. 0 without memory. */
@@ -1161,7 +1163,6 @@ static bool translation_on(bool open) {
 static bool unit_tables(struct unit *u) {
     wr64(u, R_RTADDR, u->root); /* legacy mode */
     bool ok = command(u, GCMD_SRTP, true) && queue_start(u);
-    bool eime = remap && apic_x2();
     if (ok && remap) {
         wr64(u, R_IRTA, irt_of(u->segment)->t.phys | (eime ? IRTA_EIME : 0) | IRT_S);
         ok = command(u, GCMD_SIRTP, true);
@@ -1286,8 +1287,9 @@ static bool units_start(bool translate) {
 }
 
 /* translate false, no page table format the units share, or the firmware's DMA_REMAP_OPT_OUT
-   (8.1): interrupt remapping alone, for a unit that requires it (ECAP.IRREQ: every interrupt
-   message is blocked while it is off, 5.1.4). DMA then passes the units untranslated. */
+   (8.1): interrupt remapping alone where the units remap (remap), which is not DMA translation:
+   a unit that requires it blocks every interrupt message while it is off (ECAP.IRREQ, 5.1.4), and
+   x2APIC mode on Intel's CPUs waits for it (SDM 13.12.7). DMA then passes the units untranslated. */
 static bool intel_start(bool translate) {
     if (translate && dmar_flags & DMAR_DMA_REMAP_OPT_OUT) {
         kprintf("iommu: the firmware asks the OS not to enable VT-d DMA remapping (DMAR DMA_REMAP_OPT_OUT): "
@@ -1295,7 +1297,7 @@ static bool intel_start(bool translate) {
         translate = false;
     }
     translate &= intel.levels != 0;
-    if (!translate && !irreq) return false;
+    if (!translate && !remap) return false;
     if (!queues_address_safe()) {
         kprintf("iommu: an inherited VT-d queue overlaps OS-managed or unclassified RAM; not touched\n");
         return false;
@@ -1343,11 +1345,11 @@ static bool intel_start(bool translate) {
     /* any CPU the unit's message can name: a 32-bit destination in Extended Interrupt Mode (unit_tables) */
     if (!fault_irq)
         fault_irq = irq_request_msi(&(struct irq_spec){.name = "VT-d faults", .handler = fault_isr, .node = -1}, IRQ_CPU_ANY,
-                                    remap && apic_x2() ? UINT32_MAX : 0xFF);
+                                    eime ? UINT32_MAX : 0xFF);
     uint64_t f = units_hold();
     ok = units_start(translate);
-    if (!ok && translate && irreq) {
-        kprintf("iommu: VT-d did not start translating; a unit requires interrupt remapping: trying that alone\n");
+    if (!ok && translate && remap) {
+        kprintf("iommu: VT-d did not start translating: trying interrupt remapping alone\n");
         ok = units_start(false);
     }
     units_release(f);
@@ -1355,15 +1357,16 @@ static bool intel_start(bool translate) {
         if (irreq) kprintf("iommu: a VT-d unit that requires interrupt remapping is off: it blocks every interrupt message\n");
         return false; /* the tables stay: a unit may still read them */
     }
+    intel.x2apic_ready = eime;
     if (!intel.translating) {
-        kprintf("iommu: VT-d remaps interrupts only (%s format), %lu unit%s\n", apic_x2() ? "x2APIC" : "xAPIC",
+        kprintf("iommu: VT-d remaps interrupts only (%s format), %lu unit%s\n", eime ? "x2APIC" : "xAPIC",
                 (unsigned long)nunits, nunits == 1 ? "" : "s");
         return true;
     }
     kprintf("iommu: VT-d on, %lu unit%s, %u-level tables%s, interrupt remapping %s, %u reserved range%s: every "
             "function passes through until an app claims it\n", (unsigned long)nunits, nunits == 1 ? "" : "s",
             intel.levels, pass_all ? "" : " (identity domain for units without pass-through)",
-            remap ? apic_x2() ? "on (x2APIC format)" : "on (xAPIC format)"
+            remap ? eime ? "on (x2APIC format)" : "on (xAPIC format)"
                   : dmar_flags & DMAR_INTR_REMAP ? "not possible on these units" : "not offered by the firmware",
             iommu_reserved_count(), iommu_reserved_count() == 1 ? "" : "s");
     if (!remap) kprintf("iommu: interrupts are not remapped: a device given to an app can send any vector\n");
@@ -1482,15 +1485,20 @@ const struct iommu_hw *iommu_intel_probe(bool *plain_safe) {
         kprintf("iommu: the IOAPICs' requester IDs are not known: interrupts are not remapped\n");
         remap = false;
     }
-    /* Every unit remaps in the CPUs' mode (arch/apic.c chose it, the DMAR's X2APIC_OPT_OUT among
-       its reasons): Extended Interrupt Mode, "x2APIC mode is active" (11.4.10), needs each unit's
-       EIM (5.1.6); xAPIC mode a unit that does not remap in Extended Interrupt Mode only (EIMER). */
+    /* Every unit remaps in the mode the CPUs are in or wait for (arch/apic.c chose it, the DMAR's
+       X2APIC_OPT_OUT among its reasons): Extended Interrupt Mode, "x2APIC mode is active"
+       (11.4.10), needs each unit's EIM (5.1.6); CPUs in x2APIC mode cannot be named otherwise,
+       CPUs that wait for it stay in xAPIC mode then. xAPIC destinations need no unit that remaps
+       in Extended Interrupt Mode only (EIMER). */
     if (remap && apic_x2() && !eim) {
         kprintf("iommu: a VT-d unit remaps interrupts in xAPIC format only (no EIM), and the CPUs are in x2APIC "
                 "mode: interrupts are not remapped\n");
         remap = false;
     }
-    if (remap && !apic_x2() && eimer) {
+    if (remap && apic_x2_waits() && !eim)
+        kprintf("iommu: a VT-d unit remaps interrupts in xAPIC format only (no EIM): the CPUs stay in xAPIC mode\n");
+    eime = remap && eim && (apic_x2() || apic_x2_waits());
+    if (remap && !eime && eimer) {
         kprintf("iommu: a VT-d unit remaps interrupts in x2APIC format only (EIMER), and the CPUs are in xAPIC "
                 "mode: interrupts are not remapped\n");
         remap = false;
@@ -1500,13 +1508,12 @@ const struct iommu_hw *iommu_intel_probe(bool *plain_safe) {
         kprintf("iommu: the DMAR scope or structure is not supported: VT-d not used\n");
         return NULL;
     }
-    /* A unit that requires interrupt remapping blocks every interrupt message while it is off
-       (5.1.4): it is started to remap them even where nothing else of VT-d is used. Without the
-       queue (which remapping needs for its invalidations) or the remapping it is left as the
-       firmware set it. */
+    /* Units that remap interrupts are started to remap them even where nothing else of VT-d is
+       used (intel_start). Without the queue (which remapping needs for its invalidations), or
+       without a page table format and the remapping, they are left as the firmware set them. */
     const char *unused = !qi ? "a VT-d unit has no invalidation queue"
                        : irreq && !remap ? "a VT-d unit requires interrupt remapping, which these units cannot give"
-                       : !intel.levels && !irreq ? "the VT-d units share no page table format" : NULL;
+                       : !intel.levels && !remap ? "the VT-d units share no page table format" : NULL;
     if (unused) {
         kprintf("iommu: %s: VT-d not used%s\n", unused,
                 irreq ? "; unless the firmware left remapping on, every interrupt message is blocked" : "");
