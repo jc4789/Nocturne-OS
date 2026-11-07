@@ -1,11 +1,10 @@
-/* Realtek RTL8125B 2.5 Gigabit Ethernet (PCI 10EC:8125), the onboard port of many AM5 and
- * Intel 600/700-series boards. The MAC runs on its mask-ROM code: the optional MAC and PHY
- * microcode patches the vendor driver loads are not applied.
- *
- * Register offsets, bit values and the initialization sequence (out-of-band exit, MAC common
- * setup, PCIe PHY parameters, PHY OCP access) follow Realtek's FreeBSD driver
- * rtl_bsd_drv_v1102.01, which carries this notice:
- *
+/* Realtek RTL8125B 2.5 Gigabit Ethernet（PCI 10EC:8125）。AM5 と Intel 600・700 系の多くの板に載る口。MAC は mask
+   ROM の code で走る：Realtek の driver が読み込む MAC と PHY の microcode の当て布は当てない。
+
+   レジスターの番地、bit の値、初めの手順（out-of-band からの出、MAC の共通の設定、PCI Express の PHY の値、PHY の OCP
+   の読み書き）と電源の手順（re_suspend、re_shutdown、re_resume）は Realtek の FreeBSD の driver rtl_bsd_drv_v1102.01
+   に従う。ASPM は使わない（その driver の enable_aspm が 0 の道）。その driver は次の文を持つ： */
+/*
  * Copyright (c) 1997, 1998
  *	Bill Paul <wpaul@ctr.columbia.edu>.  All rights reserved.
  *
@@ -46,13 +45,13 @@
 #include "../hal/hal.h"
 #include "../mm/heap.h"
 #include "../sys/clock.h"
+#include "../sys/wait.h"
 
-
-/* MAC registers */
+/* MAC のレジスター */
 #define IDR0        0x0000
 #define MAR0        0x0008
 #define MAR4        0x000C
-#define TX_RING     0x0020 /* normal-priority queue 0, 64-bit */
+#define TX_RING     0x0020 /* 普通の優先の queue 0、64 bit */
 #define INT_CFG0    0x0034
 #define CMD         0x0037
 #define TXCFG       0x0040
@@ -74,7 +73,7 @@
 #define RX_MAX_SIZE 0x00DA
 #define CPLUS_CMD   0x00E0
 #define INTR_MIT    0x00E2
-#define RX_RING     0x00E4 /* queue 0, 64-bit */
+#define RX_RING     0x00E4 /* queue 0、64 bit */
 #define INTR_MOD    0x0A00
 #define IMR_CLEAR   0x0D00
 #define ISR         0x0D04
@@ -86,13 +85,15 @@
 #define CMD_RX_EN    0x08
 #define CMD_RESET    0x10
 #define CMD_STOP_REQ 0x80
-#define EECMD_UNLOCK 0xC0 /* write access to the configuration registers */
+#define EECMD_UNLOCK 0xC0 /* 構成のレジスターへ書ける */
 #define MCU_NOW_IS_OOB 0x80
 #define MCU_FIFOS_EMPTY 0x30
-#define RX_ACCEPT (0x02 | 0x04 | 0x08) /* own address, multicast, broadcast */
-#define TXCFG_INIT 0x03000780 /* interframe gap, unlimited DMA burst */
+#define RX_ACCEPT (0x02 | 0x04 | 0x08) /* 自分の番地、multicast、broadcast */
+#define RX_FILTER 0x3Fu                /* 受ける frame の選び（re_clear_all_rx_packet_filter） */
+#define TXCFG_INIT 0x03000780          /* frame の間の隙間、DMA の burst は限らない */
+#define PMCH_PHY_WAKE 0x80             /* PHY の電源（RL_FLAG_PHYWAKE_PM の機種） */
 
-/* The 8125B's interrupt mapping (interrupt configuration bit 0) */
+/* 8125B の割り込みの割り当て（割り込みの構成の bit 0） */
 #define INT_RX0  (1u << 0)
 #define INT_TX0  (1u << 16)
 #define INT_LINK (1u << 21)
@@ -101,31 +102,32 @@
 #define LINK_UP   0x02
 #define FULL_DUP  0x01
 
-/* Descriptors: first word, both rings */
+/* descriptor の最初の語：両方の輪 */
 #define D_OWN (1u << 31)
 #define D_EOR (1u << 30)
 #define D_FS  (1u << 29)
 #define D_LS  (1u << 28)
-#define RX_RES (1u << 21) /* receive error summary */
+#define RX_RES (1u << 21) /* 受けた frame の誤りのまとめ */
 #define RX_LEN 0x3FFFu
-/* What the MAC says of a received frame's checksums (opts1, and opts2 for the IP version) */
+/* 受けた frame の checksum について MAC が言うこと（opts1。IP の版は opts2） */
 #define RX_TCPT (1u << 17)
 #define RX_UDPT (1u << 18)
 #define RX_IPF (1u << 16)
 #define RX_UDPF (1u << 15)
 #define RX_TCPF (1u << 14)
 #define RX_V4F (1u << 30)
-/* What a frame to send asks the MAC to complete (opts2, the 8125's descriptor format) */
+/* 送る frame が MAC に埋めさせるもの（opts2、8125 の descriptor の形） */
 #define TX_IPV4CS (1u << 29)
 #define TX_TCPCS (1u << 30)
 #define TX_UDPCS (1u << 31)
 
-/* PHY (standard registers are mapped at OCP 0xA400 + 2 * register) */
+/* PHY（標準のレジスターは OCP の 0xA400 + 2 * 番号に写る、IEEE 802.3 22.2.4） */
 #define MII_BMCR 0
 #define MII_ANAR 4
 #define MII_GBCR 9
 #define BMCR_RESET    0x8000
 #define BMCR_AUTONEG  0x1000
+#define BMCR_PDOWN    0x0800
 #define BMCR_RESTART  0x0200
 #define ANAR_10       0x0020
 #define ANAR_10_FD    0x0040
@@ -138,9 +140,9 @@
 #define ADV_2500_FD   0x0080
 
 #define BUFSZ 2048
-#define FRAME_MAX 1522 /* 1500 + header + VLAN tag + FCS */
-#define UDP_PAD 121 /* short IPv4 UDP frames sent without a checksum for the MAC to complete go out this long (8125A/B) */
-#define LINK_LOOK NS_PER_S /* poll reads the link state again after this, besides the link interrupt */
+#define FRAME_MAX 1522 /* 1500 + 頭 + VLAN の札 + FCS */
+#define UDP_PAD 121 /* MAC に checksum を埋めさせない短い IPv4 UDP の frame はこの長さで出す（8125A/B） */
+#define LINK_LOOK NS_PER_S /* link の割り込みのほかに、poll はこの間ごとに link の状態を読む */
 
 struct desc {
     uint32_t opts1, opts2;
@@ -150,23 +152,25 @@ struct desc {
 #define NTX (PAGE_SIZE / sizeof(struct desc))
 _Static_assert(sizeof(struct desc) == 16, "RTL8125 descriptor ABI");
 
-/* The receive ring and the link state belong to the net thread (poll, rx_pending); the
-   transmit ring to transmit, which the stack calls one at a time. The interrupt handler and
-   poll, each on any CPU, share the interrupt mask and the two latches below: rtl_lock, a leaf
-   under the stack's net_lock, guards them; net_rx_notify comes after it is given back. A
-   power change (quiesce, resume) runs alone: every other CPU halted, no other task of CPU 0's
-   running in the middle. */
+/* 受信の輪と link の状態は網の thread（poll、rx_pending）のもの、送信の輪は transmit のもの。網の層は呼出しを net_lock
+   の下で一つずつにする（net/net.h）。割り込みと poll はどの CPU でも走り、割り込みの mask と下の二つの印を共有する：
+   rtl_lock（葉）が守り、net_rx_notify は放してから呼ぶ。
+   電源の walk の間も網の層は呼ぶ。網の層の呼出しは path を持って asleep を見て、立っていれば装置に触れない。suspend は
+   asleep を立ててから装置を止め、resume は装置を立て直してから下ろす。その間、装置に触れるのは電源の thread と割り込み
+   だけである。錠の順：net_lock → path → rtl_lock。 */
 struct rtl8125 {
-    struct netif nif; /* first: self is the device */
+    struct netif nif; /* 先頭：self が装置 */
     volatile uint8_t *mmio;
     volatile struct desc *rx, *tx;
     uint64_t rx_ring_bus, tx_ring_bus;
     uint8_t *rxbuf[NRX], *txbuf[NTX];
     unsigned rx_cur, tx_cur, tx_clean;
+    struct mutex path;
+    bool asleep; /* path の下 */
     struct spinlock rtl_lock;
     volatile bool rx_irq_pending, link_event;
     bool link;
-    uint64_t link_checked; /* the moment check_link last read the PHY */
+    uint64_t link_checked; /* check_link が最後に PHY を読んだ時 */
     uint32_t macver;
 };
 
@@ -177,21 +181,21 @@ static void wr8(struct rtl8125 *c, uint32_t r, uint8_t v) { mmio_write8(c->mmio 
 static void wr16(struct rtl8125 *c, uint32_t r, uint16_t v) { mmio_write16(c->mmio + r, v); }
 static void wr32(struct rtl8125 *c, uint32_t r, uint32_t v) { mmio_write32(c->mmio + r, v); }
 
-/* The register sequences run at probe and in a power change (the other CPUs halted), where nothing
-   may sleep: their waits spin on the clock (clock_spin). */
-/* The size-byte register r is read after each step until (its value & mask) == want, for at most
-   ns (looking after the step, as Realtek's sequences do): true when it came. */
-static bool wait_reg(struct rtl8125 *c, uint32_t r, unsigned size, uint32_t mask, uint32_t want, uint64_t step, uint64_t ns) {
+/* size バイトのレジスター r の値と mask の積が want になるまで、step ごとに眠ってから読み（Realtek の手順と同じく、
+   一歩の後に見る）、ns まで待つ。来たら true。last があれば最後に読んだ値を入れる。 */
+static bool wait_reg(struct rtl8125 *c, uint32_t r, unsigned size, uint32_t mask, uint32_t want, uint64_t step, uint64_t ns,
+                     uint32_t *last) {
     uint64_t until = clock_after(ns);
     for (;;) {
-        clock_spin(step);
+        sleep_until(clock_after(step));
         uint32_t v = size == 1 ? rd8(c, r) : size == 2 ? rd16(c, r) : rd32(c, r);
+        if (last) *last = v;
         if ((v & mask) == want) return true;
         if (clock_now_ns() >= until) return false;
     }
 }
 
-/* MAC and PHY registers behind the OCP windows, addressed in bytes, one 16-bit word each */
+/* OCP の窓の奥の MAC と PHY のレジスター。番地は byte で、一つが 16 bit の語 */
 static uint16_t mac_ocp_read(struct rtl8125 *c, uint16_t a) {
     wr32(c, MAC_OCP, (uint32_t)(a / 2) << 16);
     return (uint16_t)rd32(c, MAC_OCP);
@@ -203,30 +207,27 @@ static void mac_ocp_modify(struct rtl8125 *c, uint16_t a, uint16_t clear, uint16
     mac_ocp_write(c, a, (mac_ocp_read(c, a) & ~clear) | set);
 }
 
+/* 値は印（bit 31）を見せた読みのもの（re_real_ocp_phy_read）。 */
 static uint16_t phy_read(struct rtl8125 *c, uint16_t a) {
     wr32(c, PHY_OCP, (uint32_t)(a / 2) << 16);
-    uint64_t until = clock_after(100 * NS_PER_US);
-    uint32_t v;
-    do {
-        clock_spin(NS_PER_US);
-        v = rd32(c, PHY_OCP);
-    } while (!(v & (1u << 31)) && clock_now_ns() < until);
+    uint32_t v = 0;
+    wait_reg(c, PHY_OCP, 4, 1u << 31, 1u << 31, NS_PER_US, 100 * NS_PER_US, &v);
     return (uint16_t)v;
 }
 
 static void phy_write(struct rtl8125 *c, uint16_t a, uint16_t v) {
     wr32(c, PHY_OCP, 1u << 31 | (uint32_t)(a / 2) << 16 | v);
-    wait_reg(c, PHY_OCP, 4, 1u << 31, 0, NS_PER_US, 100 * NS_PER_US);
+    wait_reg(c, PHY_OCP, 4, 1u << 31, 0, NS_PER_US, 100 * NS_PER_US, NULL);
 }
 
 static void phy_modify(struct rtl8125 *c, uint16_t a, uint16_t clear, uint16_t set) { phy_write(c, a, (phy_read(c, a) & ~clear) | set); }
 static uint16_t mii_read(struct rtl8125 *c, unsigned reg) { return phy_read(c, (uint16_t)(0xA400 + reg * 2)); }
 static void mii_write(struct rtl8125 *c, unsigned reg, uint16_t v) { phy_write(c, (uint16_t)(0xA400 + reg * 2), v); }
 
-/* PCI Express PHY */
+/* PCI Express の PHY */
 static void ephy_write(struct rtl8125 *c, uint8_t a, uint16_t v) {
     wr32(c, EPHYAR, 1u << 31 | (uint32_t)a << 16 | v);
-    wait_reg(c, EPHYAR, 4, 1u << 31, 0, NS_PER_MS, 5 * NS_PER_MS);
+    wait_reg(c, EPHYAR, 4, 1u << 31, 0, NS_PER_MS, 5 * NS_PER_MS, NULL);
 }
 
 static void cfg_unlock(struct rtl8125 *c) { wr8(c, EECMD, rd8(c, EECMD) | EECMD_UNLOCK); }
@@ -236,32 +237,32 @@ static unsigned phy_state(struct rtl8125 *c) { return phy_read(c, 0xA420) & 7; }
 
 static void wait_phy_state(struct rtl8125 *c, unsigned state) {
     uint64_t until = clock_after(100 * NS_PER_MS);
-    while (phy_state(c) != state && clock_now_ns() < until) clock_spin(NS_PER_MS);
+    while (phy_state(c) != state && clock_now_ns() < until) sleep_until(clock_after(NS_PER_MS));
 }
 
-/* Take the MAC from the firmware's out-of-band (wake/management) mode to driver mode. */
+/* MAC を firmware の out-of-band（wake と管理）の型から driver の型へ。 */
 static void exit_oob(struct rtl8125 *c) {
     cfg_lock(c);
     wr8(c, 0xF2, rd8(c, 0xF2) | 0x08);
-    clock_spin(2 * NS_PER_MS);
+    sleep_until(clock_after(2 * NS_PER_MS));
     if (rd8(c, CMD) & (CMD_TX_EN | CMD_RX_EN)) {
-        clock_spin(100 * NS_PER_US);
+        sleep_until(clock_after(100 * NS_PER_US));
         wr8(c, CMD, rd8(c, CMD) & ~(CMD_TX_EN | CMD_RX_EN));
     }
     wr8(c, CMD, rd8(c, CMD) | CMD_STOP_REQ);
-    if (!wait_reg(c, MCU_CMD, 1, MCU_FIFOS_EMPTY, MCU_FIFOS_EMPTY, 50 * NS_PER_US, 150 * NS_PER_MS))
+    if (!wait_reg(c, MCU_CMD, 1, MCU_FIFOS_EMPTY, MCU_FIFOS_EMPTY, 50 * NS_PER_US, 150 * NS_PER_MS, NULL))
         kprintf("rtl8125: FIFOs did not drain\n");
-    wait_reg(c, INTR_MIT, 2, 0x103, 0x103, 50 * NS_PER_US, 150 * NS_PER_MS);
-    mac_ocp_modify(c, 0xC0B4, 1, 0); /* reset the MAC MCU packet filter */
+    wait_reg(c, INTR_MIT, 2, 0x103, 0x103, 50 * NS_PER_US, 150 * NS_PER_MS, NULL);
+    mac_ocp_modify(c, 0xC0B4, 1, 0); /* MAC の MCU の frame の選びを reset する */
     mac_ocp_modify(c, 0xC0B4, 0, 1);
     wr8(c, MCU_CMD, rd8(c, MCU_CMD) & ~MCU_NOW_IS_OOB);
     mac_ocp_modify(c, 0xE8DE, 1u << 14, 0);
-    wait_reg(c, TWI_CMD, 2, 1u << 9, 1u << 9, 100 * NS_PER_US, NS_PER_MS);
+    wait_reg(c, TWI_CMD, 2, 1u << 9, 1u << 9, 100 * NS_PER_US, NS_PER_MS, NULL);
     mac_ocp_write(c, 0xC0AA, 0x07D0);
     mac_ocp_write(c, 0xC0A6, 0x01B5);
     mac_ocp_write(c, 0xC01E, 0x5555);
-    wait_reg(c, TWI_CMD, 2, 1u << 9, 1u << 9, 100 * NS_PER_US, NS_PER_MS);
-    if (mac_ocp_read(c, 0xD42C) & (1u << 8)) { /* resuming from the PHY's power-saving (UPS) state */
+    wait_reg(c, TWI_CMD, 2, 1u << 9, 1u << 9, 100 * NS_PER_US, NS_PER_MS, NULL);
+    if (mac_ocp_read(c, 0xD42C) & (1u << 8)) { /* PHY の節電（UPS）の状態から戻る */
         wait_phy_state(c, 2);
         mac_ocp_modify(c, 0xD42C, 1u << 8, 0);
         phy_modify(c, 0xA466, 1, 0);
@@ -269,13 +270,17 @@ static void exit_oob(struct rtl8125 *c) {
     }
 }
 
-static void mac_reset(struct rtl8125 *c) {
-    wr32(c, RXCFG, rd32(c, RXCFG) & ~0x3Fu); /* accept nothing while the reset runs */
+/* 受けるのを止め、割り込みを切り、MAC を reset する（re_stop_txrx、re_reset）。reset は全部の DMA を終わらせる。reset
+   が済んだら true。 */
+static bool mac_reset(struct rtl8125 *c) {
+    wr32(c, RXCFG, rd32(c, RXCFG) & ~RX_FILTER);
     wr32(c, IMR_CLEAR, 0xFFFFFFFF);
     wr32(c, ISR, 0xFFFFFFFF);
-    clock_spin(2 * NS_PER_MS + 200 * NS_PER_US);
+    sleep_until(clock_after(2 * NS_PER_MS + 200 * NS_PER_US));
     wr8(c, CMD, CMD_RESET);
-    if (!wait_reg(c, CMD, 1, CMD_RESET, 0, 10 * NS_PER_US, 10 * NS_PER_MS)) kprintf("rtl8125: reset did not complete\n");
+    if (wait_reg(c, CMD, 1, CMD_RESET, 0, 10 * NS_PER_US, 10 * NS_PER_MS, NULL)) return true;
+    kprintf("rtl8125: reset did not complete\n");
+    return false;
 }
 
 static void aspm_clkreq_off(struct rtl8125 *c) {
@@ -284,27 +289,29 @@ static void aspm_clkreq_off(struct rtl8125 *c) {
     wr8(c, CFG2, rd8(c, CFG2) & ~0x80);
 }
 
+/* MAC と PHY を初めから立てる。firmware が渡したままでも、電源を失った後でも、走っていても同じ（exit_oob が送受信を
+   止め、mac_reset が DMA を終わらせる）。 */
 static void hw_init(struct rtl8125 *c) {
     exit_oob(c);
     mac_reset(c);
-    mac_ocp_modify(c, 0xE080, 1u << 1, 0); /* EEE+ off */
+    mac_ocp_modify(c, 0xE080, 1u << 1, 0); /* EEE+ を切る */
     cfg_unlock(c);
-    mac_ocp_modify(c, 0xC0B6, 1, 0); /* no magic-packet wake */
+    mac_ocp_modify(c, 0xC0B6, 1, 0); /* magic packet で起こさない */
     aspm_clkreq_off(c);
     wr8(c, CFG2, rd8(c, CFG2) | 0x20);
     cfg_lock(c);
 
-    /* Breakpoints of a MAC microcode patch a boot ROM may have left: the MAC runs its ROM code. */
+    /* boot ROM が残したかもしれない MAC の microcode の当て布の breakpoint：MAC は ROM の code で走る */
     for (uint16_t a = 0xFC28; a <= 0xFC48; a += 2) mac_ocp_write(c, a, 0);
-    clock_spin(3 * NS_PER_MS);
+    sleep_until(clock_after(3 * NS_PER_MS));
     mac_ocp_write(c, 0xFC26, 0);
 
-    /* PHY power up */
+    /* PHY の電源を入れる */
     wr8(c, PMCH, rd8(c, PMCH) | 0xC0);
     mii_write(c, MII_BMCR, BMCR_AUTONEG);
     wait_phy_state(c, 3);
 
-    /* PCI Express PHY parameters */
+    /* PCI Express の PHY の値 */
     static const uint16_t ephy_b1[][2] = {
         {0x06, 0x001F}, {0x0A, 0xB66B}, {0x01, 0xA852}, {0x24, 0x0008}, {0x2F, 0x6052}, {0x0D, 0xF716},
         {0x20, 0xD477}, {0x21, 0x4477}, {0x22, 0x0013}, {0x23, 0xBB66}, {0x0B, 0xA909}, {0x29, 0xFF04},
@@ -321,7 +328,7 @@ static void hw_init(struct rtl8125 *c) {
     else
         for (size_t i = 0; i < ARRAY_SIZE(ephy_b2); i++) ephy_write(c, (uint8_t)ephy_b2[i][0], ephy_b2[i][1]);
 
-    /* MAC common setup */
+    /* MAC の共通の設定 */
     cfg_unlock(c);
     aspm_clkreq_off(c);
     wr16(c, CPLUS_CMD, 0x2060);
@@ -336,7 +343,7 @@ static void hw_init(struct rtl8125 *c) {
     wr8(c, TDFNR, 0x10);
     mac_ocp_write(c, 0xC140, 0xFFFF);
     mac_ocp_write(c, 0xC142, 0xFFFF);
-    mac_ocp_modify(c, 0xEB58, 1, 0); /* the 16-byte descriptor format */
+    mac_ocp_modify(c, 0xEB58, 1, 0); /* 16 byte の descriptor の形 */
     mac_ocp_modify(c, 0xE614, 0x0700, 2u << 8);
     mac_ocp_modify(c, 0xE63E, 0x0C00, 0);
     mac_ocp_modify(c, 0xE63E, 0x0030, 2u << 4);
@@ -355,18 +362,18 @@ static void hw_init(struct rtl8125 *c) {
     wr8(c, 0xD0, rd8(c, 0xD0) | 0x80);
     mac_ocp_modify(c, 0xEA1C, 1u << 2, 0);
     mac_ocp_modify(c, 0xEB54, 0, 1);
-    clock_spin(NS_PER_US);
+    clock_spin(NS_PER_US); /* 二つの書込みの間の 1 us */
     mac_ocp_modify(c, 0xEB54, 1, 0);
     wr16(c, 0x1880, rd16(c, 0x1880) & ~0x30);
     for (uint32_t r = 0x0A00; r < 0x0A80; r += 4) wr32(c, r, 0);
-    wr8(c, INT_CFG0, (rd8(c, INT_CFG0) & ~0x07) | 0x01); /* the 8125B interrupt mapping */
+    wr8(c, INT_CFG0, (rd8(c, INT_CFG0) & ~0x07) | 0x01); /* 8125B の割り込みの割り当て */
     wr16(c, INT_CFG1, 0);
     wr32(c, INTR_MOD, 0x00630063);
     cfg_lock(c);
 }
 
 static void start_autoneg(struct rtl8125 *c) {
-    phy_modify(c, 0xA428, 1u << 9, 0); /* no "giga lite" */
+    phy_modify(c, 0xA428, 1u << 9, 0); /* "giga lite" を使わない */
     phy_modify(c, 0xA5EA, 1, 0);
     phy_modify(c, 0xA5D4, 0, ADV_2500_FD);
     mii_write(c, MII_GBCR, (mii_read(c, MII_GBCR) & ~GBCR_1000_HD) | GBCR_1000_FD);
@@ -375,8 +382,7 @@ static void start_autoneg(struct rtl8125 *c) {
     mii_write(c, MII_BMCR, BMCR_RESET | BMCR_AUTONEG | BMCR_RESTART);
 }
 
-/* Both rings from their first descriptor, handed to the MAC, then receive and transmit on: at
-   probe and after a sleep, which reset the MAC (the buffers stay where they were). */
+/* 両方の輪を最初の descriptor から MAC に渡し、受信と送信を入れる。緩衝はもとの場所のまま。 */
 static void rings_start(struct rtl8125 *c) {
     for (size_t i = 0; i < NRX; i++) {
         c->rx[i].opts2 = 0;
@@ -396,6 +402,34 @@ static void rings_start(struct rtl8125 *c) {
     wr32(c, MAR4, 0xFFFFFFFF);
     wr32(c, RXCFG, 0x40C00C00 | RX_ACCEPT);
     wr8(c, CMD, CMD_TX_EN | CMD_RX_EN);
+}
+
+/* hw_init の後、データの道を閉じて：局の番地、両方の輪、割り込み、自動交渉。attach と resume が通る。 */
+static void rtl_run(struct rtl8125 *c) {
+    cfg_unlock(c);
+    wr32(c, IDR0, c->nif.mac[0] | c->nif.mac[1] << 8 | c->nif.mac[2] << 16 | (uint32_t)c->nif.mac[3] << 24);
+    wr16(c, IDR0 + 4, (uint16_t)(c->nif.mac[4] | c->nif.mac[5] << 8));
+    cfg_lock(c);
+    rings_start(c);
+    c->link = false; /* 自動交渉が済むと check_link がまた言う */
+    wr32(c, ISR, 0xFFFFFFFF);
+    wr32(c, IMR_SET, INT_MASK);
+    start_autoneg(c);
+}
+
+/* データの道を閉じる：この後、網の層の呼出しは装置に触れない。 */
+static void path_close(struct rtl8125 *c) {
+    mutex_lock(&c->path);
+    c->asleep = true;
+    mutex_unlock(&c->path);
+}
+
+/* データの道を開き、網の thread に輪と、待たせた送信を見させる。 */
+static void path_open(struct rtl8125 *c) {
+    mutex_lock(&c->path);
+    c->asleep = false;
+    mutex_unlock(&c->path);
+    net_rx_notify();
 }
 
 static void check_link(struct rtl8125 *c) {
@@ -422,7 +456,7 @@ static enum irq_result rtl_irq(void *context) {
     uint32_t isr = rd32(c, ISR);
     bool ours = isr && isr != 0xFFFFFFFF;
     if (ours) {
-        /* The net thread drains the rings: interrupts stay off until poll rearms them. */
+        /* 輪は網の thread が空ける：poll が入れ直すまで割り込みは切ったまま */
         wr32(c, IMR_CLEAR, 0xFFFFFFFF);
         wr32(c, ISR, isr);
         if (isr & INT_LINK) c->link_event = true;
@@ -436,11 +470,13 @@ static enum irq_result rtl_irq(void *context) {
 static bool rtl_rx_pending(struct netif *self, unsigned queue) {
     (void)queue;
     struct rtl8125 *c = (struct rtl8125 *)self;
-    return c->rx_irq_pending || c->link_event || !(c->rx[c->rx_cur].opts1 & D_OWN);
+    mutex_lock(&c->path);
+    bool pending = !c->asleep && (c->rx_irq_pending || c->link_event || !(c->rx[c->rx_cur].opts1 & D_OWN));
+    mutex_unlock(&c->path);
+    return pending;
 }
 
-/* What the MAC verified of the frame: NET_RX_CSUM_OK for an IPv4 frame whose header and TCP or UDP
-   checksum are right. */
+/* MAC が確かめたこと：IPv4 の frame の頭と TCP か UDP の checksum が正しければ NET_RX_CSUM_OK。 */
 static unsigned rx_checks(uint32_t opts1, uint32_t opts2) {
     if (!(opts2 & RX_V4F) || (opts1 & RX_IPF)) return 0;
     if ((opts1 & RX_TCPT) && !(opts1 & RX_TCPF)) return NET_RX_CSUM_OK;
@@ -451,17 +487,22 @@ static unsigned rx_checks(uint32_t opts1, uint32_t opts2) {
 static size_t rtl_poll(struct netif *self, unsigned queue, size_t budget, net_input_fn input) {
     (void)queue;
     struct rtl8125 *c = (struct rtl8125 *)self;
+    mutex_lock(&c->path);
+    if (c->asleep) {
+        mutex_unlock(&c->path);
+        return 0;
+    }
     uint64_t flags = spin_lock(&c->rtl_lock);
     bool event = c->link_event;
     c->link_event = false;
     spin_unlock(&c->rtl_lock, flags);
     if (event || clock_now_ns() >= c->link_checked + LINK_LOOK) check_link(c);
-    (void)rd8(c, INT_CFG0); /* a register read orders the descriptor writes the NIC posted before it */
+    (void)rd8(c, INT_CFG0); /* レジスターの読みは、NIC がその前に書いた descriptor を先に見せる */
     size_t consumed = 0;
     while (consumed < budget && !(c->rx[c->rx_cur].opts1 & D_OWN)) {
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         uint32_t o = c->rx[c->rx_cur].opts1, o2 = c->rx[c->rx_cur].opts2;
-        unsigned len = (o & RX_LEN) >= 4 ? (o & RX_LEN) - 4 : 0; /* without the FCS */
+        unsigned len = (o & RX_LEN) >= 4 ? (o & RX_LEN) - 4 : 0; /* FCS を除く */
         if (!(o & RX_RES) && (o & D_FS) && (o & D_LS) && len >= 14 && len <= BUFSZ)
             input(self, c->rxbuf[c->rx_cur], len, rx_checks(o, o2));
         c->rx[c->rx_cur].opts2 = 0;
@@ -473,18 +514,19 @@ static size_t rtl_poll(struct netif *self, unsigned queue, size_t budget, net_in
     flags = spin_lock(&c->rtl_lock);
     c->rx_irq_pending = false;
     wr32(c, IMR_SET, INT_MASK);
-    /* A frame may have landed between the last check and rearming: never wait for a new edge. */
+    /* 最後に見てから入れ直すまでに frame が着いたかもしれない：新しい割り込みを待たない */
     bool again = !(c->rx[c->rx_cur].opts1 & D_OWN);
     if (again) {
         wr32(c, IMR_CLEAR, 0xFFFFFFFF);
         c->rx_irq_pending = true;
     }
     spin_unlock(&c->rtl_lock, flags);
+    mutex_unlock(&c->path);
     if (again) net_rx_notify();
     return consumed;
 }
 
-/* One frame into the next descriptor, handed to the MAC. A frame longer than the MAC sends is dropped. */
+/* frame を一つ次の descriptor に入れ、MAC に渡す。MAC が送れるより長い frame は捨てる。 */
 static void tx_post(struct rtl8125 *c, const struct net_tx_frame *frame) {
     uint8_t *b = c->txbuf[c->tx_cur];
     size_t len = 0;
@@ -496,8 +538,8 @@ static void tx_post(struct rtl8125 *c, const struct net_tx_frame *frame) {
     if (frame->offload & NET_TX_IP_CSUM) opts2 |= TX_IPV4CS;
     if (frame->offload & NET_TX_TCP_CSUM) opts2 |= TX_TCPCS;
     else if (frame->offload & NET_TX_UDP_CSUM) opts2 |= TX_UDPCS;
-    /* The 8125A/B corrupt a short IPv4 UDP frame unless it is padded, which the MAC's own checksum
-       does not need (Realtek's driver, re_8125_pad). */
+    /* 8125A/B は短い IPv4 UDP の frame を詰め物なしでは壊す。MAC が自分で checksum を埋めるなら要らない（Realtek の
+       driver の re_8125_pad） */
     size_t min = !(frame->offload & (NET_TX_TCP_CSUM | NET_TX_UDP_CSUM)) && len >= 24 && b[12] == 0x08 &&
                          b[13] == 0x00 && b[23] == 17 ?
                      UDP_PAD :
@@ -512,22 +554,94 @@ static void tx_post(struct rtl8125 *c, const struct net_tx_frame *frame) {
     c->tx_cur = (c->tx_cur + 1) % NTX;
 }
 
+/* 道が閉じている間は一つも取らない：網の層が持っておき、path_open の知らせで渡し直す（net/net.h）。 */
 static unsigned rtl_transmit(struct netif *self, unsigned queue, const struct net_tx_frame *frames, unsigned count) {
     (void)queue;
     struct rtl8125 *c = (struct rtl8125 *)self;
+    mutex_lock(&c->path);
+    if (c->asleep) {
+        mutex_unlock(&c->path);
+        return 0;
+    }
     while (c->tx_clean != c->tx_cur && !(c->tx[c->tx_clean].opts1 & D_OWN)) c->tx_clean = (c->tx_clean + 1) % NTX;
     unsigned taken = 0, posted = 0;
     while (taken < count) {
-        if (frames[taken].length > FRAME_MAX - 4) { /* the MAC cannot send it: dropped */
+        if (frames[taken].length > FRAME_MAX - 4) { /* MAC が送れない：捨てる */
             taken++;
             continue;
         }
-        if ((c->tx_cur + 1) % NTX == c->tx_clean) break; /* no room: the rest waits for a completion */
+        if ((c->tx_cur + 1) % NTX == c->tx_clean) break; /* 場所が無い：残りは送り終わりを待つ */
         tx_post(c, &frames[taken++]);
         posted++;
     }
-    if (posted) wr16(c, TPPOLL, 1); /* normal-priority queue 0: one doorbell for the batch */
+    if (posted) wr16(c, TPPOLL, 1); /* 普通の優先の queue 0：まとめて一度の呼び鈴 */
+    mutex_unlock(&c->path);
     return taken;
+}
+
+/* ---- 電源 ---- */
+
+/* D3 の前の MAC の設定（re_hw_d3_para の RTL8125B の分）：EEE+ を入れ（re_set_eeeplus）、MAC の側で LTR を切り
+   （_re_set_enable_ltr）、L1 off を切る（re_set_enable_l1off）。ASPM を使わないので LTR の要求は出していない
+   （re_issue_ltr_no_req は何もしない）。構成の空間（Device Control 2 の LTR の許し）は HAL のもので、ここでは書かない。 */
+static void d3_prepare(struct rtl8125 *c) {
+    mac_ocp_modify(c, 0xE080, 0, 1u << 1);
+    mac_ocp_modify(c, 0xE032, (1u << 0) | (1u << 1), 0);
+    mac_ocp_modify(c, 0xE094, 0xFF00, 0);
+    mac_ocp_modify(c, 0xE092, 0x00FF, 0);
+}
+
+/* wake を使わない眠りと電源断の PHY（re_setwol、re_phy_power_down）：PHY を power down にし、PHY の wake の電源を
+   切る。 */
+static void phy_power_down(struct rtl8125 *c) {
+    mii_write(c, MII_BMCR, BMCR_AUTONEG | BMCR_PDOWN);
+    wr8(c, PMCH, rd8(c, PMCH) & ~PMCH_PHY_WAKE);
+}
+
+/* 道を閉じて：装置を初めから立て直し（re_hw_init）、道を開く。MAC が reset を出て送受信が入ったら true。 */
+static bool rtl_restart(struct rtl8125 *c) {
+    hw_init(c);
+    rtl_run(c);
+    uint8_t cmd = rd8(c, CMD);
+    bool back = !(cmd & CMD_RESET) && (cmd & (CMD_TX_EN | CMD_RX_EN)) == (CMD_TX_EN | CMD_RX_EN);
+    path_open(c);
+    return back;
+}
+
+/* hal.h の suspend（re_suspend と re_shutdown）。道を閉じてから MAC を reset する：DMA と割り込みが止まる。眠りと電源断
+   では装置が D3 に入るか電源を失うので、D3 の前の設定と PHY の電源断を続ける。休止の写しでは電源が残り、resume が
+   初めから立て直す。reset が済まなければ false。眠りと休止は取りやめになり、止まらなかった装置に resume は来ない
+   （hal/power.c）ので、動いていたとおりに戻す。電源断では戻さない：電源が切れるか、休止の写しへ渡る前に DMA を
+   また始めることになる。 */
+static bool rtl_suspend(struct hal_device *d, enum hal_power_target target) {
+    struct rtl8125 *c = d->driver_data;
+    path_close(c);
+    if (!mac_reset(c)) {
+        if (target != HAL_POWER_OFF && !rtl_restart(c)) hal_failed(d, -N_ERR_IO);
+        return false;
+    }
+    switch (target) {
+    case HAL_POWER_SLEEP:
+    case HAL_POWER_OFF:
+        d3_prepare(c);
+        phy_power_down(c);
+        break;
+    case HAL_POWER_IMAGE: break;
+    }
+    return true;
+}
+
+/* hal.h の resume（re_resume）。装置は電源を失っていても、そのままでもよい：hw_init はどちらからも初めから立てる。局の
+   番地と輪の場所は記憶にあり、電源を失っても失われない。 */
+static bool rtl_resume(struct hal_device *d) {
+    struct rtl8125 *c = d->driver_data;
+    path_close(c);
+    bool back = rtl_restart(c);
+    if (!back) {
+        kprintf("rtl8125: did not come back after sleeping\n");
+        hal_failed(d, -N_ERR_IO);
+    }
+    return back;
 }
 
 static bool valid_mac(const uint8_t *m) {
@@ -570,7 +684,7 @@ static int rtl_attach(struct hal_device *d) {
         for (int i = 0; i < 6; i++) c->nif.mac[i] = rd8(c, IDR0 + i);
     if (!valid_mac(c->nif.mac)) {
         entropy_get(c->nif.mac, 6);
-        c->nif.mac[0] = (c->nif.mac[0] & 0xFE) | 0x02; /* locally administered */
+        c->nif.mac[0] = (c->nif.mac[0] & 0xFE) | 0x02; /* 局所に決めた番地 */
         kprintf("rtl8125: no station address stored, using a random one\n");
     }
 
@@ -578,12 +692,7 @@ static int rtl_attach(struct hal_device *d) {
     phy_write(c, 0xA436, 0x801E);
     uint16_t phy_code = phy_read(c, 0xA438);
 
-    cfg_unlock(c);
-    wr32(c, IDR0, c->nif.mac[0] | c->nif.mac[1] << 8 | c->nif.mac[2] << 16 | (uint32_t)c->nif.mac[3] << 24);
-    wr16(c, IDR0 + 4, (uint16_t)(c->nif.mac[4] | c->nif.mac[5] << 8));
-    cfg_lock(c);
-
-    /* the rings, then the buffers they point at: one block each, the buffers after one another */
+    /* 輪、続いてそれが指す緩衝：それぞれ一つの塊で、緩衝は並べて */
     uint64_t ring_bus, buffer_bus;
     uint8_t *rings = hal_dma_alloc(d, 2 * PAGE_SIZE, 0, &ring_bus);
     uint8_t *buffers = hal_dma_alloc(d, (NRX + NTX) * BUFSZ, 0, &buffer_bus);
@@ -605,15 +714,16 @@ static int rtl_attach(struct hal_device *d) {
         c->tx[i].addr = buffer_bus + (NRX + i) * BUFSZ;
     }
 
-    /* a PCI Express function that interrupts has MSI or MSI-X (PCIe 6.0, 6.1.4); the chip's
-       interrupt mask stays clear until the rings are set */
+    /* 割り込む PCI Express の機能は MSI か MSI-X を持つ（PCIe 6.0、6.1.4）。chip の割り込みの mask は輪が立つまで
+       切ったまま（mac_reset） */
     if (!hal_irq_enable(d, &(struct irq_spec){.name = "RTL8125", .handler = rtl_irq, .context = c}, 1, NULL)) {
         kprintf("rtl8125: no interrupt message could be enabled\n");
         r = -N_ERR_IO;
         goto fail;
     }
-    rings_start(c);
 
+    /* 網の層は net_register から呼ぶ：輪が立つまで道を閉じておく */
+    c->asleep = true;
     c->nif.driver = "rtl8125";
     c->nif.tx_queues = c->nif.rx_queues = 1;
     c->nif.offloads = NET_OFFLOAD_CSUM_TX | NET_OFFLOAD_CSUM_RX;
@@ -621,14 +731,13 @@ static int rtl_attach(struct hal_device *d) {
     c->nif.rx_pending = rtl_rx_pending;
     c->nif.poll = rtl_poll;
     net_register(d, &c->nif);
-    wr32(c, ISR, 0xFFFFFFFF);
-    wr32(c, IMR_SET, INT_MASK);
-    start_autoneg(c);
+    rtl_run(c);
+    path_open(c);
     kprintf("net: rtl8125 (RTL8125B, %08x, PHY code %04x) mac %02x:%02x:%02x:%02x:%02x:%02x\n", txcfg, phy_code,
             c->nif.mac[0], c->nif.mac[1], c->nif.mac[2], c->nif.mac[3], c->nif.mac[4], c->nif.mac[5]);
     return 0;
 fail:
-    hal_irq_disable(d); /* before the handler's memory goes */
+    hal_irq_disable(d); /* handler の記憶が消える前に */
     d->driver_data = NULL;
     kfree(c);
     return r;
@@ -640,5 +749,8 @@ static const struct hal_driver rtl8125_driver = {
     .rules = rtl_rules,
     .rule_count = ARRAY_SIZE(rtl_rules),
     .attach = rtl_attach,
+    .suspend = rtl_suspend,
+    .resume = rtl_resume,
+    .after_sleep = HAL_AFTER_SLEEP_RESUME,
 };
 HAL_DRIVER(rtl8125_driver);

@@ -96,6 +96,9 @@ struct hda_output *hda_codec_outputs(struct hda_codec *codec);
 /* After a reset of the link, and at first: the audio groups powered (D0), and the pins that sense
    asked to announce what is plugged in, with this tag in their unsolicited responses. */
 void hda_codec_power(struct hda_codec *codec, const struct hda_output *outputs, unsigned tag);
+/* 音の function group を D3 にする（7.3.3.10）。link の clock を止める前に：codec は D0 から D3 へ移る音の乱れを
+   自分で抑える。 */
+void hda_codec_sleep(struct hda_codec *codec);
 /* What is plugged in now, kept in out->plugged, and its name; true when either changed. */
 bool hda_output_sense(struct hda_output *out);
 /* What its converter declares (7.3.4.7) that a stream format's word can say: the rates in Hz, in rising
