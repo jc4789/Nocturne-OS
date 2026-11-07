@@ -699,9 +699,9 @@ static int hid_attach(struct hal_device *hal) {
     hids = h;
     spin_unlock(&hids_lock, f);
     input_identify(h);
-    kprintf("usbhid: slot %u interface %u is a %s%s%s%s\n", d->slot, h->interface,
-            h->keyboard ? "keyboard" : "", h->keyboard && h->mouse ? " and " : "",
-            h->mouse ? (h->x.relative ? "mouse" : "absolute pointer") : "", h->wheel.present ? " with wheel" : "");
+    kprintf("usbhid: slot %u interface %u: %s%s%s%s\n", d->slot, h->interface, h->keyboard ? "keyboard" : "",
+            h->keyboard && h->mouse ? ", " : "", h->mouse ? (h->x.relative ? "mouse" : "absolute pointer") : "",
+            h->wheel.present ? " with wheel" : "");
     h->packet = usb_interrupt_length(d, ep, 1);
     /* room for a report all but whole, and the packet that ends it */
     h->partial = h->packet ? kmalloc(h->longest + h->packet) : NULL;

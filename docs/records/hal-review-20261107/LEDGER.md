@@ -47,7 +47,7 @@
 | H30 | `dev/power.c` の電源断とリセットに「emulator の代わりの道」と、AML が読めないときに DSDT から `_S5_` のバイトを探す代わりの道がある | `kernel/src/dev/power.c:1-3` | 未 |
 | H31 | DMA の番地が物理番地に決め打ち（`hal_dma_reach` の `*bus = phys`、`hal/dma.c`）。IOMMU の領域は同じ番地の写しだけで、カーネルの実装の装置は外向きの port（Thunderbolt など）でも隔離されない。幅の外の緩衝は block だけにあり、網・音・USB は持てない | `kernel/src/hal/hal.h`、`kernel/src/hal/dma.c` | 未 |
 | H32 | 眠りの穴：USB のディスク（`usbmsc`）を挿している間は眠りも休止もしない（戻った制御器が数え直すとディスクが新しい装置になる）。`nvrm` が `n_hal_power_wait` を呼ばず、NVIDIA の GPU の機械は眠らない。`firmware-screen` は claim の GPU ドライバーが画面 0 を持っても結ばれたままで S3 を拒む。PCI の列挙は firmware が D3cold で渡した機能を D0 にしない | `kernel/src/dev/usbmsc.c`、`ports/nvidia/nvrm.c`、`kernel/src/dev/fb.c:642`、`kernel/src/dev/pci.c` | 未 |
-| H33 | 起動のたびに QEMU が「Ignoring request for interrupt vector 0」と言う（vector 0 の MSI が送られた）。出所が分からない | 作業場の `serial-c1-qemu-err.txt`、`qemu-err.txt` | 未 |
+| H33 | 起動のたびに QEMU が「Ignoring request for interrupt vector 0」と言う。serial の最初の行（UEFI の BdsDxe）より前に出る：Nocturne はまだ走っていない。QEMU か firmware の事で、Nocturne の欠陥ではない | 作業場の `when.py`、`serial-h33*.log` | 直 |
 | H34 | 利用者の ABI と文書が装置の管理者を「HAL」と呼ぶ（`n_hal_*`、`SYS_HAL_*`、`common/hal_abi.h`）。機械の HAL を分けると、名前が持ち主に着かない | `common/hal_abi.h`、`common/abi.h` | 未 |
 | H35 | `pcitest` の画面の印の数の確かめが 5 件落ちる（refresh の分からない画面での合成の振る舞い）。段 B で範囲の外とした | §5 の段 B | 未 |
 | H36 | 機械の検査：訂正の誤りを拾う道は UC と PCC の bank を飛ばす。#MC の道と分けた理由が SDM と照らしてない | `kernel/src/arch/mca.c:43`、`:85` | 未 |
@@ -66,6 +66,12 @@
 | H49 | `pci_find_cap` は同じ ID の最初の capability だけを返す。virtio は ID 9 の全部を手の walk で辿る。PCI のバスの口に capability の列挙が要る | `kernel/src/dev/pci.c`、`kernel/src/vm/virtio_gpu.c` | 未 |
 | H50 | 一つの装置の状態が file の static にある（`virtio_gpu`、`ata` の `disks[]`・`channels[]`、二度目の attach を断る門）。二つ目の装置を持てない | `kernel/src/vm/virtio_gpu.c`、`kernel/src/vm/ata.c` | 未 |
 | H51 | 固定の節 "ide-ports" の slot の並び（channel c の命令の block が 2c、制御が 2c+1）を書くのは `ata.c` だけで、出す側（`vm/vm.c` の `publish_ide_ports`）に無い | `kernel/src/vm/vm.c` | 未 |
+| H52 | 光学ドライブ（ATAPI）を扱わない：AHCI は「port 2: an ATAPI drive, skipped」と言って飛ばす。SCSI の MMC の命令、読むだけの block、媒体の入れ替えが無い。q35 の CD は台帳にも出ない | `kernel/src/dev/ahci.c` | 未 |
+| H53 | SMBus の制御器（q35 の 8086:2930）に実装が無い。設定の窓は PCI の class だけで種類を言い、SMBus（0Ch の 05h）を「USB などのバス」と書く | `kernel/src/dev/`、`user/apps/settings.c` の `hardware_kind` | 未 |
+| H54 | usbhid の起動の行の文が崩れる（「is a absolute pointer」） | `kernel/src/dev/usbhid.c` | 直 |
+| H55 | 利用者に英語が見える：端末の窓の題と案内の行、メモ帳（「untitled - Text Editor」、New・Open・Save・Save as）、ファイルの窓の保存（Up・Home・New folder・Save・Cancel・Name・Size・Type）、音の出口の名「line out」（カーネルの codec の pin の内部の値を窓が出す） | `user/apps/`、`kernel/src/dev/hda_codec.c`、`user/apps/settings.c` | 未 |
+| H56 | `audiotest` の「1 s の音が 948 ms で鳴り終わった」（下限 950 ms）。段 D の媒体で四回のうち一回（948、971、1032、972 ms）。前の記録も前の写しも無く、退行かどうかは確かめていない | `tests/audiotest.c:148`、`user/apps/audio.c`、`kernel/src/dev/hda.c` | 未 |
+| H57 | ブラウザー：ja.wikipedia.org の頁で `getItem`・`removeItem` を undefined から読む TypeError と、jqueryMsg の解析の誤り（F12 の console）。段 D は実装だけを変えたので、この組の前からのものと見込むが、前の写しで比べていない | `user/libc/web/`、`user/libc/webstorage.c` | 未 |
 
 ## 2. 実装ごとの事実
 
@@ -251,13 +257,13 @@
 | A | 機械の装置（D4）、木（D8）、H10、H11 | 済：宣言 `struct hal_machine`（`.hal_machine`）、firmware の節 `struct firmware_node`、ACPI の二度の出し方、QEMU で木を確かめた |
 | B | firmware の口（D3）、claim の渡し方（D5）、台帳の見張り（D6） | 済：`dev/acpi_claim.c`（`SYS_HAL_ACPI_EVAL`・`_NOTIFY_TAKE`、`N_ACPI_PARENT`）、`SYS_SCREEN_HOLD`、`n_hal_claim` の実装の名、管理者が claim を取って `N_SERVICE_HANDLE_DEVICE` で渡す、台帳の見張りで実例を作り・消す、見張りの相手へ一覧の全部。確かめは下の 5 |
 | C | 電源（D1、D2、H3、H12、H14） | 済：`hal/power.c` の walk、`dev/acpi_power.c`、PCI の `power`、`dev/pm.c` の機械の順、claim の段、実装ごとの suspend・resume（3.2）。確かめは下の 5 |
-| D | DMA の長く使うメモリー（D7）、H19 | 進行中：口（`hal/dma.c`）を建てた。実装のつなぎはサブエージェント四人（xHCI、virtio_gpu と ata、block と NVMe と AHCI、音と網） |
+| D | DMA の長く使うメモリー（D7）、H19 | 済：口（`hal/dma.c`）、全部の実装（xHCI、virtio_gpu、ata、block と NVMe と AHCI、HDA、AC'97、e1000、tulip、rtl8125、netvsc、storvsc）、VMBus のバスの stop（host が持つかもしれない GPADL を覚える）、`check_boundaries` の規則 7。確かめは下の 5 |
 | E | 機械の HAL を分ける（D10、D11）：`hal/` と `io/`、H28、H30、H33、H36、H37、H40、H41 | 未 |
 | F | 実装の ABI と像（D12、D13、D16）：像の形式、DDK、輸出、読み込み、組み、起動の module（NVMe、SATA、USB のどれからでも起動する）、DMA の層、全部の実装とバスを像に（D14）、プログラムも同じ形式に、導入の形式（宣言と中身。ドライバーと任意の機能とアプリを同じ形で入れる）。H26、H27、H31、H39、H42、H47〜H51 | 未 |
 | G | USB を本物のバスに（D14、H29、H45）、USB のプロセスの実装 | 未 |
-| H | 接続の資源と提供者（D15、H22）、GPIO・I2C の制御器の実装、I2C の HID、i8042 | 未 |
-| I | 電源と寿命（D17、H20、H21、H23〜H25、H32、H38、H43、H44、H46）、H35 | 未 |
-| J | 利用者の ABI の名（D18、H34）、文書（`docs/hal.md`、ABI の §9、地図）、全体の確かめ、台帳を閉じる | 未 |
+| H | 接続の資源と提供者（D15、H22）、GPIO・I2C・SMBus の制御器の実装、I2C の HID、i8042、光学ドライブ（H52、H53） | 未 |
+| I | 電源と寿命（D17、H20、H21、H23〜H25、H32、H38、H43、H44、H46）、H35、H56 | 未 |
+| J | 利用者の ABI の名（D18、H34）、文書（`docs/hal.md`、ABI の §9、地図）、利用者に見える英語（H55）、H57、全体の確かめ、台帳を閉じる | 未 |
 
 ## 5. 確かめの記録
 
@@ -277,3 +283,16 @@
 - 試験の側の注意：`n_power_request` の眠りと休止はすぐ戻る（pm の thread が後で行う）。試験の終わりの電源断の頼みが先に来ると、そちらが行われる。
 - 確かめていないこと：実機と Hyper-V。tulip、ata、rtl8125、ac97、usbmsc、usbnet の walk（QEMU のこの構成に無い）。S3 からの戻り（WHPX）。
 - 段 B と段 C の確かめは足りない：ログインの先のデスクトップで装置を使っていない（ファイルの保存と再起動、音、網、開始メニューからの眠りと休止とその後の装置）。serial.log の全部と QEMU の stderr（H33）を読んでいない。段 D の媒体で、この手順の全部をやり直す。
+
+**段 D（コミット 71a74e77 の媒体、QEMU 窓付き、WHPX、q35、`intel-iommu,intremap=off,caching-mode=on`、e1000、`qemu-xhci`＋`usb-kbd`＋`usb-tablet`、`intel-hda`＋`hda-duplex`、qcow2 の overlay で書込みが残る）**
+- NVMe の起動：最初の利用者を作り、デスクトップへ。起動の行は段 C の媒体と同じで、違いは xHCI の「64-bit DMA」だけ（作業場の `serial-d1.log` と `serial-c1.log`）。
+- 端末で試験の源をホストから `fetch`（e1000）し、ゲストの clang と tcc で組んだ。`dmadisktest write` と `check`（13 の文書、35 MB、block の端と blk.c の緩衝の端と MiB の単位、1 MiB の塊と頁の中の半端な位置の塊）：0 failed。`fstest`：0 failed。`audiotest`：四回のうち三回 0 failed、一回 H56。
+- 設定の窓：音の頁（HDA の出口、48000 Hz）と装置の頁（PCI の木、USB の装置、nvme・e1000・xhci・usbhid・hda・ahci が動かす。SMBus は実装なし：H53）。
+- ブラウザー：`browser --maximized` で ja.wikipedia.org の「月」を開き、本文と画像が出て、wheel で送れる。F12 の console は H57。
+- 開始メニューの「電源を切る」の後に起動し直し、冷えた cache で `dmadisktest check`：35 MB を 399 ms（cache からは 17 ms）、0 failed。作った利用者でログインできる。
+- 開始メニューの「休止」：写し 99 MiB を 402 ms で書いて電源断。起動し直すと写しへ戻り、端末の窓と文が戻る。xHCI は状態を失ったと分かって数え直し、キーボードとタブレットが効く。戻った後に `dmadisktest check`、`fetch`、`audiotest` は 0 failed。
+- 開始メニューの「スリープ」：QMP の `query-status` が `suspended`。WHPX は S3 から戻れない。
+- AHCI の起動（NVMe を外し `-device ahci` に disk）：C: は `sata0.0`。`dmadisktest write` と `check`、電源断の後の冷えた `check`（551 ms）：0 failed。この構成の QEMU は CD を作らない（`info block`）ので、ATAPI の行が出ないのは構成の事。
+- serial の行は全部読んだ。説明の要る行：「nvme0: namespace 1 is not ready yet」は NVMe 2.4 の Figure 346 の NSTAT（byte 14）の NRDY が 0 のときの知らせで、続く命令は通る。「cpu: LFENCE is not known to be dispatch serializing」は WHPX の CPUID 80000021h が 0 のため。
+- 前の写し `build/mae.img` は段 C の試験の媒体（autorun と powertest を C: に入れたもの）で、起動するとすぐ眠る。H56 と H57 の「前」には使えない。
+- 確かめていないこと：実機と Hyper-V（netvsc、storvsc、VMBus の stop は Hyper-V でしか通らない）。virtio_gpu、ata、AC'97、tulip、rtl8125、usbmsc、usbnet（この構成に無い）。聞こえる音。S3 からの戻り（WHPX）。

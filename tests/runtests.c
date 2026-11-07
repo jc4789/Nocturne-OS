@@ -101,6 +101,9 @@ static const struct test tests[] = {
 
     /* filesystems */
     {"fs", "store", "tcc -o .\\fstest C:\\Tests\\fstest.c && .\\fstest C:\\Tests\\fstest", 0, {"fstest: 0 failed"}, "FAIL", 180},
+    {"fs", "disk-dma",
+     "tcc -o .\\dmadisktest C:\\Tests\\dmadisktest.c && .\\dmadisktest write C:\\Tests\\dma && .\\dmadisktest check C:\\Tests\\dma",
+     0, {"dmadisktest: 0 failed"}, "FAIL", 180},
 
     /* Host cross-built C++ application, using the native C startup and APIs. */
     {"cxx", "native-runtime", "cppdemo --self-test", 0,
