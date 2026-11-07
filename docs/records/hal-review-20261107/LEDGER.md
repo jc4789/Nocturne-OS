@@ -70,8 +70,8 @@
 | H53 | SMBus の制御器（q35 の 8086:2930）に実装が無い。設定の窓は PCI の class だけで種類を言い、SMBus（0Ch の 05h）を「USB などのバス」と書く | `kernel/src/dev/`、`user/apps/settings.c` の `hardware_kind` | 未 |
 | H54 | usbhid の起動の行の文が崩れる（「is a absolute pointer」） | `kernel/src/dev/usbhid.c` | 直 |
 | H55 | 利用者に英語が見える：端末の窓の題と案内の行、メモ帳（「untitled - Text Editor」、New・Open・Save・Save as）、ファイルの窓の保存（Up・Home・New folder・Save・Cancel・Name・Size・Type）、音の出口の名「line out」（カーネルの codec の pin の内部の値を窓が出す） | `user/apps/`、`kernel/src/dev/hda_codec.c`、`user/apps/settings.c` | 未 |
-| H56 | `audiotest` の「1 s の音が 948 ms で鳴り終わった」（下限 950 ms）。段 D の媒体で四回のうち一回（948、971、1032、972 ms）。前の記録も前の写しも無く、退行かどうかは確かめていない | `tests/audiotest.c:148`、`user/apps/audio.c`、`kernel/src/dev/hda.c` | 未 |
-| H57 | ブラウザー：ja.wikipedia.org の頁で `getItem`・`removeItem` を undefined から読む TypeError と、jqueryMsg の解析の誤り（F12 の console）。段 D は実装だけを変えたので、この組の前からのものと見込むが、前の写しで比べていない | `user/libc/web/`、`user/libc/webstorage.c` | 未 |
+| H56 | `audiotest` の「1 s の音が 948 ms で鳴り終わった」（下限 950 ms）。段 D の媒体で四回のうち一回（948、971、1032、972 ms）。`n_audio_close` は出口の位置（HDA の LPIB から `user/apps/audio.c` の heard）が流れの終わりを過ぎるまで待つ。段 D の hda の差分は位置の道に触れていない（整形だけ）。前の記録も前の写しも無く、原因は確かめていない | `tests/audiotest.c:148`、`user/apps/audio.c`、`kernel/src/dev/hda.c` | 未 |
+| H57 | ブラウザー：ja.wikipedia.org の頁で `getItem`・`removeItem` を undefined から読む TypeError と、jqueryMsg の解析の誤り（F12 の console）。F12 で `localStorage` を読むと「UnknownError: Native storage read/write failed」。`AppData\Browser` に `storage` が無く、`AppData\Temp\Browser\storage` に同じ名の `.0`・`.2`・`.3`・`.4` がある。新しい C: の最初の頁でも起きる | `user/libc/web/`、`user/libc/webstorage.c` | 未 |
 
 ## 2. 実装ごとの事実
 
