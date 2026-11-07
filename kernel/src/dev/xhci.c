@@ -15,7 +15,11 @@
  * vector, where the controller and the PCI layer give that many; with fewer they share.
  *
  * 電源（hal/hal.h の契約、下の「眠り」の節）。眠りと休止の写しでは装置を残す形で止め（4.15、4.23.2）、状態を保った装置は
- * 戻りの後も同じ装置として残る。状態を失った装置は去り、つながっていれば数え直される。 */
+ * 戻りの後も同じ装置として残る。状態を失った装置は去り、つながっていれば数え直される。
+ *
+ * DMA（hal/hal.h）。制御器が届く番地の幅は AC64 が言い、attach が HAL に言う。制御器に渡すメモリー（輪、文脈、
+ * Scratchpad、転送の緩衝）は全部 hal_dma_alloc で取り、制御器へ書く番地はその bus だけ。呼ぶ側のメモリーは制御器に
+ * 渡さない：usb_control、usb_bulk、usb_send は自分の緩衝へ写し、stream の報告は緩衝の中を指す。 */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/irq.h"
@@ -24,7 +28,6 @@
 #include "dev/usb.h"
 #include "hal/hal.h"
 #include "mm/heap.h"
-#include "mm/pmm.h"
 #include "sys/alarm.h"
 #include "sys/clock.h"
 #include "sys/thread.h"
@@ -33,6 +36,13 @@
 #define RING_TRBS 256 /* one page; the last entry links back to the first */
 #define EV_PAGES 4    /* each event ring: one contiguous segment */
 #define EV_TRBS (EV_PAGES * 256)
+/* 構造の大きさ（Table 6-1）。hal_dma_alloc の番地は大きさ以上の 2 の冪の頁に揃う：一頁の構造は頁を、16 頁までの構造は
+   64 KiB の境を跨がない。PAGESIZE が 4 KiB より大きい制御器でも、頁に揃った一頁は一つの PAGESIZE の中にある。 */
+#define RING_BYTES (RING_TRBS * sizeof(struct trb)) /* 輪の segment：64 KiB の境を跨がない */
+#define EV_BYTES (EV_PAGES * 4096)                  /* 事象の輪の segment：同じ */
+#define CTX_BYTES 4096 /* 装置の文脈（32 個）と入力の文脈（33 個）：64 バイトの文脈でも PAGESIZE を跨がない */
+#define DCBAA_BYTES (256 * sizeof(uint64_t)) /* MaxSlotsEn + 1 項まで、PAGESIZE を跨がない（6.1） */
+#define XFER_BYTES 4096                      /* 装置ごとの制御の data stage の緩衝 */
 
 struct trb {
     uint64_t param;
@@ -143,7 +153,7 @@ enum ring_kind { RING_CONTROL, RING_PERIODIC, RING_BULK, RING_KINDS };
 
 struct ring {
     struct trb *trb;
-    uint64_t phys, bus; /* where the CPU reaches it, and what the controller is told (bus_of) */
+    uint64_t bus; /* 制御器に言う番地（hal_dma_alloc） */
     unsigned enq;
     uint32_t cycle;
 };
@@ -176,8 +186,7 @@ struct endpoint {
                                          OUT: its NAK rate (6.2.3.6) */
     unsigned mps, esit;
     uint8_t *buf; /* contiguous DMA area: `count` transfers `stride` bytes apart */
-    uint64_t buf_phys, buf_bus;
-    unsigned pages;
+    uint64_t buf_bus;
     unsigned len;           /* bytes per transfer (streams: as usb_stream_start's caller says) */
     unsigned stride, count;
     uint32_t busy;          /* transfers in flight */
@@ -207,13 +216,13 @@ struct xdev {
     unsigned ninterfaces;
     bool published; /* dev.hal is in the tree: release_slot removes it */
     uint8_t *out_ctx, *in_ctx;
-    uint64_t out_phys, in_phys;
+    uint64_t out_bus, in_bus;
     struct ring ep0;
     uint8_t ep0_state;  /* EP_RUNNING, ... under ctl_lock */
     uint8_t speed_id;   /* the Slot Context's Speed: the port's own Protocol Speed ID (7.2.2.1) */
     uint16_t ep0_mps;
     uint8_t *xfer; /* control transfer bounce page */
-    uint64_t xfer_phys;
+    uint64_t xfer_bus;
     struct mutex in_mutex;    /* in_ctx, from the first field written until the command that reads it ends;
                                  before cmd_mutex */
     struct mutex ctl_mutex;   /* one control transfer at a time: ep0, xfer, ctl_broken */
@@ -238,9 +247,9 @@ struct interrupter {
     volatile uint8_t *regs;
     struct spinlock lock; /* the ring's dequeue side: one drain at a time */
     struct trb *ev;
-    uint64_t ev_phys, ev_bus;
+    uint64_t ev_bus;
     uint64_t *erst;
-    uint64_t erst_phys, erst_bus;
+    uint64_t erst_bus;
     unsigned ev_idx;
     uint32_t ev_cycle;
     struct irq *irq;     /* its MSI or MSI-X message, or the INTx line; NULL when polled */
@@ -255,10 +264,12 @@ struct usb_hc {
     volatile uint32_t *db;
     unsigned max_slots, max_ports, max_intrs, ctx_size;
     bool lec;      /* Large ESIT Payload (HCCPARAMS2, 5.3.9) */
+    /* 64 bit の番地を持つ（HCCPARAMS1、Table 5-13）。無ければ番地は 32 bit で、番地の register は Dword で書く */
+    bool ac64;
     uint64_t *dcbaa;
-    uint64_t dcbaa_phys;
+    uint64_t dcbaa_bus;
     uint64_t bar_size;
-    uint64_t scratch_phys; /* kept across a restart, like the rings */
+    uint64_t scratch_bus; /* Scratchpad の配列（DCBAA の項 0、4.20）。0：要らない。輪と同じく立て直しをまたいで保つ */
     struct ring cmd;
     struct mutex cmd_mutex;   /* one command at a time: the command ring and CRCR */
     struct spinlock cmd_lock; /* the result below, against the drain */
@@ -309,7 +320,14 @@ static unsigned controllers; /* atomic: the indexes given */
 
 static inline uint32_t rd32(volatile uint8_t *b, unsigned off) { return mmio_read32(b + off); }
 static inline void wr32(volatile uint8_t *b, unsigned off, uint32_t v) { mmio_write32(b + off, v); }
-static inline void wr64(volatile uint8_t *b, unsigned off, uint64_t v) { mmio_write64(b + off, v); } /* 5.1.1 */
+/* 番地を持つ 64 bit の register（5.1.1）：AC64 の制御器は Qword で一度に書き、無い制御器は Dword だけで書く（上の Dword
+   は使われない）。 */
+static void wr_address(const struct usb_hc *hc, volatile uint8_t *b, unsigned off, uint64_t v) {
+    if (hc->ac64)
+        mmio_write64(b + off, v);
+    else
+        mmio_write32(b + off, (uint32_t)v);
+}
 #define barrier() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 
 static bool hc_running(const struct usb_hc *hc) { return __atomic_load_n(&hc->running, __ATOMIC_ACQUIRE); }
@@ -362,7 +380,7 @@ static bool sleep_locked(struct wait_queue *wq, struct spinlock *lock, uint64_t 
 }
 
 static void ring_reset(struct ring *r) {
-    memset(r->trb, 0, 4096);
+    memset(r->trb, 0, RING_BYTES);
     r->enq = 0;
     r->cycle = 1;
     r->trb[RING_TRBS - 1].param = r->bus;
@@ -370,8 +388,7 @@ static void ring_reset(struct ring *r) {
 }
 
 static bool ring_init(const struct usb_hc *hc, struct ring *r) {
-    if (!(r->trb = dma_page(&r->phys))) return false;
-    r->bus = bus_of(hc, r->phys);
+    if (!(r->trb = hal_dma_alloc(hc->hal, RING_BYTES, &r->bus))) return false;
     ring_reset(r);
     return true;
 }
@@ -659,7 +676,7 @@ static void drain(struct interrupter *ir, uint64_t at, bool in_interrupt) {
         }
         any = true;
     }
-    if (any || in_interrupt) wr64(ir->regs, ERDP, (ir->ev_bus + ir->ev_idx * sizeof(struct trb)) | ERDP_EHB);
+    if (any || in_interrupt) wr_address(hc, ir->regs, ERDP, (ir->ev_bus + ir->ev_idx * sizeof(struct trb)) | ERDP_EHB);
 }
 
 /* The INTx pin's assertion is the interrupter's when it may interrupt and has one pending (IMAN,
@@ -775,16 +792,15 @@ static int hc_command(struct usb_hc *hc, uint64_t param, uint32_t control, uint8
             r = hc->cmd_cc;
         } else if (hc_running(hc)) {
             kprintf("usb: controller %d command %u timed out\n", hc->index, (control >> 10) & 63);
-            /* abort it so the commands queued after it can run: the ring stops with a Command Ring
-               Stopped completion (4.6.1.2), and goes on from there at the next doorbell. The one
-               64-bit write CRCR takes (5.1.1): bits 5:4 kept, its pointer and cycle ignored while
-               the ring runs (5.4.5). A ring not running has nothing to abort, and a command it
-               never answered; one that does not stop neither: the controller is reset (4.6.1.2). */
+            /* 後に積んだ命令が走るよう止める：輪は Command Ring Stopped の完了で止まり（4.6.1.2）、次の doorbell で
+               そこから進む。CRCR は一度の書きで（5.1.1、wr_address）：bit 5:4 は保ち、指と cycle は輪が走る間は
+               見られない（5.4.5）。走っていない輪には止めるものも、答えない命令も無い。止まらない輪も同じで、
+               制御器を reset する（4.6.1.2）。 */
             f = spin_lock(&hc->cmd_lock);
             hc->cmd_stopped = false;
             spin_unlock(&hc->cmd_lock, f);
             uint32_t crcr = rd32(hc->op, CRCR);
-            if (crcr & CRCR_CRR) wr64(hc->op, CRCR, (crcr & CRCR_RSVDP) | CRCR_CA);
+            if (crcr & CRCR_CRR) wr_address(hc, hc->op, CRCR, (crcr & CRCR_RSVDP) | CRCR_CA);
             if (!(crcr & CRCR_CRR) || !command_wait(hc, &hc->cmd_stopped, clock_after(COMMAND_ABORT_NS))) {
                 kprintf("usb: controller %d command ring does not stop\n", hc->index);
                 __atomic_store_n(&hc->wedged, true, __ATOMIC_RELEASE);
@@ -925,9 +941,9 @@ static bool control_recover(struct xdev *xd) {
     return false;
 }
 
-/* ctl_mutex held. mem, phys: the data stage's memory, not the controller's any more if *over is set. */
+/* ctl_mutex の下。mem と bus：data stage のメモリーとその番地。*over が立てば、もう制御器のものではない。 */
 static int control(struct xdev *xd, uint8_t type, uint8_t request, uint16_t value, uint16_t index, void *buffer,
-                   uint16_t length, uint8_t *mem, uint64_t phys, bool *over) {
+                   uint16_t length, uint8_t *mem, uint64_t bus, bool *over) {
     struct usb_device *d = &xd->dev;
     struct usb_hc *hc = d->hc;
     *over = true;
@@ -940,7 +956,7 @@ static int control(struct xdev *xd, uint8_t type, uint8_t request, uint16_t valu
     xd->ctl_done = false;
     xd->ctl_residual = 0;
     struct trb *first = ring_hold(&xd->ep0, setup, 8, TRB_TYPE(TRB_SETUP) | TRB_IDT | (length ? (in ? 3u : 2u) << 16 : 0), NULL);
-    if (length) ring_push(&xd->ep0, bus_of(hc, phys), length, TRB_TYPE(TRB_DATA) | TRB_ISP | (in ? TRB_DIR_IN : 0));
+    if (length) ring_push(&xd->ep0, bus, length, TRB_TYPE(TRB_DATA) | TRB_ISP | (in ? TRB_DIR_IN : 0));
     xd->ctl_status_trb = ring_push(&xd->ep0, 0, 0, TRB_TYPE(TRB_STATUS) | TRB_IOC | (length && in ? 0 : TRB_DIR_IN));
     ring_release(first);
     xd->ep0_state = EP_RUNNING;
@@ -967,22 +983,22 @@ static int control(struct xdev *xd, uint8_t type, uint8_t request, uint16_t valu
     return got;
 }
 
-/* A data stage that does not fit the device's page has 64 KiB of its own, all of wLength (USB 2.0
-   9.3.5), aligned as they are, so one TRB may cover it (6.4.1); kept if the controller may still
-   be using it. */
-#define CONTROL_LONG_PAGES 16
+/* 装置の緩衝に入らない data stage は、wLength の全部（USB 2.0 9.3.5）の 64 KiB を自分で持つ。hal_dma_alloc の揃えで
+   64 KiB の境を跨がず、一つの TRB に入る（6.4.1）。制御器がまだ使うかもしれなければ返さない（HAL が detach の後に返す）。 */
+#define CONTROL_LONG_BYTES 0x10000
 
 int usb_control(struct usb_device *d, uint8_t type, uint8_t request, uint16_t value, uint16_t index,
                 void *buffer, uint16_t length) {
     struct xdev *xd = (struct xdev *)d;
-    bool lng = length > 4096, over;
-    uint64_t phys = xd->xfer_phys;
-    uint8_t *mem = lng ? dma_block(CONTROL_LONG_PAGES, &phys) : xd->xfer;
+    struct hal_device *hal = d->hc->hal;
+    bool lng = length > XFER_BYTES, over;
+    uint64_t bus = xd->xfer_bus;
+    uint8_t *mem = lng ? hal_dma_alloc(hal, CONTROL_LONG_BYTES, &bus) : xd->xfer;
     if (!mem) return -1;
     mutex_lock(&xd->ctl_mutex);
-    int r = control(xd, type, request, value, index, buffer, length, mem, phys, &over);
+    int r = control(xd, type, request, value, index, buffer, length, mem, bus, &over);
     mutex_unlock(&xd->ctl_mutex);
-    if (lng && over) dma_free(phys, CONTROL_LONG_PAGES);
+    if (lng && over) hal_dma_free(hal, mem);
     return r;
 }
 
@@ -1008,24 +1024,18 @@ static unsigned address_dci(uint8_t address) { return (address & 15) * 2 + ((add
 static void free_endpoint(struct usb_hc *hc, struct endpoint *ep) {
     if (!ep) return;
     if (ep->type == 3) __atomic_fetch_sub(&hc->periodic[ep->interval], 1, __ATOMIC_RELAXED);
-    if (ep->ring.trb) pmm_free(ep->ring.phys);
-    if (ep->buf) dma_free(ep->buf_phys, ep->pages);
+    if (ep->ring.trb) hal_dma_free(hc->hal, ep->ring.trb);
+    if (ep->buf) hal_dma_free(hc->hal, ep->buf);
     kfree(ep);
 }
 
-/* The DMA area for `count` transfers of `len` bytes, 64-byte aligned each. Before the endpoint
-   gets its mode, by the one thread that sets it. */
+/* len バイトの転送 count 個の DMA の区域。各転送は 64 バイトに揃う。端点が mode を得る前に、それを立てる一つの thread が
+   呼ぶ。区域の中の 64 KiB の境は endpoint_push が TRB を分けて越える（6.4.1）。 */
 static bool endpoint_buffer(const struct usb_hc *hc, struct endpoint *ep, unsigned len, unsigned count) {
     if (ep->buf) return ep->len >= len && ep->count >= count;
     if (!len || !count || count > EP_XFERS) return false;
-    unsigned stride = (len + 63) & ~63u, pages = (stride * count + 4095) / 4096;
-    uint64_t phys = pmm_alloc_contig(pages, 64);
-    if (!phys) return false;
-    ep->buf = phys_to_virt(phys);
-    memset(ep->buf, 0, pages * 4096ull);
-    ep->buf_phys = phys;
-    ep->buf_bus = bus_of(hc, phys);
-    ep->pages = pages;
+    unsigned stride = (len + 63) & ~63u;
+    if (!(ep->buf = hal_dma_alloc(hc->hal, (size_t)stride * count, &ep->buf_bus))) return false;
     ep->len = len;
     ep->stride = stride;
     ep->count = count;
@@ -1037,14 +1047,15 @@ static struct endpoint *find_endpoint(struct usb_device *d, uint8_t address) {
 }
 
 static void free_device(struct xdev *xd) {
+    struct hal_device *hal = xd->dev.hc->hal;
     kfree(xd->dev.product);
     kfree((void *)xd->dev.config);
     kfree(xd->interfaces);
     for (int i = 0; i < 32; i++) free_endpoint(xd->dev.hc, xd->ep[i]);
-    if (xd->out_ctx) pmm_free(xd->out_phys);
-    if (xd->in_ctx) pmm_free(xd->in_phys);
-    if (xd->ep0.trb) pmm_free(xd->ep0.phys);
-    if (xd->xfer) pmm_free(xd->xfer_phys);
+    if (xd->out_ctx) hal_dma_free(hal, xd->out_ctx);
+    if (xd->in_ctx) hal_dma_free(hal, xd->in_ctx);
+    if (xd->ep0.trb) hal_dma_free(hal, xd->ep0.trb);
+    if (xd->xfer) hal_dma_free(hal, xd->xfer);
     kfree(xd);
 }
 
@@ -1153,7 +1164,7 @@ static void endpoints_free(struct xdev *xd) {
 static bool open_endpoints(struct xdev *xd, const struct usb_ep_info *eps, int n) {
     struct usb_hc *hc = xd->dev.hc;
     mutex_lock(&xd->in_mutex);
-    memset(xd->in_ctx, 0, 4096);
+    memset(xd->in_ctx, 0, CTX_BYTES);
     uint32_t *icc = in_ctx(xd, 0);
     unsigned top = 1;
     uint32_t added = 0;
@@ -1211,7 +1222,7 @@ static bool open_endpoints(struct xdev *xd, const struct usb_ep_info *eps, int n
         slot_context(xd, top > entries ? top : entries, true);
         for (uint32_t m = added; m; m &= m - 1)
             __atomic_store_n(&xd->ep[__builtin_ctz(m)], made[__builtin_ctz(m)], __ATOMIC_RELEASE);
-        int cc = hc_command(hc, bus_of(hc, xd->in_phys), TRB_TYPE(TRB_CONFIGURE) | (uint32_t)xd->dev.slot << 24, NULL);
+        int cc = hc_command(hc, xd->in_bus, TRB_TYPE(TRB_CONFIGURE) | (uint32_t)xd->dev.slot << 24, NULL);
         if (cc == CC_SUCCESS) {
             mutex_unlock(&xd->in_mutex);
             return true;
@@ -1276,7 +1287,7 @@ static bool pipe_reset(struct xdev *xd, struct endpoint *ep) {
     }
     if (state_get(xd, dci) == EP_ERROR && !set_dequeue(xd, dci, &ep->ring)) return false;
     mutex_lock(&xd->in_mutex);
-    memset(xd->in_ctx, 0, 4096);
+    memset(xd->in_ctx, 0, CTX_BYTES);
     uint32_t *icc = in_ctx(xd, 0), *c = in_ctx(xd, dci + 1);
     icc[0] = 1u << dci;
     icc[1] = 1u | 1u << dci;
@@ -1285,7 +1296,7 @@ static bool pipe_reset(struct xdev *xd, struct endpoint *ep) {
     c[2] = (uint32_t)(ep->ring.bus + ep->ring.enq * sizeof(struct trb)) | ep->ring.cycle;
     c[3] = (uint32_t)((ep->ring.bus + ep->ring.enq * sizeof(struct trb)) >> 32);
     slot_context(xd, out_ctx(xd, 0)[0] >> 27, true);
-    int cc = hc_command(d->hc, bus_of(d->hc, xd->in_phys), TRB_TYPE(TRB_CONFIGURE) | slot << 24, NULL);
+    int cc = hc_command(d->hc, xd->in_bus, TRB_TYPE(TRB_CONFIGURE) | slot << 24, NULL);
     mutex_unlock(&xd->in_mutex);
     if (cc != CC_SUCCESS) {
         kprintf("usb: slot %u endpoint %u could not be reset (%d)\n", slot, dci, cc);
@@ -1602,7 +1613,7 @@ static uint8_t *choose_configuration(struct usb_device *d, int *got) {
    control). Its result as hc_command's. */
 static int address_device(struct xdev *xd) {
     mutex_lock(&xd->in_mutex);
-    memset(xd->in_ctx, 0, 4096);
+    memset(xd->in_ctx, 0, CTX_BYTES);
     uint32_t *icc = in_ctx(xd, 0), *ep0 = in_ctx(xd, 2);
     icc[1] = 3;
     slot_context(xd, 1, false);
@@ -1610,7 +1621,7 @@ static int address_device(struct xdev *xd) {
     ep0[2] = (uint32_t)(xd->ep0.bus + xd->ep0.enq * sizeof(struct trb)) | xd->ep0.cycle;
     ep0[3] = (uint32_t)((xd->ep0.bus + xd->ep0.enq * sizeof(struct trb)) >> 32);
     ep0[4] = 8;
-    int cc = hc_command(xd->dev.hc, bus_of(xd->dev.hc, xd->in_phys), TRB_TYPE(TRB_ADDRESS) | (uint32_t)xd->dev.slot << 24, NULL);
+    int cc = hc_command(xd->dev.hc, xd->in_bus, TRB_TYPE(TRB_ADDRESS) | (uint32_t)xd->dev.slot << 24, NULL);
     mutex_unlock(&xd->in_mutex);
     if (cc == CC_TRANSACTION_ERROR) tt_clear(xd, 0, 0, 0);
     return cc;
@@ -1770,10 +1781,11 @@ static struct xdev *device_attach(struct usb_hc *hc, struct usb_device *parent, 
                              .tt_slot = tt_slot, .tt_port = tt_port};
     xd->speed_id = (uint8_t)speed_id;
     xd->ep0_state = EP_RUNNING;
-    if (!(xd->out_ctx = dma_page(&xd->out_phys)) || !(xd->in_ctx = dma_page(&xd->in_phys)) ||
-        !ring_init(hc, &xd->ep0) || !(xd->xfer = dma_page(&xd->xfer_phys)))
+    if (!(xd->out_ctx = hal_dma_alloc(hc->hal, CTX_BYTES, &xd->out_bus)) ||
+        !(xd->in_ctx = hal_dma_alloc(hc->hal, CTX_BYTES, &xd->in_bus)) || !ring_init(hc, &xd->ep0) ||
+        !(xd->xfer = hal_dma_alloc(hc->hal, XFER_BYTES, &xd->xfer_bus)))
         goto fail;
-    hc->dcbaa[slot] = bus_of(hc, xd->out_phys);
+    hc->dcbaa[slot] = xd->out_bus;
     __atomic_store_n(&hc->slots[slot], xd, __ATOMIC_RELEASE);
 
     unsigned mps = speed >= USB_SPEED_SUPER ? 512 : speed == USB_SPEED_HIGH ? 64 : 8;
@@ -1796,7 +1808,7 @@ static struct xdev *device_attach(struct usb_hc *hc, struct usb_device *parent, 
         icc[0] = 0;
         icc[1] = 2;
         ep0[1] = 3u << 1 | 4u << 3 | mps << 16;
-        cc = hc_command(hc, bus_of(hc, xd->in_phys), TRB_TYPE(TRB_EVALUATE) | (uint32_t)slot << 24, NULL);
+        cc = hc_command(hc, xd->in_bus, TRB_TYPE(TRB_EVALUATE) | (uint32_t)slot << 24, NULL);
         mutex_unlock(&xd->in_mutex);
         if (cc != CC_SUCCESS) {
             kprintf("usb: port %u control packet size %u refused (%d)\n", port, mps, cc);
@@ -2188,8 +2200,8 @@ static void hc_take_ownership(struct usb_hc *hc) {
 }
 
 static void interrupter_free(struct interrupter *ir) {
-    if (ir->ev) dma_free(ir->ev_phys, EV_PAGES);
-    if (ir->erst) pmm_free(ir->erst_phys);
+    if (ir->ev) hal_dma_free(ir->hc->hal, ir->ev);
+    if (ir->erst) hal_dma_free(ir->hc->hal, ir->erst);
 }
 
 /* The interrupters, once: their memory, then as many as the kinds of events, the controller's MaxIntrs
@@ -2207,12 +2219,10 @@ static bool interrupters_init(struct usb_hc *hc) {
         ir->index = i;
         ir->regs = hc->rt + IR_SET(i);
         specs[i] = (struct irq_spec){.name = "xHCI", .handler = xhci_isr, .context = ir};
-        /* the event ring segment must not cross a 64 KiB boundary (6.0, Table 6-1) */
-        if ((ir->ev = dma_block(EV_PAGES, &ir->ev_phys)) && (ir->erst = dma_page(&ir->erst_phys))) {
-            ir->ev_bus = bus_of(hc, ir->ev_phys);
-            ir->erst_bus = bus_of(hc, ir->erst_phys);
+        /* 事象の輪の一つの segment と、それを指す一項の表（6.5） */
+        if ((ir->ev = hal_dma_alloc(hc->hal, EV_BYTES, &ir->ev_bus)) &&
+            (ir->erst = hal_dma_alloc(hc->hal, 2 * sizeof *ir->erst, &ir->erst_bus)))
             continue;
-        }
         for (unsigned j = 0; j <= i; j++) interrupter_free(&intr[j]);
         kfree(intr);
         return false;
@@ -2255,23 +2265,50 @@ static bool hc_run(struct usb_hc *hc) {
 
 /* An interrupter's ring empty and in place (4.9.4: ERSTBA last). */
 static void interrupter_start(struct usb_hc *hc, struct interrupter *ir) {
-    memset(ir->ev, 0, EV_PAGES * 4096);
+    memset(ir->ev, 0, EV_BYTES);
     ir->erst[0] = ir->ev_bus;
     ir->erst[1] = EV_TRBS;
     ir->ev_idx = 0;
     ir->ev_cycle = 1;
     ir->interrupts = 0;
     wr32(ir->regs, ERSTSZ, 1);
-    wr64(ir->regs, ERDP, ir->ev_bus);
-    wr64(ir->regs, ERSTBA, ir->erst_bus);
+    wr_address(hc, ir->regs, ERDP, ir->ev_bus);
+    wr_address(hc, ir->regs, ERSTBA, ir->erst_bus);
     wr32(ir->regs, IMOD, interrupter_imod(hc, ir));
     wr32(ir->regs, IMAN, interrupter_iman(hc));
 }
 
+/* Scratchpad（4.20）：Max Scratchpad Buffers の数（5.3.4）の、PAGESIZE（5.4.3：一番小さい 2^(n+12) バイト）の緩衝と、
+   その番地の配列。緩衝は大きさが 2 の冪の頁なので、hal_dma_alloc の揃えで PAGESIZE の境に乗り、0 で埋まっている。
+   配列は Table 6-1 では 248 バイトで PAGESIZE を跨がないが、項は 1023 まである（5.3.4、6.6）：512 項までは一頁に入り、
+   それより多い配列は二つの文が合わず、頁を跨ぐ。制御器は配列と緩衝をキャッシュを覗かずに読み書きする（4.18.2.2）：
+   CPU が書いた 0 と番地を書き戻して捨ててから渡す（後で書き戻る CPU の行が制御器の状態を潰さない）。 */
+static bool scratchpad_init(struct usb_hc *hc, unsigned count) {
+    uint32_t pagesize = rd32(hc->op, PAGESIZE) & 0xFFFF;
+    size_t bytes = (size_t)4096 << (pagesize ? __builtin_ctz(pagesize) : 0);
+    void **buffers = kmalloc(count * sizeof *buffers); /* 失敗したとき返すため */
+    uint64_t bus = 0;
+    uint64_t *array = buffers ? hal_dma_alloc(hc->hal, count * sizeof *array, &bus) : NULL;
+    unsigned made = 0;
+    while (array && made < count && (buffers[made] = hal_dma_alloc(hc->hal, bytes, &array[made]))) {
+        cpu_cache_flush(buffers[made], bytes);
+        made++;
+    }
+    bool whole = made == count;
+    if (whole) {
+        cpu_cache_flush(array, count * sizeof *array);
+        hc->scratch_bus = bus;
+    } else {
+        while (made) hal_dma_free(hc->hal, buffers[--made]);
+        if (array) hal_dma_free(hc->hal, array);
+    }
+    kfree(buffers);
+    return whole;
+}
+
 static bool hc_start(struct usb_hc *hc) {
     struct pci_device *pci = hc->pci;
-    /* the capability, operational, runtime, doorbell and extended registers, all in its BAR, mapped by attach */
-    hal_enable(hc->hal, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA);
+    /* capability、operational、runtime、doorbell、拡張の register は全部 BAR の中にあり、attach が写して答えさせた */
     hc->op = hc->cap + (rd32(hc->cap, 0) & 0xFF);
     uint32_t hcs1 = rd32(hc->cap, 4), hcs2 = rd32(hc->cap, 8), hcc1 = rd32(hc->cap, 0x10);
     hc->max_slots = hcs1 & 0xFF;
@@ -2317,38 +2354,19 @@ static bool hc_start(struct usb_hc *hc) {
         return false;
     }
     /* a restart after a fatal error reuses the memory: the reset took it back from the controller */
-    if (hc->dcbaa) memset(hc->dcbaa, 0, 4096);
-    else if (!(hc->dcbaa = dma_page(&hc->dcbaa_phys))) return false;
+    if (hc->dcbaa)
+        memset(hc->dcbaa, 0, DCBAA_BYTES);
+    else if (!(hc->dcbaa = hal_dma_alloc(hc->hal, DCBAA_BYTES, &hc->dcbaa_bus)))
+        return false;
     if (hc->cmd.trb) ring_reset(&hc->cmd);
     else if (!ring_init(hc, &hc->cmd)) return false;
     if (!hc->intr && !interrupters_init(hc)) return false;
     unsigned scratch = ((hcs2 >> 21) & 0x1F) << 5 | hcs2 >> 27;
-    if (scratch && !hc->scratch_phys) {
-        /* buffers of its PAGESIZE, 2^(n+12) bytes on that boundary, zeroed (5.4.3, 4.20). The array has as
-           many entries as Max Scratchpad Buffers says, Hi and Lo (5.3.4, 4.20, 6.6), up to 1023: two pages
-           aligned as a pair. Table 6-1 gives it at most 248 bytes, and within a PAGESIZE; the two do not agree
-           for the largest, and this holds them all, within a PAGESIZE up to 512. */
-        uint32_t pagesize = rd32(hc->op, PAGESIZE) & 0xFFFF;
-        unsigned pages = pagesize ? 1u << __builtin_ctz(pagesize) : 1;
-        uint64_t array_phys;
-        uint64_t *array = dma_block(2, &array_phys);
-        if (!array) return false;
-        for (unsigned i = 0; i < scratch; i++) {
-            uint64_t page = pmm_alloc_contig(pages, 64);
-            if (!page) {
-                while (i) dma_free(phys_of(hc, array[--i]), pages);
-                dma_free(array_phys, 2);
-                return false;
-            }
-            memset(phys_to_virt(page), 0, pages * 4096ull);
-            array[i] = bus_of(hc, page);
-        }
-        hc->scratch_phys = array_phys;
-    }
-    hc->dcbaa[0] = hc->scratch_phys ? bus_of(hc, hc->scratch_phys) : 0;
+    if (scratch && !hc->scratch_bus && !scratchpad_init(hc, scratch)) return false;
+    hc->dcbaa[0] = hc->scratch_bus;
     wr32(hc->op, CONFIG, (rd32(hc->op, CONFIG) & ~0xFFu) | hc->max_slots);
-    wr64(hc->op, DCBAAP, bus_of(hc, hc->dcbaa_phys));
-    wr64(hc->op, CRCR, hc->cmd.bus | 1);
+    wr_address(hc, hc->op, DCBAAP, hc->dcbaa_bus);
+    wr_address(hc, hc->op, CRCR, hc->cmd.bus | 1);
     for (unsigned i = 0; i < hc->nintr; i++) interrupter_start(hc, &hc->intr[i]);
     if (!hc_run(hc)) {
         kprintf("usb: controller %d did not start\n", hc->index);
@@ -2373,9 +2391,14 @@ static bool hc_start(struct usb_hc *hc) {
     for (unsigned p = 1; p <= hc->max_ports; p++)
         if (hc->port_major[p]) __atomic_fetch_or(&hc->port_pending[p >> 5], 1u << (p & 31), __ATOMIC_RELEASE);
     bool polled = __atomic_load_n(&hc->polled, __ATOMIC_ACQUIRE);
-    kprintf("usb: xHCI %d (%04x:%04x) version %x, %u ports, %u slots, %u interrupter%s of %u, %s\n", hc->index,
-            pci->vendor, pci->device, rd32(hc->cap, 0) >> 16, hc->max_ports, hc->max_slots, hc->nintr,
-            hc->nintr > 1 ? "s" : "", hc->max_intrs, polled ? "polled" : !hc->messages ? "INTx" : pci->msi_count ? "MSI" : "MSI-X");
+    kprintf("usb: xHCI %d (%04x:%04x) version %x, %u ports, %u slots, %u interrupter%s of %u, %s, %u-bit DMA\n",
+            hc->index, pci->vendor, pci->device, rd32(hc->cap, 0) >> 16, hc->max_ports, hc->max_slots, hc->nintr,
+            hc->nintr > 1 ? "s" : "", hc->max_intrs,
+            polled           ? "polled"
+            : !hc->messages  ? "INTx"
+            : pci->msi_count ? "MSI"
+                             : "MSI-X",
+            hc->ac64 ? 64 : 32);
     for (unsigned i = 0; i < hc->nintr && !polled; i++) {
         struct irq_target to = irq_target(hc->intr[i].irq);
         kprintf("usb: controller %d interrupter %u (%s) on cpu %u vector 0x%x\n", hc->index, i,
@@ -2714,13 +2737,13 @@ static bool hc_restore(struct usb_hc *hc) {
         return false;
     }
     hc_take_ownership(hc);
-    wr64(hc->op, DCBAAP, bus_of(hc, hc->dcbaa_phys));
+    wr_address(hc, hc->op, DCBAAP, hc->dcbaa_bus);
     wr32(hc->op, CONFIG, (rd32(hc->op, CONFIG) & ~0xFFu) | hc->max_slots);
     for (unsigned i = 0; i < hc->nintr; i++) {
         struct interrupter *ir = &hc->intr[i];
         wr32(ir->regs, ERSTSZ, 1);
-        wr64(ir->regs, ERSTBA, ir->erst_bus);
-        wr64(ir->regs, ERDP, ir->ev_bus + ir->ev_idx * sizeof(struct trb));
+        wr_address(hc, ir->regs, ERSTBA, ir->erst_bus);
+        wr_address(hc, ir->regs, ERDP, ir->ev_bus + ir->ev_idx * sizeof(struct trb));
         wr32(ir->regs, IMAN, interrupter_iman(hc));
         wr32(ir->regs, IMOD, interrupter_imod(hc, ir));
     }
@@ -2734,18 +2757,20 @@ static bool hc_restore(struct usb_hc *hc) {
     }
     mutex_lock(&hc->cmd_mutex);
     ring_reset(&hc->cmd);
-    wr64(hc->op, CRCR, hc->cmd.bus | 1);
+    wr_address(hc, hc->op, CRCR, hc->cmd.bus | 1);
     mutex_unlock(&hc->cmd_mutex);
     return true;
 }
 
 /* 止めた制御器を走らせ直す：止めたままの状態を持つ時と、Save State から戻せた時。D3cold を通らなければ内の状態は
    残り、Restore State は要らない（4.23.2）。D3hot から D0 への移りと HCRST は Core の電源の側のレジスターを既定に
-   戻す（4.23.1）：DCBAAP が自分の DCBAA を指していなければ、レジスターは失われた。 */
+   戻す（4.23.1）：DCBAAP が自分の DCBAA を指していなければ、レジスターは失われた。AC64 の無い制御器の上の Dword は
+   読まない（Table 5-13）。 */
 static bool hc_wake(struct usb_hc *hc) {
     uint32_t sts = rd32(hc->op, USBSTS);
     if (sts == 0xFFFFFFFFu) return false;
-    bool kept = (sts & STS_HCH) && mmio_read64(hc->op + DCBAAP) == bus_of(hc, hc->dcbaa_phys);
+    uint64_t dcbaap = hc->ac64 ? mmio_read64(hc->op + DCBAAP) : rd32(hc->op, DCBAAP);
+    bool kept = (sts & STS_HCH) && dcbaap == hc->dcbaa_bus;
     if (!kept && !(hc->saved && hc_restore(hc))) return false;
     if (hc_run(hc)) return true;
     kprintf("usb: controller %d did not start after sleep\n", hc->index);
@@ -2822,6 +2847,11 @@ static int xhci_attach(struct hal_device *d) {
         kfree(hc);
         return -N_ERR_NO_MEMORY;
     }
+    /* register の窓に答えさせ、メモリーへ読み書きさせる。届く番地の幅は AC64（HCCPARAMS1 の bit 0、Table 5-13）で、
+       DMA のメモリーを取る前に HAL へ言う */
+    hal_enable(d, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA);
+    hc->ac64 = rd32(hc->cap, 0x10) & 1;
+    hal_dma_bits(d, hc->ac64 ? 64 : 32);
     d->driver_data = hc;
     alarm_init(&hc->poll, poll_fire);
     hal_looking_begin();
