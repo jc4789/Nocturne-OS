@@ -642,7 +642,6 @@ static const struct n_hal_rule boot_screen_rules[] = {N_FIXED("boot-screen")};
 static const struct hal_driver boot_screen_driver = {.name = "firmware-screen", .rules = boot_screen_rules,
                                                      .rule_count = ARRAY_SIZE(boot_screen_rules),
                                                      .attach = boot_screen_attach, .detach = boot_screen_detach,
-                                                     .cold_ok = true};
 HAL_DRIVER(boot_screen_driver);
 
 void fb_publish(void) {

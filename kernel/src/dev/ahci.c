@@ -255,9 +255,6 @@ static void hba_wr(struct hba *h, unsigned off, uint32_t v) { mmio_write32(h->re
 static uint32_t rd(struct port *p, unsigned off) { return mmio_read32(p->regs + off); }
 static void wr(struct port *p, unsigned off, uint32_t v) { mmio_write32(p->regs + off, v); }
 
-/* With interrupts off (a power change) nothing may sleep: waits spin on the clock instead. */
-static bool may_sleep(void) { return read_rflags() & 0x200; }
-
 /* Until (register & mask) == want, for up to ns: looked at each millisecond, or spinning. */
 static bool wait_mmio(volatile uint8_t *reg, uint32_t mask, uint32_t want, uint64_t ns) {
     bool sleeps = may_sleep();
@@ -1516,61 +1513,6 @@ static void port_to_listen(struct port *p) {
     wr(p, PxCMD, rd(p, PxCMD) & ~CMD_SUD);
 }
 
-/* Before the power goes away: the cache on the medium and the disk spun down (STANDBY IMMEDIATE),
-   so a hard disk parks its heads and does not count an emergency stop; a port an error left down is
-   set up for that first, spinning; then the engines stopped, of every port (they all receive FISes),
-   no DMA after this. Interrupts are already off, and blk_hold let no request in. A disk that is gone
-   and a dead adapter hold nothing that could be kept. An adapter reset on the way leaves every port
-   unverified, so no later port is set up again, or given a command. */
-static bool ahci_quiesce(struct hal_device *d) {
-    struct hba *h = d->driver_data;
-    bool all = true;
-    for (unsigned n = 0; n < PORTS; n++) {
-        struct port *p = h->ports[n];
-        if (!p || __atomic_load_n(&h->dead, __ATOMIC_ACQUIRE)) continue;
-        struct disk *disk = p->disk;
-        if (disk && !__atomic_load_n(&disk->blk.gone, __ATOMIC_ACQUIRE)) {
-            uint8_t fis[20];
-            fis_make(fis, ATA_STANDBY_IMMEDIATE, 0, 0, false, false);
-            fis[7] = 0;
-            if ((__atomic_load_n(&disk->cache, __ATOMIC_ACQUIRE) && flush(disk)) ||
-                command(disk, fis, false, true, false, NULL, 0, READY_NS))
-                all = false;
-            else
-                port_to_slumber(p);
-        }
-        if (port_stop(p)) {
-            port_to_listen(p);
-        } else {
-            port_force_stop(p);
-            all = false;
-        }
-        uint64_t f = spin_lock(&p->lock);
-        p->live = false;
-        p->need_reset = true;
-        spin_unlock(&p->lock, f);
-    }
-    return all;
-}
-
-/* After a sleep the adapter has lost its state, the firmware may own it again, and the disks may have
-   changed. All of that takes waiting, and resume must not wait: the next command, or the adapter's
-   thread, sets it up again (hba_set_up in port_start). */
-static bool ahci_resume(struct hal_device *d) {
-    struct hba *h = d->driver_data;
-    if (!h->regs) return true;
-    __atomic_store_n(&h->lost, true, __ATOMIC_RELEASE);
-    for (unsigned n = 0; n < PORTS; n++) {
-        struct port *p = h->ports[n];
-        if (!p) continue;
-        uint64_t f = spin_lock(&p->lock);
-        p->unverified = true;
-        spin_unlock(&p->lock, f);
-    }
-    hba_look_all(h);
-    return true;
-}
-
 static int ahci_attach(struct hal_device *d) {
     struct hba *h = kzalloc(sizeof *h);
     if (!h) {
@@ -1626,7 +1568,5 @@ static const struct hal_driver ahci_driver = {
     .rule_count = ARRAY_SIZE(ahci_rules),
     .attach = ahci_attach,
     .detach = ahci_detach,
-    .quiesce = ahci_quiesce,
-    .resume = ahci_resume,
 };
 HAL_DRIVER(ahci_driver);

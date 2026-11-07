@@ -61,8 +61,6 @@ struct hal_bus_ops {
    HAL が割り込みを切り、DMA を止め、DMA のメモリーを返す。
    detach：装置が去る、または手放す。自分が hal_publish した子を hal_remove してから返る。戻った後、割り込みと DMA は
    HAL が片づける。NULL の実装は装置が去らないバスの上だけで動く。
-   quiesce：DMA と割り込みを止める。false は止められなかった（眠りを取りやめる）。NULL は止めるものが無い。
-   resume：眠りから戻す。false は戻らなかった。NULL は戻れない（その間、機械は眠らない）。
    refuse：今は眠れない理由（ログのため）か NULL。眠りのたびに聞く。
    cold_ok：resume が無くても、次の起動の後に元どおりになる（休止は妨げない）。 */
 #define HAL_DECLINE 1
@@ -72,10 +70,7 @@ struct hal_driver {
     uint32_t rule_count;
     int (*attach)(struct hal_device *d);
     void (*detach)(struct hal_device *d);
-    bool (*quiesce)(struct hal_device *d);
-    bool (*resume)(struct hal_device *d);
     const char *(*refuse)(struct hal_device *d);
-    bool cold_ok;
 };
 #define HAL_DRIVER(driver) \
     static const struct hal_driver *const driver##_entry __attribute__((used, section(".hal_drivers"))) = &driver
@@ -202,12 +197,9 @@ bool hal_driver_exists(const struct n_hal_prop *props, uint32_t count, const uin
 
 /* ---- 電源（dev/pm.c だけが呼ぶ） ----
    hal_power_begin は新しい attach と変更を止め、進行中のものを待ち、止める順の列を作る。hal_power_end で開く。
-   間の hal_quiesce_all と hal_resume_all は列を錠なしで辿るので、割り込みを切っても他の CPU を止めても呼べる。
    順は子が先で親が後、依存する側が先。戻すのは逆。 */
 void hal_power_begin(void);
 void hal_power_end(void);
-const char *hal_quiesce_all(bool stop_at_failure); /* NULL か、最初の止まらなかった実装の名 */
-const char *hal_resume_all(void);                  /* NULL か、最初の戻らなかった実装の名 */
 /* 眠りを妨げるものの名か NULL。hal_power_begin の間に呼ぶ。 */
 enum hal_refusal {
     HAL_REFUSAL_NONE,
@@ -216,8 +208,6 @@ enum hal_refusal {
     HAL_REFUSAL_PROCESS, /* 眠りに加わらないプロセスの実装が持っている */
 };
 const char *hal_power_refused(bool hibernate, enum hal_refusal *why);
-/* 実装の resume の有無だけを見る。錠を取る。いつでも呼べる。 */
-const char *hal_power_cannot(bool hibernate);
 
 /* ---- プログラムへ ---- */
 int64_t hal_syscall_list(void *user_out, uint64_t bytes);
@@ -306,14 +296,7 @@ int hal_bind_process(struct hal_device *d, struct hal_claim *claim, const char *
 void hal_unbind_process(struct hal_device *d);
 void hal_claim_end_device(struct hal_device *d);
 
-/* 眠り。n_hal_power_wait を一度でも呼んだ claim は眠りの知らせを受ける（hal_claim_sleeps）。呼ばない claim を
-   持つ装置は眠りを断る（HAL_REFUSAL_PROCESS）。hal_claims_suspend は眠る claim へ N_HAL_POWER_SUSPEND を渡し、
-   n_hal_power_done の答えを期限つきで待つ（thread が動いている間）。答えない、断る claim があればそのプログラムの
-   名を返し、眠りは取りやめになる。取りやめでも、眠った後でも、全部の thread が動いた後に hal_claims_resume を
-   呼ぶ：知らせを渡した claim へ N_HAL_POWER_RESUME を渡す。 */
 bool hal_claim_sleeps(const struct hal_claim *claim);
-const char *hal_claims_suspend(void);
-void hal_claims_resume(void);
 /* 番号で引き、見つかれば記録を hold する。去っている装置は見つからない。眠らない。hal_put で放す。 */
 struct hal_device *hal_find(uint32_t id);
 void hal_put(struct hal_device *d);

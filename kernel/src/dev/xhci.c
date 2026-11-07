@@ -2445,29 +2445,6 @@ static void hc_worker(void *arg) {
     hc_kick(hc);
 }
 
-/* Power change (hal/hal.h): halt the controller, which ends its DMA (5.4.2: within 16 ms).
-   The disks behind it were flushed before. Interrupts are off: polled. */
-static bool xhci_quiesce(struct hal_device *d) {
-    struct usb_hc *hc = d->driver_data;
-    if (!hc->op) return true;
-    wr32(hc->op, USBCMD, rd32(hc->op, USBCMD) & ~(1u | CMD_INTE));
-    for (uint64_t deadline = clock_after(HALT_NS); !(rd32(hc->op, USBSTS) & STS_HCH) && clock_now_ns() < deadline;)
-        pause();
-    return rd32(hc->op, USBSTS) & STS_HCH;
-}
-
-/* After a sleep: the controller is reset and enumerated again by its worker (resume must not wait, and the
-   class drivers' detach runs there). Keyboards and mice come back; a USB disk would come back as a new
-   device under a mounted filesystem, so there is no sleep while one is plugged in (usbmsc's refuse). */
-static bool xhci_resume(struct hal_device *d) {
-    struct usb_hc *hc = d->driver_data;
-    if (!hc->op) return true;
-    __atomic_store_n(&hc->running, false, __ATOMIC_RELEASE);
-    __atomic_store_n(&hc->woke, true, __ATOMIC_RELEASE);
-    hc_kick(hc);
-    return true; /* the worker logs a controller that does not come back (hc_restart) */
-}
-
 static int xhci_attach(struct hal_device *d) {
     const struct n_hal_resource *bar = hal_resource(d, N_HAL_MEMORY, 0);
     if (!bar || bar->size < 0x1000) {
@@ -2523,7 +2500,5 @@ static const struct hal_driver xhci_driver = {
     .rule_count = ARRAY_SIZE(xhci_rules),
     .attach = xhci_attach,
     .detach = xhci_detach,
-    .quiesce = xhci_quiesce,
-    .resume = xhci_resume,
 };
 HAL_DRIVER(xhci_driver);

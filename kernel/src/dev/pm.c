@@ -181,7 +181,6 @@ static NORETURN void finish(enum pm_action action) {
     if (action == PM_POWER_OFF) acpi_sleep_prepare(5); /* the firmware's _PTS(5), while interrupts still run */
     cli();
     kprintf("pm: stopping the devices\n");
-    hal_quiesce_all(false);
     serial_flush();
     if (action == PM_REBOOT) power_reboot();
     power_off();
@@ -226,8 +225,6 @@ static enum n_power_reason sleep_blocker(bool hibernate, const char **detail) {
    devices' part follows the tree, which changes as drivers come and go. */
 static bool can_sleep, can_hibernate;
 
-bool pm_can_sleep(void) { return can_sleep && !hal_power_cannot(false); }
-bool pm_can_hibernate(void) { return can_hibernate && !hal_power_cannot(true); }
 
 static void blocker_log(const char *what, enum n_power_reason why, const char *detail) {
     if (why) kprintf("pm: %s unavailable (%s%s%s)\n", what, reason_text(why), detail ? ": " : "", detail ? detail : "");
@@ -260,7 +257,6 @@ static bool machine_sleep(void (*enter)(void), unsigned state, enum pm_action ac
     acpi_freeze(true);
     const char *stuck = pci_suspend();
     uint64_t f = irq_save();
-    if (!stuck) stuck = hal_quiesce_all(true);
     irq_suspend();
     /* the log's readers are told again in log_resume, once the APICs are back; before the clock
        stops, which bounds the serial port's last wait */
@@ -298,7 +294,6 @@ static bool machine_sleep(void (*enter)(void), unsigned state, enum pm_action ac
     if (state == 3 || slept) acpi_wake(state);
     smp_resume();
     irq_resume_lines(); /* the IOAPIC entries, to CPUs that run */
-    const char *lost = hal_resume_all();
     input_resumed();
     acpi_freeze(false);
     if (units_lost) say(N_POWER_DEVICE_LOST, action, N_POWER_REASON_IOMMU, units_lost, false);
@@ -328,14 +323,11 @@ static void sleep_now(bool hibernate) {
         }
         if (who) detail = who;
     }
-    if (!why && (detail = hal_claims_suspend())) why = N_POWER_REASON_DEVICE_STUCK;
-    bool claims_told = !why;
     if (!why && hibernate) why = hibernate_prepare();
     if (why) {
         kprintf("pm: not %s: %s%s%s\n", hibernate ? "hibernating" : "sleeping", reason_text(why), detail ? ": " : "",
                 detail ? detail : "");
         say(N_POWER_REFUSED, action, why, detail, false);
-        if (claims_told) hal_claims_resume();
         hal_power_end();
         return;
     }
@@ -374,7 +366,6 @@ static void sleep_now(bool hibernate) {
     }
     if (parked && !cpus_back) smp_resume();
     blk_release();
-    hal_claims_resume();
     hal_power_end();
     if (hibernate) hibernate_cleanup(slept);
     if (screen_display) screen_display->repaint();

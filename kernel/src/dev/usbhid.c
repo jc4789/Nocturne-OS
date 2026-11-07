@@ -716,13 +716,6 @@ static void hid_work(struct usb_interface *node) {
     kfree(report);
 }
 
-/* A sleep removes every device and enumerates them again (the controller's resume), so a keyboard comes
-   back as a new interface: nothing of its own to bring back. */
-static bool hid_resume(struct hal_device *hal) {
-    (void)hal;
-    return true;
-}
-
 static const struct n_hal_rule hid_rules[] = {N_USB_INTERFACE_CLASS(3)};
 static const struct hal_driver hid_driver = {
     .name = "usbhid",
@@ -730,6 +723,5 @@ static const struct hal_driver hid_driver = {
     .rule_count = ARRAY_SIZE(hid_rules),
     .attach = hid_attach,
     .detach = hid_detach,
-    .resume = hid_resume,
 };
 HAL_DRIVER(hid_driver);

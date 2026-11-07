@@ -606,42 +606,6 @@ static int run(struct nvme *c, uint32_t cmd[16], uint64_t timeout_ns, uint32_t *
     return status;
 }
 
-/* An admin command where interrupts are off and nothing may sleep (a power change: no other command
-   is in the controller): its completion looked for by this CPU. 0, the status field, or FAILED. */
-static int run_polled(struct nvme *c, uint32_t cmd[16], uint64_t timeout_ns) {
-    struct queue *q = &c->admin;
-    uint64_t f = spin_lock(&q->sq_lock);
-    int id = slot_take(q);
-    if (id < 0) {
-        spin_unlock(&q->sq_lock, f);
-        return FAILED;
-    }
-    struct slot *s = &q->slots[id];
-    uint64_t start = __atomic_load_n(&s->seq, __ATOMIC_ACQUIRE);
-    enter(q, id, cmd);
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    doorbell(c, q->qid, false, q->tail);
-    spin_unlock(&q->sq_lock, f);
-    int status = FAILED;
-    for (uint64_t deadline = clock_after(timeout_ns); clock_now_ns() < deadline; pause()) {
-        struct blk_request *none = NULL;
-        f = spin_lock(&q->cq_lock);
-        reap(q, &none);
-        spin_unlock(&q->cq_lock, f);
-        if (__atomic_load_n(&s->seq, __ATOMIC_ACQUIRE) != start) {
-            status = s->status;
-            break;
-        }
-        if (rd32(c, CSTS) & CSTS_CFS) break;
-    }
-    /* never answered: a late answer finds no command, and the slot is free for another */
-    f = spin_lock(&q->cq_lock);
-    s->busy = false;
-    spin_unlock(&q->cq_lock, f);
-    slot_give(q, (unsigned)id);
-    return status;
-}
-
 /* The I/O queues the controller gives, at most one a CPU: their memory, once. */
 static bool io_alloc(struct nvme *c, unsigned want) {
     struct queue *io = kzalloc(want * sizeof *io);
@@ -1196,87 +1160,6 @@ static int start(struct nvme *c) {
     return 0;
 }
 
-/* The I/O queues deleted, submission queues before completion queues (3.6.1 steps 1b, 1c; 5.3.4,
-   5.3.3): a queue that does not go does not keep the shutdown from being notified. */
-static void delete_queues(struct nvme *c) {
-    for (int op = OP_DELETE_SQ; op >= 0; op = op == OP_DELETE_SQ ? OP_DELETE_CQ : -1)
-        for (unsigned i = 0; i < c->nio; i++) {
-            uint32_t cmd[16] = {(uint32_t)op};
-            cmd[10] = c->io[i].qid;
-            int r = run_polled(c, cmd, ADMIN_NS);
-            if (r) {
-                kprintf("nvme%d: deleting I/O queue %u failed (%x)\n", c->index, c->io[i].qid, r);
-                return;
-            }
-        }
-}
-
-/* CC.SHN set: until CSTS.SHST reads complete, which is when the controller may lose power (3.6.1).
-   With CSTS.ST set the whole subsystem is shutting down, by another controller's hand, and its
-   complete says as much (3.6.3). The specification gives the least to wait (RTD3E, or one second when
-   that is not reported) and no limit: a controller that has begun is waited for up to our own
-   limit, its cache being worth more than the time. One that has not begun by the least, reads the
-   reserved value (Figure 42), reported a fatal status or vanished will not finish. */
-static bool shutdown_done(struct nvme *c) {
-    uint64_t least = c->rtd3e ? c->rtd3e * NS_PER_US : NS_PER_S, deadline = clock_after(least);
-    uint64_t last = clock_after(MAX(least, (uint64_t)SHUTDOWN_MOST_NS));
-    bool told = false;
-    for (;;) {
-        uint32_t csts = rd32(c, CSTS);
-        if (csts == 0xFFFFFFFFu || csts & CSTS_CFS) return false;
-        unsigned shst = CSTS_SHST(csts);
-        if (shst == SHST_DONE) return true;
-        if (shst == SHST_RESERVED) return false;
-        uint64_t now = clock_now_ns();
-        if (now >= last) return false;
-        if (now >= deadline) {
-            if (shst == SHST_NONE) return false;
-            if (!told) {
-                kprintf("nvme%d: its shutdown takes longer than the %lu us it reports\n", c->index,
-                        (unsigned long)(least / NS_PER_US));
-                told = true;
-            }
-        }
-        pause();
-    }
-}
-
-/* Normal shutdown before power goes away (3.6.1): SHN is to be written before any power down
-   (Figure 41), whoever used it, and the drive then does not count an unsafe shutdown. Its I/O
-   queues go first if it still takes commands; the notification has no such condition: a reset that
-   failed left its cache as it was. One that reports complete stays ready to lose power (3.6.1), and
-   one that does not stop can keep nothing; another device that came in its place has been given
-   nothing, and is told as well. Only one holding block devices, given commands since it last lost
-   power, keeps a power change from going on. Interrupts are already off, the disks held (no
-   command in flight). */
-static bool nvme_quiesce(struct hal_device *d) {
-    struct nvme *c = d->driver_data;
-    /* a Function Level Reset left unfinished is not to be reached, and counted its cache lost */
-    bool cut = __atomic_load_n(&c->cut, __ATOMIC_ACQUIRE), stranger = cut && c->stranger;
-    if (!c->regs || (cut && !stranger) || pci_reset_left(c->pci) || CSTS_SHST(rd32(c, CSTS)) == SHST_DONE) return true;
-    bool all = true;
-    if (__atomic_load_n(&c->live, __ATOMIC_ACQUIRE)) {
-        __atomic_store_n(&c->ready, false, __ATOMIC_RELEASE);
-        delete_queues(c);
-    }
-    wr32(c, CC, (rd32(c, CC) & ~CC_SHN) | CC_SHN_NORMAL);
-    /* its cache may not be on the flash */
-    if (!shutdown_done(c) && !stranger && __atomic_load_n(&c->in_use, __ATOMIC_ACQUIRE) &&
-        !__atomic_load_n(&c->woke, __ATOMIC_ACQUIRE))
-        all = false;
-    controller_down(c);
-    return all;
-}
-
-/* After a sleep (the shutdown notification above went first): the next read or write resets the
-   controller and sets the queues up again, the way it recovers from a timeout. Resume must not
-   wait for the controller; the I/O path may (it reports a controller that does not come back). */
-static bool nvme_resume(struct hal_device *d) {
-    struct nvme *c = d->driver_data;
-    if (c->regs && c->ident) __atomic_store_n(&c->woke, true, __ATOMIC_RELEASE);
-    return true;
-}
-
 static int nvme_attach(struct hal_device *d) {
     struct nvme *c = kzalloc(sizeof *c);
     if (!c) {
@@ -1335,7 +1218,5 @@ static const struct hal_driver nvme_driver = {
     .rule_count = ARRAY_SIZE(nvme_rules),
     .attach = nvme_attach,
     .detach = nvme_detach,
-    .quiesce = nvme_quiesce,
-    .resume = nvme_resume,
 };
 HAL_DRIVER(nvme_driver);

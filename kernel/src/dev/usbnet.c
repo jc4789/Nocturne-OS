@@ -334,13 +334,6 @@ static void usbnet_detach(struct hal_device *hal) {
     kfree(n);
 }
 
-/* A sleep removes every device and enumerates them again (the controller's resume), so the adapter comes back
-   as a new one (the same MAC address is the same adapter to the system): nothing of its own to bring back. */
-static bool usbnet_resume(struct hal_device *hal) {
-    (void)hal;
-    return true;
-}
-
 static const struct n_hal_rule usbnet_rules[] = {N_USB_INTERFACE_SUBCLASS(2, CDC_ECM), N_USB_INTERFACE_SUBCLASS(2, CDC_NCM)};
 static const struct hal_driver usbnet_driver = {
     .name = "usbnet",
@@ -348,6 +341,5 @@ static const struct hal_driver usbnet_driver = {
     .rule_count = ARRAY_SIZE(usbnet_rules),
     .attach = usbnet_attach,
     .detach = usbnet_detach,
-    .resume = usbnet_resume,
 };
 HAL_DRIVER(usbnet_driver);

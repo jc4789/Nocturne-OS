@@ -488,31 +488,6 @@ static bool claim_suspend(struct hal_claim *c) {
     return ok;
 }
 
-const char *hal_claims_suspend(void) {
-    const char *refused = NULL;
-    mutex_lock(&claims_mutex);
-    for (struct hal_claim *c = claims; c && !refused; c = c->next)
-        if (!hal_claim_sleeps(c) || !claim_suspend(c)) refused = c->d->driver_name;
-    mutex_unlock(&claims_mutex);
-    return refused;
-}
-
-void hal_claims_resume(void) {
-    mutex_lock(&claims_mutex);
-    for (struct hal_claim *c = claims; c; c = c->next) {
-        uint64_t irq = spin_lock(&c->power_lock);
-        if (c->power_told) {
-            c->power_told = false;
-            /* SUSPEND をまだ取っていないなら、見ずに済む */
-            c->power_event = c->power_event == N_HAL_POWER_SUSPEND ? 0 : N_HAL_POWER_RESUME;
-            c->power_awaiting = false;
-            wq_wake_all(&c->power_wq);
-        }
-        spin_unlock(&c->power_lock, irq);
-    }
-    mutex_unlock(&claims_mutex);
-}
-
 /* ---- 終わり ---- */
 
 bool hal_claim_on_end(struct hal_claim *c, struct hal_claim_end *e) {

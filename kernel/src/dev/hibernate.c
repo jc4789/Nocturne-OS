@@ -690,12 +690,6 @@ void hibernate_restore(void) {
     }
     smp_hold_in_init(); /* out of every page the copy overwrites */
     cli();
-    if (hal_quiesce_all(false)) {
-        /* its DMA could write over the restored pages; the image is used up, so the next boot is
-           a normal one */
-        kprintf("hibernate: a device did not stop, restarting instead of restoring\n");
-        power_reboot();
-    }
     ioapic_mask_all(); /* the 8259 has been masked since boot (arch/irq.h) */
     if (!iommu_shutdown()) {
         kprintf("hibernate: IOMMU did not stop; restarting without overwriting live DMA tables\n");

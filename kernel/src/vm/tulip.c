@@ -125,19 +125,6 @@ static unsigned tulip_transmit(struct netif *self, unsigned queue, const struct 
     return taken;
 }
 
-/* Power change (hal.h): interrupts off, receive and transmit stopped (CSR7, CSR6), until both
-   processes report "stopped" in CSR5 (bits 17-19 and 20-22). */
-static bool tulip_quiesce(struct hal_device *d) {
-    struct tulip *c = d->driver_data;
-    csr_wr(c, 7, 0);
-    csr_wr(c, 6, 0);
-    for (int i = 0; i < 10000; i++) {
-        if (!(csr_rd(c, 5) & (0x3Fu << 17))) return true;
-        io_wait(); /* ~1 us each */
-    }
-    return false;
-}
-
 static int tulip_attach(struct hal_device *d) {
     struct pci_device *pci = pci_device_of(d);
     uint16_t iobase = hal_port(d, IO_BAR);
@@ -255,5 +242,4 @@ const struct hal_driver tulip_driver = {
     .rules = tulip_rules,
     .rule_count = ARRAY_SIZE(tulip_rules),
     .attach = tulip_attach,
-    .quiesce = tulip_quiesce,
 };

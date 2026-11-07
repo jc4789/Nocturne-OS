@@ -43,7 +43,6 @@ struct vbe {
     struct scanout *buf[2];
     unsigned count;
     uint32_t height;
-    uint16_t saved[VBE_REGS];
 };
 
 static uint16_t vbe_read(struct vbe *v, unsigned reg) {
@@ -189,24 +188,6 @@ fail:
     return why;
 }
 
-/* A sleep: the registers are kept, and set again after (scanout only: no DMA to stop). */
-static bool vbe_quiesce(struct hal_device *d) {
-    struct vbe *v = d->driver_data;
-    for (unsigned r = 1; r < VBE_REGS; r++) v->saved[r] = vbe_read(v, r);
-    return true;
-}
-
-static bool vbe_resume(struct hal_device *d) {
-    struct vbe *v = d->driver_data;
-    vbe_write(v, VBE_ENABLE, 0);
-    for (unsigned r = 1; r < VBE_REGS; r++)
-        if (r != VBE_ENABLE) vbe_write(v, r, v->saved[r]);
-    vbe_write(v, VBE_ENABLE, v->saved[VBE_ENABLE] | VBE_NO_CLEAR); /* back on, without clearing the memory */
-    vbe_unblank(v);
-    return (vbe_read(v, VBE_ENABLE) & (VBE_ENABLED | VBE_LFB)) == (VBE_ENABLED | VBE_LFB) &&
-           vbe_read(v, VBE_XRES) == v->saved[VBE_XRES] && vbe_read(v, VBE_YRES) == v->saved[VBE_YRES];
-}
-
 static const struct n_hal_rule vbe_rules[] = {N_PCI_ID_CLASS(0x1234, 0x1111, 0x03, 0x00),
                                               N_PCI_ID_CLASS(0x80EE, 0xBEEF, 0x03, 0x00)};
 const struct hal_driver vbe_driver = {
@@ -214,6 +195,4 @@ const struct hal_driver vbe_driver = {
     .rules = vbe_rules,
     .rule_count = ARRAY_SIZE(vbe_rules),
     .attach = vbe_attach,
-    .quiesce = vbe_quiesce,
-    .resume = vbe_resume,
 };

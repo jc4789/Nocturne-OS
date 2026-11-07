@@ -204,18 +204,6 @@ static uint32_t e1000_itr_ticks(void) {
     return (uint32_t)((us * 1000 + ITR_TICK_NS - 1) / ITR_TICK_NS);
 }
 
-/* Power change (hal.h): no more interrupts, receive or transmit DMA. */
-static bool e1000_quiesce(struct hal_device *d) {
-    struct e1000 *c = d->driver_data;
-    wr(c, REG_IMC, 0xFFFFFFFF);
-    wr(c, REG_RCTL, 0);
-    wr(c, REG_TCTL, 0);
-    /* The 8254x has no bit that says its DMA went idle (EN reads back what was written): neither
-       engine fetches another descriptor, and the one in flight lands within this wait. */
-    for (int i = 0; i < 100; i++) io_wait(); /* ~1 us each */
-    return true;
-}
-
 static void hw_reset(struct e1000 *c) {
     wr(c, REG_IMC, 0xFFFFFFFF);
     wr(c, REG_CTRL, rd(c, REG_CTRL) | (1u << 26)); /* device reset */
@@ -266,15 +254,6 @@ static void hw_start(struct e1000 *c) {
     }
     rd(c, REG_ICR);
     wr(c, REG_IMS, ICR_TXDW | ICR_LSC | RX_IRQS);
-}
-
-static bool e1000_resume(struct hal_device *d) {
-    struct e1000 *c = d->driver_data;
-    hw_reset(c);
-    bool reset = !(rd(c, REG_CTRL) & (1u << 26));
-    hw_start(c);
-    net_rx_notify(); /* whatever the net thread was waiting for is gone: let it look again */
-    return reset && (rd(c, REG_RCTL) & (1u << 1)) && (rd(c, REG_TCTL) & (1u << 1));
 }
 
 static int e1000_attach(struct hal_device *d) {
@@ -357,6 +336,4 @@ const struct hal_driver e1000_driver = {
     .rules = e1000_rules,
     .rule_count = ARRAY_SIZE(e1000_rules),
     .attach = e1000_attach,
-    .quiesce = e1000_quiesce,
-    .resume = e1000_resume,
 };

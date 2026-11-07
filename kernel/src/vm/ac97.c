@@ -232,24 +232,6 @@ static void ac97_close(struct audio_output *output) {
     c->ring_object = NULL;
 }
 
-/* Power change (hal/hal.h): the PCM-out engine stops reading descriptors and buffers, and says so
-   (DMA controller halted). Its interrupts go off with it. */
-static bool ac97_quiesce(struct hal_device *d) {
-    struct ac97 *c = d->driver_data;
-    uint64_t f = spin_lock(&c->engine);
-    c->hw_ready = false;
-    c->power_gen++;
-    outb(c->nabm + PO_CR, 0);
-    outw(c->nabm + PO_SR, SR_CLEAR);
-    spin_unlock(&c->engine, f);
-    alarm_cancel(&c->refill);
-    for (int i = 0; i < 1000; i++) {
-        if (inw(c->nabm + PO_SR) & SR_HALTED) return true;
-        io_wait();
-    }
-    return false;
-}
-
 /* The codec out of cold reset at 0 dB and 48 kHz, the PCM-out box reset: at boot and after a sleep,
    which powered the codec off. It polls the clock: nothing may sleep here. */
 static bool hw_init(struct ac97 *c) {
@@ -265,17 +247,6 @@ static bool hw_init(struct ac97 *c) {
         outw(c->nam + NAM_FRONT_RATE, RATE);
     }
     return box_reset(c) && codec;
-}
-
-/* The service looks, and starts the engine again. */
-static bool ac97_resume(struct hal_device *d) {
-    struct ac97 *c = d->driver_data;
-    bool ok = hw_init(c);
-    uint64_t f = spin_lock(&c->engine);
-    c->hw_ready = true;
-    spin_unlock(&c->engine, f);
-    audio_output_period(&c->output);
-    return ok;
 }
 
 static const struct audio_output_ops ac97_ops = {.open = ac97_open, .close = ac97_close, .run = ac97_run, .status = ac97_status};
@@ -334,6 +305,4 @@ const struct hal_driver ac97_driver = {
     .rules = ac97_rules,
     .rule_count = ARRAY_SIZE(ac97_rules),
     .attach = ac97_attach,
-    .quiesce = ac97_quiesce,
-    .resume = ac97_resume,
 };

@@ -780,27 +780,6 @@ static void hda_thread(void *arg) {
 
 /* ---- power, and a claim of its group ---- */
 
-static bool hda_quiesce(struct hal_device *d) {
-    struct hda *h = d->driver_data;
-    uint64_t f = spin_lock(&h->engine);
-    bool stopped = h->stopped;
-    if (!stopped) link_stop(h);
-    spin_unlock(&h->engine, f);
-    if (stopped) return true;
-    if (h->quiet) alarm_cancel(&h->tick);
-    return link_down(h);
-}
-
-static bool hda_resume(struct hal_device *d) {
-    struct hda *h = d->driver_data;
-    if (__atomic_load_n(&h->stopped, __ATOMIC_RELAXED)) return true;
-    bool ok = link_up(h);
-    __atomic_store_n(&h->restore, true, __ATOMIC_SEQ_CST);
-    signal(h);
-    tell_open(h);
-    return ok;
-}
-
 /* The group is about to change hands: its outputs go, then its link and everything it sends. */
 static void hda_guest_stop(void *ctx) {
     struct hda *h = ctx;
@@ -916,7 +895,5 @@ static const struct hal_driver hda_driver = {
     .rules = hda_rules,
     .rule_count = ARRAY_SIZE(hda_rules),
     .attach = hda_attach,
-    .quiesce = hda_quiesce,
-    .resume = hda_resume,
 };
 HAL_DRIVER(hda_driver);

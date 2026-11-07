@@ -278,17 +278,6 @@ static void mac_reset(struct rtl8125 *c) {
     if (!wait_reg(c, CMD, 1, CMD_RESET, 0, 10 * NS_PER_US, 10 * NS_PER_MS)) kprintf("rtl8125: reset did not complete\n");
 }
 
-/* Power change (hal.h): interrupts off, then the reset ends every DMA. Polled waits only. */
-static bool rtl_quiesce(struct hal_device *d) {
-    struct rtl8125 *c = d->driver_data;
-    wr32(c, IMR_CLEAR, 0xFFFFFFFF);
-    wr32(c, RXCFG, rd32(c, RXCFG) & ~0x3Fu);
-    wr8(c, CMD, rd8(c, CMD) & ~(CMD_TX_EN | CMD_RX_EN));
-    clock_spin(100 * NS_PER_US);
-    wr8(c, CMD, CMD_RESET);
-    return wait_reg(c, CMD, 1, CMD_RESET, 0, 10 * NS_PER_US, 10 * NS_PER_MS);
-}
-
 static void aspm_clkreq_off(struct rtl8125 *c) {
     wr8(c, 0xF1, rd8(c, 0xF1) & ~0x80);
     wr8(c, CFG5, rd8(c, CFG5) & ~0x01);
@@ -407,24 +396,6 @@ static void rings_start(struct rtl8125 *c) {
     wr32(c, MAR4, 0xFFFFFFFF);
     wr32(c, RXCFG, 0x40C00C00 | RX_ACCEPT);
     wr8(c, CMD, CMD_TX_EN | CMD_RX_EN);
-}
-
-static bool rtl_resume(struct hal_device *d) {
-    struct rtl8125 *c = d->driver_data;
-    hw_init(c);
-    cfg_unlock(c);
-    wr32(c, IDR0, c->nif.mac[0] | c->nif.mac[1] << 8 | c->nif.mac[2] << 16 | (uint32_t)c->nif.mac[3] << 24);
-    wr16(c, IDR0 + 4, (uint16_t)(c->nif.mac[4] | c->nif.mac[5] << 8));
-    cfg_lock(c);
-    rings_start(c);
-    uint8_t cmd = rd8(c, CMD); /* out of reset, both engines on (rings_start's last write) */
-    bool back = !(cmd & CMD_RESET) && (cmd & (CMD_TX_EN | CMD_RX_EN)) == (CMD_TX_EN | CMD_RX_EN);
-    c->link = false; /* check_link reports it again once autonegotiation is done */
-    wr32(c, ISR, 0xFFFFFFFF);
-    wr32(c, IMR_SET, INT_MASK);
-    start_autoneg(c);
-    net_rx_notify();
-    return back;
 }
 
 static void check_link(struct rtl8125 *c) {
@@ -578,14 +549,6 @@ static int rtl_attach(struct hal_device *d) {
         kprintf("rtl8125: no memory register window\n");
         goto fail;
     }
-    uint8_t pm = pci_find_cap(pci, 0x01);
-    if (pm) { /* the firmware may have left the function in a sleep state */
-        uint32_t pmcsr = pci_read32(pci->address, pm + 4);
-        if (pmcsr & 3) {
-            pci_write32(pci->address, pm + 4, pmcsr & ~3u);
-            clock_spin(10 * NS_PER_MS);
-        }
-    }
     if (!(c->mmio = hal_map(d, bar))) {
         r = -N_ERR_NO_MEMORY;
         goto fail;
@@ -677,7 +640,5 @@ static const struct hal_driver rtl8125_driver = {
     .rules = rtl_rules,
     .rule_count = ARRAY_SIZE(rtl_rules),
     .attach = rtl_attach,
-    .quiesce = rtl_quiesce,
-    .resume = rtl_resume,
 };
 HAL_DRIVER(rtl8125_driver);

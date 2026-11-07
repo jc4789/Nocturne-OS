@@ -369,11 +369,6 @@ static void msc_detach(struct hal_device *hal) {
 /* A disk would come back as a new device under a mounted filesystem after a sleep: none while one is plugged in. */
 static const char *msc_refuse(struct hal_device *hal) { return hal->driver_data ? "A USB disk is plugged in" : NULL; }
 
-static bool msc_resume(struct hal_device *hal) {
-    (void)hal;
-    return true; /* only after a sleep that was given up: nothing was changed */
-}
-
 /* Bulk-only (protocol 50h) with a command set that speaks SCSI (MSC Overview Table 1): not reported
    00h, RBC 01h, MMC-5 02h, SCSI transparent 06h. */
 #define MSC_BULK_ONLY(subclass) \
@@ -386,7 +381,6 @@ static const struct hal_driver msc_driver = {
     .rule_count = ARRAY_SIZE(msc_rules),
     .attach = msc_attach,
     .detach = msc_detach,
-    .resume = msc_resume,
     .refuse = msc_refuse,
 };
 HAL_DRIVER(msc_driver);

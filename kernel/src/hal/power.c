@@ -40,45 +40,12 @@ void hal_power_begin(void) {
 
 void hal_power_end(void) { hal_gate_open(); }
 
-const char *hal_quiesce_all(bool stop_at_failure) {
-    const char *stuck = NULL;
-    for (struct hal_device *d = order_last; d; d = d->power_prev) {
-        if (!d->driver) continue;
-        d->power_down = true; /* 届いた：眠りの取りやめの後でも戻す */
-        if (!d->driver->quiesce || d->driver->quiesce(d)) continue;
-        kprintf("pm: %s at %s did not stop\n", d->driver->name, d->location);
-        if (!stuck) stuck = d->driver->name;
-        if (stop_at_failure) return stuck;
-    }
-    return stuck;
-}
-
-const char *hal_resume_all(void) {
-    const char *lost = NULL;
-    for (struct hal_device *d = order_first; d; d = d->power_next) {
-        if (!d->power_down) continue; /* 止まらなかった実装より後は、止まっていない */
-        d->power_down = false;
-        if (!d->driver->resume || d->driver->resume(d)) continue;
-        kprintf("pm: %s at %s did not come back\n", d->driver->name, d->location);
-        if (!lost) lost = d->driver->name;
-    }
-    return lost;
-}
-
-static bool driver_cannot(const struct hal_device *d, bool hibernate) {
-    return d->driver && !d->driver->resume && !(hibernate && d->driver->cold_ok);
-}
-
 const char *hal_power_refused(bool hibernate, enum hal_refusal *why) {
     *why = HAL_REFUSAL_NONE;
     for (struct hal_device *d = order_first; d; d = d->power_next) {
         if (d->claim && !hal_claim_sleeps(d->claim)) {
             *why = HAL_REFUSAL_PROCESS;
             return d->driver_name;
-        }
-        if (driver_cannot(d, hibernate)) {
-            *why = HAL_REFUSAL_CANNOT;
-            return d->driver->name;
         }
         const char *busy = d->driver && d->driver->refuse ? d->driver->refuse(d) : NULL;
         if (!busy) continue;
@@ -87,13 +54,4 @@ const char *hal_power_refused(bool hibernate, enum hal_refusal *why) {
         return d->driver->name;
     }
     return NULL;
-}
-
-const char *hal_power_cannot(bool hibernate) {
-    const char *name = NULL;
-    uint64_t f = spin_lock(&hal_lock);
-    for (struct hal_device *d = &hal_root; d && !name; d = hal_walk_next(d))
-        if (driver_cannot(d, hibernate)) name = d->driver->name;
-    spin_unlock(&hal_lock, f);
-    return name;
 }

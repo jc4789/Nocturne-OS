@@ -138,20 +138,12 @@ static int ata_attach(struct hal_device *d) {
     return 0;
 }
 
-/* The ports keep what they had across a sleep: nothing is owed to the drives (a request that comes
-   waits for the channel as before). */
-static bool ata_resume(struct hal_device *d) {
-    (void)d;
-    return true;
-}
-
 static const struct n_hal_rule ata_rules[] = {N_FIXED("ide-ports")};
 const struct hal_driver ata_driver = {
     .name = "ata",
     .rules = ata_rules,
     .rule_count = ARRAY_SIZE(ata_rules),
     .attach = ata_attach,
-    .resume = ata_resume,
 };
 
 static int setup(struct ata_disk *d, uint64_t lba, uint32_t count, bool write) {

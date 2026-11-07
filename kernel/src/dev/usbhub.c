@@ -274,13 +274,6 @@ static int hub_attach(struct hal_device *hal) {
 /* The devices behind the hub go with it (usb_remove), each by its own hub's worker. */
 static void hub_detach(struct hal_device *hal) { usbhub_detach(usb_interface_of(hal)->dev); }
 
-/* A sleep removes every device and enumerates them again (the controller's resume): the hub has nothing
-   of its own to bring back. */
-static bool hub_resume(struct hal_device *hal) {
-    (void)hal;
-    return true;
-}
-
 static const struct n_hal_rule hub_rules[] = {N_USB_INTERFACE_CLASS(9)};
 static const struct hal_driver hub_driver = {
     .name = "usbhub",
@@ -288,7 +281,6 @@ static const struct hal_driver hub_driver = {
     .rule_count = ARRAY_SIZE(hub_rules),
     .attach = hub_attach,
     .detach = hub_detach,
-    .resume = hub_resume,
 };
 HAL_DRIVER(hub_driver);
 
