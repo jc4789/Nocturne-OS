@@ -8,6 +8,7 @@
   6. プログラムは入口の像の溝からカーネルへ入る：user・tests・ports のコードの SYSCALL 命令を拒む。
   7. 実装の DMA は HAL の口を通る：struct io_driver を定めるファイルの、頁の確保（pmm_）、物理番地の引き
      （hhdm_virt_to_phys、virt_to_phys、vmm_kernel_translate）、IOMMU（iommu_）、MMIO の写し（vmm_map_mmio）を拒む。
+  8. カーネルが section("…") で置く区画は、kernel/linker.ld が名で集める：台本に無い名は、組みが通っても表を空にする。
 
   python -X utf8 tests/check_boundaries.py
 """
@@ -98,6 +99,15 @@ for path in sorted([*kernel.rglob("*.c"), *kernel.rglob("*.h")]):
         included = VM_INCLUDE.search(line)
         if included and not relative.startswith("vm/") and included.group(2) != "vm.h":
             report(path, number, "vm/ の外の VM", line)
+
+SECTION = re.compile(r'section\("(\.[A-Za-z0-9_.]+)"\)')
+linker = (root / "kernel/linker.ld").read_text(encoding="utf-8")
+for path in sorted([*kernel.rglob("*.c"), *kernel.rglob("*.h")]):
+    lines = code_of(path).split("\n")
+    for i, line in enumerate(lines):
+        for name in SECTION.findall(line):
+            if "*(" + name + ")" not in linker and "*(" + name + " " not in linker:
+                report(path, i + 1, "台本の集めない区画", line)
 
 SYSCALL_C = re.compile(r"\b(__asm__|__asm|asm)\b[^;]*?(\bsyscall\b|0x0[fF]\s*,\s*0x05)", re.S)
 SYSCALL_ASM = re.compile(r"^\s*syscall\b", re.M | re.I)
