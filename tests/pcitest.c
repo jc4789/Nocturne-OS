@@ -51,7 +51,9 @@ static int pci_functions(struct pci_function *out, int max) {
     return written;
 }
 
-static n_handle claim_function(const struct pci_function *f) { return n_hal_claim(n_cap_find(N_CAP_HAL_CLAIM), f->id); }
+static n_handle claim_function(const struct pci_function *f) {
+    return n_hal_claim(n_cap_find(N_CAP_HAL_CLAIM), f->id, "pcitest");
+}
 
 /* edu's registers (BAR 0) */
 #define EDU_IDENT 0x00
@@ -250,50 +252,51 @@ static int find_vga(const struct pci_function *list, int n) {
     return -1;
 }
 
-/* The claim's part of the ACPI namespace (n_hal_pci_acpi_eval). The VGA sits on QEMU's root bus, so
-   its upstream node is the host bridge (PNP0A08 on q35, whose _PRT is a package of packages);
+/* The claim's part of the ACPI namespace (n_hal_acpi_eval). The VGA sits on QEMU's root bus, so
+   the device above it in the device tree is the host bridge (PNP0A08 on q35, whose _PRT is a
+   package of packages);
    whether the VGA has a node of its own depends on QEMU's tables, and when it has one its _ADR
    is its device and function. */
 static void acpi_cases(n_handle vga, const struct pci_function *at) {
     static uint64_t out[8192]; /* a root bus's _PRT has 128 routes of 5 values */
     struct n_acpi_value *v = (struct n_acpi_value *)out;
-    n_result r = n_hal_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_HID", NULL, 0, NULL, 0, out, sizeof out);
+    n_result r = n_hal_acpi_eval(vga, N_ACPI_PARENT, "_HID", NULL, 0, NULL, 0, out, sizeof out);
     bool integer_hid = r >= (n_result)sizeof *v && v[0].type == N_ACPI_INTEGER;
     bool string_hid = r >= (n_result)sizeof *v && v[0].type == N_ACPI_STRING && v[0].length == 7 &&
                       v[0].value + 7 <= (uint64_t)r && !memcmp((char *)out + v[0].value, "PNP0A0", 6);
     CHECK((integer_hid && (v[0].value == 0x080AD041 || v[0].value == 0x030AD041)) || string_hid,
           "the host bridge's _HID: %s", r < 0 ? n_result_text(r) : "not a PCI host bridge");
-    r = n_hal_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_PRT", NULL, 0, NULL, 0, out, sizeof out);
+    r = n_hal_acpi_eval(vga, N_ACPI_PARENT, "_PRT", NULL, 0, NULL, 0, out, sizeof out);
     size_t values = r > 0 ? (size_t)r / sizeof *v : 0;
     bool routes = values > 1 && v[0].type == N_ACPI_PACKAGE && v[0].length > 0 && v[0].value == 1 &&
                   v[1].type == N_ACPI_PACKAGE && v[1].length == 4;
     CHECK(routes, "the host bridge's _PRT is a package of 4-element packages: %s",
           r < 0 ? n_result_text(r) : "another layout");
-    CHECK(n_hal_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_PRT", NULL, 0, NULL, 0, out, sizeof *v) == -N_ERR_TOO_LARGE,
+    CHECK(n_hal_acpi_eval(vga, N_ACPI_PARENT, "_PRT", NULL, 0, NULL, 0, out, sizeof *v) == -N_ERR_TOO_LARGE,
           "a result larger than the room is refused");
     /* QEMU's tables give the host bridge no _ROM (its own names, as "NONE", are refused:
        acpi_refused_cases) */
-    CHECK(n_hal_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_ROM", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_NOT_FOUND,
+    CHECK(n_hal_acpi_eval(vga, N_ACPI_PARENT, "_ROM", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_NOT_FOUND,
           "a missing name");
-    CHECK(n_hal_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "\\_SB", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_INVALID &&
-              n_hal_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_SB_.PCI0", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_INVALID,
+    CHECK(n_hal_acpi_eval(vga, N_ACPI_PARENT, "\\_SB", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_INVALID &&
+              n_hal_acpi_eval(vga, N_ACPI_PARENT, "_SB_.PCI0", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_INVALID,
           "paths outside the claim's nodes are refused");
     struct n_acpi_value too_many[8] = {{0}};
-    CHECK(n_hal_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_PRT", too_many, 8, NULL, 0, out, sizeof out) == -N_ERR_INVALID,
+    CHECK(n_hal_acpi_eval(vga, N_ACPI_PARENT, "_PRT", too_many, 8, NULL, 0, out, sizeof out) == -N_ERR_INVALID,
           "more than 7 arguments");
     struct n_acpi_value outside = {N_ACPI_BUFFER, 16, 0};
-    CHECK(n_hal_pci_acpi_eval(vga, N_ACPI_UPSTREAM, "_PRT", &outside, 1, "short", 5, out, sizeof out) == -N_ERR_INVALID,
+    CHECK(n_hal_acpi_eval(vga, N_ACPI_PARENT, "_PRT", &outside, 1, "short", 5, out, sizeof out) == -N_ERR_INVALID,
           "an argument past its data");
-    r = n_hal_pci_acpi_eval(vga, N_ACPI_SELF, "_ADR", NULL, 0, NULL, 0, out, sizeof out);
+    r = n_hal_acpi_eval(vga, N_ACPI_SELF, "_ADR", NULL, 0, NULL, 0, out, sizeof out);
     if (r == -N_ERR_NOT_FOUND) {
-        CHECK(n_hal_pci_acpi_eval(vga, N_ACPI_CHILD(0), "_ADR", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_INVALID,
+        CHECK(n_hal_acpi_eval(vga, N_ACPI_CHILD(0), "_ADR", NULL, 0, NULL, 0, out, sizeof out) == -N_ERR_INVALID,
               "no children without a node of its own");
-        CHECK(n_hal_pci_acpi_notify_take(vga, 0) == -N_ERR_NOT_FOUND, "no notifications without a node");
+        CHECK(n_hal_acpi_notify_take(vga, 0) == -N_ERR_NOT_FOUND, "no notifications without a node");
     } else {
         CHECK(r >= (n_result)sizeof *v && v[0].type == N_ACPI_INTEGER &&
                   v[0].value == ((uint64_t)at->dev << 16 | at->func),
               "the VGA's own _ADR: %s", r < 0 ? n_result_text(r) : "another value");
-        CHECK(n_hal_pci_acpi_notify_take(vga, 0) == -N_ERR_TIMEOUT, "no notification waiting");
+        CHECK(n_hal_acpi_notify_take(vga, 0) == -N_ERR_TIMEOUT, "no notification waiting");
     }
 }
 
@@ -310,38 +313,38 @@ static void acpi_refused_cases(n_handle pci, const struct pci_function *at) {
         "_PS0", "_PS1", "_PS2", "_PS3", "_ON_", "_OFF", "_RST", "_EJ0", "_EJ1", "_EJ2", "_EJ3", "_EJ4", "_LCK", "_DCK",
         "_DIS", "_SRS", "_OSC", "_OST", "_PSW", "_DSW", "_INI", "_REG", "_EVT", "_PTS", "_WAK", "_TTS", "_GTS", "_BFS",
     };
-    static const uint32_t nodes[] = {N_ACPI_SELF, N_ACPI_UPSTREAM, N_ACPI_CHILD(0), N_ACPI_CHILD(1000)};
+    static const uint32_t nodes[] = {N_ACPI_SELF, N_ACPI_PARENT, N_ACPI_CHILD(0), N_ACPI_CHILD(1000)};
     for (size_t i = 0; i < sizeof system_methods / sizeof *system_methods; i++)
         for (size_t k = 0; k < sizeof nodes / sizeof *nodes; k++) {
-            n_result r = n_hal_pci_acpi_eval(pci, nodes[k], system_methods[i], NULL, 0, NULL, 0, out, sizeof out);
+            n_result r = n_hal_acpi_eval(pci, nodes[k], system_methods[i], NULL, 0, NULL, 0, out, sizeof out);
             CHECK(r == -N_ERR_DENIED, "%s on node %x is the system's: %s", system_methods[i], nodes[k],
                   n_result_text(r));
         }
-    n_result r = n_hal_pci_acpi_eval(pci, N_ACPI_UPSTREAM, "NONE", NULL, 0, NULL, 0, out, sizeof out);
+    n_result r = n_hal_acpi_eval(pci, N_ACPI_PARENT, "NONE", NULL, 0, NULL, 0, out, sizeof out);
     CHECK(r == -N_ERR_DENIED, "the bridge's own names are the platform's: %s", n_result_text(r));
-    r = n_hal_pci_acpi_eval(pci, N_ACPI_UPSTREAM, "\\_SB", NULL, 0, NULL, 0, out, sizeof out);
+    r = n_hal_acpi_eval(pci, N_ACPI_PARENT, "\\_SB", NULL, 0, NULL, 0, out, sizeof out);
     CHECK(r == -N_ERR_INVALID, "a malformed name stays malformed on the bridge: %s", n_result_text(r));
     /* as before the refusals */
-    r = n_hal_pci_acpi_eval(pci, N_ACPI_SELF, "NONE", NULL, 0, NULL, 0, out, sizeof out);
+    r = n_hal_acpi_eval(pci, N_ACPI_SELF, "NONE", NULL, 0, NULL, 0, out, sizeof out);
     CHECK(r == -N_ERR_NOT_FOUND, "the function's own names are not refused: %s", n_result_text(r));
-    r = n_hal_pci_acpi_eval(pci, N_ACPI_SELF, "_ROM", NULL, 0, NULL, 0, out, sizeof out);
+    r = n_hal_acpi_eval(pci, N_ACPI_SELF, "_ROM", NULL, 0, NULL, 0, out, sizeof out);
     CHECK(r == -N_ERR_NOT_FOUND, "edu has no _ROM: %s", n_result_text(r));
-    r = n_hal_pci_acpi_eval(pci, N_ACPI_SELF, "_ADR", NULL, 0, NULL, 0, out, sizeof out);
+    r = n_hal_acpi_eval(pci, N_ACPI_SELF, "_ADR", NULL, 0, NULL, 0, out, sizeof out);
     CHECK(r == -N_ERR_NOT_FOUND || (r >= (n_result)sizeof *v && v[0].type == N_ACPI_INTEGER &&
                                     v[0].value == ((uint64_t)at->dev << 16 | at->func)),
           "edu's own _ADR, when it has a node: %s", r < 0 ? n_result_text(r) : "another value");
-    r = n_hal_pci_acpi_eval(pci, N_ACPI_CHILD(0), "_ADR", NULL, 0, NULL, 0, out, sizeof out);
+    r = n_hal_acpi_eval(pci, N_ACPI_CHILD(0), "_ADR", NULL, 0, NULL, 0, out, sizeof out);
     CHECK(r == -N_ERR_INVALID, "edu has no child devices: %s", n_result_text(r));
-    r = n_hal_pci_acpi_eval(pci, N_ACPI_UPSTREAM, "_ROM", NULL, 0, NULL, 0, out, sizeof out);
+    r = n_hal_acpi_eval(pci, N_ACPI_PARENT, "_ROM", NULL, 0, NULL, 0, out, sizeof out);
     CHECK(r == -N_ERR_NOT_FOUND, "a predefined name the host bridge lacks: %s", n_result_text(r));
     /* RM's names on the nodes it uses them on (those that take arguments get none here, so no AML
        of theirs runs: whatever the answer, it is not a refusal) */
     static const struct { uint32_t node; const char *name; } rm[] = {
-        {N_ACPI_SELF, "_DSM"}, {N_ACPI_SELF, "_ROM"}, {N_ACPI_SELF, "_DOD"}, {N_ACPI_UPSTREAM, "_DSM"},
+        {N_ACPI_SELF, "_DSM"}, {N_ACPI_SELF, "_ROM"}, {N_ACPI_SELF, "_DOD"}, {N_ACPI_PARENT, "_DSM"},
         {N_ACPI_CHILD(0), "_ADR"}, {N_ACPI_CHILD(0), "_DDC"}, {N_ACPI_CHILD(0), "MXDS"}, {N_ACPI_CHILD(0), "MXDM"},
     };
     for (size_t i = 0; i < sizeof rm / sizeof *rm; i++) {
-        r = n_hal_pci_acpi_eval(pci, rm[i].node, rm[i].name, NULL, 0, NULL, 0, out, sizeof out);
+        r = n_hal_acpi_eval(pci, rm[i].node, rm[i].name, NULL, 0, NULL, 0, out, sizeof out);
         CHECK(r != -N_ERR_DENIED, "RM's %s on node %x is not refused", rm[i].name, rm[i].node);
     }
 }
@@ -402,10 +405,10 @@ static void screen_cases(const struct pci_function *list, int n) {
         if (wc >= 0) n_handle_close(wc);
     }
     if (bar >= 0) n_handle_close(bar);
-    CHECK(n_hal_pci_hold_screen(vga, true) == 0 && n_hal_pci_hold_screen(vga, true) == 0, "holds of the screen nest");
-    CHECK(n_hal_pci_hold_screen(vga, false) == 0 && n_hal_pci_hold_screen(vga, false) == 0, "and are released one by one");
-    CHECK(n_hal_pci_hold_screen(vga, false) == -N_ERR_INVALID, "a release without a hold");
-    CHECK(n_hal_pci_hold_screen(vga, true) == 0, "a hold the claim's end gives back");
+    CHECK(n_screen_hold(vga, true) == 0 && n_screen_hold(vga, true) == 0, "holds of the screen nest");
+    CHECK(n_screen_hold(vga, false) == 0 && n_screen_hold(vga, false) == 0, "and are released one by one");
+    CHECK(n_screen_hold(vga, false) == -N_ERR_INVALID, "a release without a hold");
+    CHECK(n_screen_hold(vga, true) == 0, "a hold the claim's end gives back");
     acpi_cases(vga, &list[at]);
     n_handle_close(vga);
 }
@@ -891,7 +894,7 @@ static void give_screen_cases(n_handle edu, const struct pci_function *list, int
     uint64_t count = 0;
     r = vblanks(vga, &count, 30);
     CHECK(r == 0, "vertical blanks of the surface shown: %s", n_result_text(r));
-    CHECK(n_hal_pci_hold_screen(vga, true) == 0 && n_hal_pci_hold_screen(vga, false) == 0, "the screen held and given back");
+    CHECK(n_screen_hold(vga, true) == 0 && n_screen_hold(vga, false) == 0, "the screen held and given back");
     n_sleep_until(n_clock_after(300 * N_NS_PER_MS)); /* the release draws all of the screen again: the marks below come after it */
 
     /* a second buffer past it, which the display then shows */
@@ -976,7 +979,7 @@ static int stuck_holder(void) {
     struct pci_function list[128];
     int n = pci_functions(list, 128), at = find_vga(list, n);
     n_handle vga = at < 0 ? -1 : claim_function(&list[at]);
-    if (vga < 0 || n_hal_pci_hold_screen(vga, true) != 0) return 2;
+    if (vga < 0 || n_screen_hold(vga, true) != 0) return 2;
     for (;;) n_sleep_until(n_clock_after(60000 * N_NS_PER_MS));
 }
 
@@ -1011,7 +1014,7 @@ static void stuck_holder_cases(const char *program, const struct pci_function *l
     n_handle vga = claim_function(&list[at]);
     CHECK(vga >= 0, "the VGA can be claimed again: %s", n_result_text(vga));
     if (vga < 0) return;
-    CHECK(n_hal_pci_hold_screen(vga, true) == 0 && n_hal_pci_hold_screen(vga, false) == 0, "and held and given back");
+    CHECK(n_screen_hold(vga, true) == 0 && n_screen_hold(vga, false) == 0, "and held and given back");
     n_handle_close(vga);
 }
 
@@ -1295,7 +1298,7 @@ int main(int argc,char **argv) {
             break;
         }
     acpi_refused_cases(pci, e);
-    CHECK(n_hal_pci_hold_screen(pci, true) == -N_ERR_NOT_FOUND, "edu has no screen to hold");
+    CHECK(n_screen_hold(pci, true) == -N_ERR_NOT_FOUND, "edu has no screen to hold");
     give_screen_cases(pci, list, n, 0);
     /* a function on bus 0 that is neither this device nor a bridge above it */
     for (int i = 0; i < n; i++)

@@ -24,6 +24,7 @@
 #include "mm/heap.h"
 #include "mm/shared.h"
 #include "mm/space.h"
+#include "dev/acpi.h"
 #include "dev/fb.h"
 #include "dev/gpu.h"
 #include "dev/audio.h"
@@ -230,11 +231,15 @@ static int64_t new_handle(int64_t r,struct handle *h) {
 /* ---- アプリの中の装置ドライバー（hal/claim.c、画面は dev/screen_driver.c） ----
    どの呼出しも claim の handle を引いて、閉じるまで持つ。 */
 
-static int64_t sys_hal_claim(int cap,uint32_t device) {
+static int64_t sys_hal_claim(int cap,uint32_t device,const char *udriver) {
+    char driver[sizeof((struct n_hal_device *)0)->driver];
+    int n=user_str(driver,udriver,sizeof driver);
+    if(n<0)return n;
+    if(!n)return -N_ERR_INVALID;
     struct handle *claim=NULL;
     int64_t r=cap_check(cap,N_CAP_HAL_CLAIM);
     if(r<0)return r;
-    r=hal_claim_open(device,&claim);
+    r=hal_claim_open(device,driver,&claim);
     return new_handle(r,claim);
 }
 static int64_t sys_hal_resources(int h,struct n_hal_resource *uout,size_t max) {
@@ -286,6 +291,36 @@ static int64_t sys_hal_bus_call(int h,const struct n_hal_call *ucall) {
     kfree(in);kfree(out);handle_close(claim);
     return r;
 }
+/* The claimed device's ACPI description (dev/acpi_claim.c): the arguments and their bytes, and the
+   result of at most N_ACPI_OUT_MAX bytes, go through kernel copies. */
+static int64_t sys_hal_acpi_eval(int h,const struct n_hal_acpi_call *ucall) {
+    struct n_hal_acpi_call call;
+    if(copy_from_user(&call,ucall,sizeof call))return -N_ERR_BAD_ADDRESS;
+    if(call.reserved || call.nargs>N_ACPI_ARGS_MAX || call.data_size>N_ACPI_DATA_MAX)return -N_ERR_INVALID;
+    size_t room=(size_t)MIN(call.out_size,(uint64_t)N_ACPI_OUT_MAX);
+    if(room && !user_ok_w(call.out,room))return -N_ERR_BAD_ADDRESS;
+    struct n_acpi_value args[N_ACPI_ARGS_MAX];
+    if(call.nargs && copy_from_user(args,call.args,call.nargs*sizeof *args))return -N_ERR_BAD_ADDRESS;
+    char name[5];
+    memcpy(name,call.name,4);
+    name[4]=0;
+    struct handle *claim=handle_get(h);
+    if(!claim)return -N_ERR_NO_HANDLE;
+    uint8_t *data=call.data_size?kmalloc(call.data_size):NULL,*out=room?kzalloc(room):NULL;
+    int64_t r=(call.data_size && !data) || (room && !out)?-N_ERR_NO_MEMORY:0;
+    if(!r && call.data_size && copy_from_user(data,call.data,call.data_size))r=-N_ERR_BAD_ADDRESS;
+    if(!r)r=acpi_claim_eval(claim,call.node,name,args,call.nargs,data,call.data_size,out,room);
+    if(r>0 && copy_to_user(call.out,out,(size_t)r))r=-N_ERR_BAD_ADDRESS;
+    kfree(data);kfree(out);handle_close(claim);
+    return r;
+}
+static int64_t sys_hal_acpi_notify_take(int h,uint64_t deadline) {
+    struct handle *claim=handle_get(h);
+    if(!claim)return -N_ERR_NO_HANDLE;
+    int64_t r=acpi_claim_notify_take(claim,deadline);
+    handle_close(claim);
+    return r;
+}
 static int64_t sys_hal_offer(int h,uint32_t kind,uint32_t instance,const char *ulabel) {
     char label[sizeof((struct n_hal_offer *)0)->label];
     int n=user_str(label,ulabel,sizeof label);
@@ -318,6 +353,15 @@ static int64_t sys_hal_power_done(int h,bool ok) {
     return r;
 }
 
+/* The boot screen's pixels in the claimed device's memory: held from the CPU's writes, or given back. */
+static int64_t sys_screen_hold(int h,uint64_t hold) {
+    if(hold>1)return -N_ERR_INVALID;
+    struct handle *claim=handle_get(h);
+    if(!claim)return -N_ERR_NO_HANDLE;
+    int64_t r=screen_driver_hold(claim,hold==1);
+    handle_close(claim);
+    return r;
+}
 /* An output's buffers a screen is drawn into, or given back. */
 static int64_t sys_screen_give(int h,uint32_t output,const struct n_screen_buffers *ub) {
     struct n_screen_buffers b;
@@ -1114,7 +1158,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_SHARED_VIEW: ret = sys_shared_view((int)a,b,c,(uint32_t)d,(uint32_t)e); break;
     case SYS_SHARED_COMPOSE: ret = sys_shared_compose((const struct n_shared_range *)a,b,(uint32_t)c); break;
     case SYS_SHARED_REVOKE: ret = sys_shared_revoke((int)a); break;
-    case SYS_HAL_CLAIM: ret = sys_hal_claim((int)a,(uint32_t)b); break;
+    case SYS_HAL_CLAIM: ret = sys_hal_claim((int)a,(uint32_t)b,(const char *)c); break;
     case SYS_HAL_CLAIM_RESOURCES: ret = sys_hal_resources((int)a,(struct n_hal_resource *)b,(size_t)c); break;
     case SYS_HAL_MAP: ret = sys_hal_map((int)a,(uint32_t)b); break;
     case SYS_HAL_INTERRUPTS: ret = sys_hal_interrupts((int)a,(uint32_t)b); break;
@@ -1124,6 +1168,9 @@ void syscall_dispatch(struct regs *r) {
     case SYS_HAL_OFFER_WITHDRAW: ret = sys_hal_offer_withdraw((int)a,(uint32_t)b,(uint32_t)c); break;
     case SYS_HAL_POWER_WAIT: ret = sys_hal_power_wait((int)a,b); break;
     case SYS_HAL_POWER_DONE: ret = sys_hal_power_done((int)a,b != 0); break;
+    case SYS_HAL_ACPI_EVAL: ret = sys_hal_acpi_eval((int)a,(const struct n_hal_acpi_call *)b); break;
+    case SYS_HAL_ACPI_NOTIFY_TAKE: ret = sys_hal_acpi_notify_take((int)a,b); break;
+    case SYS_SCREEN_HOLD: ret = sys_screen_hold((int)a,b); break;
     case SYS_SCREEN_GIVE: ret = sys_screen_give((int)a,(uint32_t)b,(const struct n_screen_buffers *)c); break;
     case SYS_SCREEN_FLIPS: ret = sys_screen_flips((int)a,(struct n_screen_flip *)b,(size_t)c,d); break;
     case SYS_SCREEN_VBLANK: ret = sys_screen_vblank((int)a,(const struct n_screen_vblank *)b); break;

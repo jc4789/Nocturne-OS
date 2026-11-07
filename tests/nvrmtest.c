@@ -3,12 +3,14 @@
    BAR 0 and runs rm_init_rm (RM's CPU, registry and OS objects, all before the GPU is touched),
    then RM must refuse the device and nvrm end with status 1. A crash there (status 128 + the
    CPU exception, e.g. 141 for "mov %cr4" in user mode) is what real hardware hit first.
-   nvrm claims with the N_CAP_HAL_CLAIM capability the test disk gives it; compiled inside Nocturne with tcc. Prints
+   The test claims edu with the N_CAP_HAL_CLAIM capability the test disk gives it and hands the claim to nvrm at
+   N_SERVICE_HANDLE_DEVICE, as the service manager does; compiled inside Nocturne with tcc. Prints
    "nvrmtest: N failed". */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "nocturne.h"
+#include "nocturne_services.h"
 
 static int failed;
 #define CHECK(c, ...)                                                                                                  \
@@ -44,16 +46,20 @@ nvrmtest: 1 failed
 ");
         return 1;
     }
-    /* nvrm takes the claim itself: the argument is the device's ledger id, the capability the fourth handle */
+    /* the argument is the device's ledger id, the claim the handle N_SERVICE_HANDLE_DEVICE */
     char where[16];
     snprintf(where, sizeof where, "%x", (unsigned)edu);
+    n_handle claim = n_hal_claim(n_cap_find(N_CAP_HAL_CLAIM), edu, "nvrm");
+    CHECK(claim >= 0, "claim edu for nvrm: %s", n_result_text(claim));
     n_handle log = n_system_log_open();
     const char *args[2] = {"nvrm", where};
-    int32_t handles[4] = {-1, log, log, n_cap_find(N_CAP_HAL_CLAIM)};
-    struct n_launch l = {.arguments = args, .handles = handles, .argument_count = 2, .handle_count = 4};
-    n_handle app = n_app_launch(N_FOLDER_SYSTEM "\\nvrm", &l);
+    int32_t handles[N_SERVICE_HANDLE_DEVICE + 1] = {-1, log, log, -1, claim};
+    struct n_launch l = {.arguments = args, .handles = handles, .argument_count = 2,
+                         .handle_count = N_SERVICE_HANDLE_DEVICE + 1};
+    n_handle app = claim >= 0 ? n_app_launch(N_FOLDER_SYSTEM "\\nvrm", &l) : claim;
     CHECK(app >= 0, "launch " N_FOLDER_SYSTEM "\\nvrm: %s", n_result_text(app));
     if (log >= 0) n_handle_close(log);
+    if (claim >= 0) n_handle_close(claim); /* nvrm's is the only one left: the claim ends with nvrm */
     if (app >= 0) {
         int status = -1;
         n_result r = n_app_result(app, n_clock_after(60000 * N_NS_PER_MS), &status);
@@ -71,7 +77,7 @@ nvrmtest: 1 failed
     CHECK(got >= 0 && !strstr(text, "rm_init_rm failed"), "rm_init_rm succeeded");
 
     /* the claim ends with nvrm: the device can be claimed again */
-    n_handle again = n_hal_claim(n_cap_find(N_CAP_HAL_CLAIM), edu);
+    n_handle again = n_hal_claim(n_cap_find(N_CAP_HAL_CLAIM), edu, "nvrmtest");
     CHECK(again >= 0, "claim after nvrm ended: %s", n_result_text(again));
     if (again >= 0) n_handle_close(again);
 

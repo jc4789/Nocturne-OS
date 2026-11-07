@@ -99,8 +99,8 @@ index 949ca6a3..eb12fdd7 100644
 +	ELF_NOTE_NOCTURNE_NAMESZ     = 9
 +	ELF_NOTE_NOCTURNE_DESCSZ     = 8
 +	ELF_NOTE_NOCTURNE_TAG        = 1
-+	ELF_NOTE_NOCTURNE_GENERATION = 4
-+	ELF_NOTE_NOCTURNE_SLOTS      = 240
++	ELF_NOTE_NOCTURNE_GENERATION = 5
++	ELF_NOTE_NOCTURNE_SLOTS      = 243
 +)
 +
 +var ELF_NOTE_NOCTURNE_NAME = []byte("Nocturne\x00")
@@ -4114,8 +4114,8 @@ index 00000000..0383e9c7
 +#define SYS_YIELD		28
 +#define SYS_THREAD_EXIT		47
 +#define SYS_THREAD_ID		50
-+#define N_ENTRY_CLOCK_MONOTONIC	236
-+#define N_ENTRY_CLOCK_WALL	238
++#define N_ENTRY_CLOCK_MONOTONIC	239
++#define N_ENTRY_CLOCK_WALL	241
 +
 +// The address of a slot, into a register.
 +#define SLOT(n, reg) \

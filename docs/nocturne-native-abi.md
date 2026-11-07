@@ -536,13 +536,17 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     台帳では `N_PROP_PCI_ADDRESS` の値である。`N_PCI_SELF` は `struct n_hal_pci_config` の `target` で
     「claim した機能そのもの」を言い、32 bit の外にある。上にブリッジがある機能は `N_PCI_HAS_UPSTREAM` が立ち、
     `upstream` がその住所である。
-  - `n_hal_claim(cap, device)` は台帳の装置 `device`（`id`）を動かす権利（`N_KIND_HAL_CLAIM`）を返す。`cap` は
-    `N_CAP_HAL_CLAIM`（§13）で、サービスの管理者が宣言のあるドライバーアプリにだけ渡す。持っている実装がある装置
+  - `n_hal_claim(cap, device, driver)` は台帳の装置 `device`（`id`）を動かす権利（`N_KIND_HAL_CLAIM`）を返す。`cap` は
+    `N_CAP_HAL_CLAIM`（§13）で、サービスの管理者が持つ。管理者は宣言（`user/apps/services.c` の装置ごとのサービス）の
+    規則に合う実装の無い装置ごとに権利を取り、ドライバーのアプリをその装置の id の 16 進数を引数にして起こし、
+    権利を handle `N_SERVICE_HANDLE_DEVICE`（4）で渡して、自分の handle は閉じる。ドライバーのアプリは能力を持たず、
+    渡された装置しか動かせない。管理者は台帳を見張り、装置が来れば起こし、去るかほかの実装が持てば止める。
+    `driver` は台帳に見せる実装の名（ドライバーのプログラムの名、空は `N_ERR_INVALID`）。持っている実装がある装置
     （カーネルのドライバーが動かしているもの）と、既に権利のある装置は `N_ERR_BUSY`。プロセスの実装を許さない
     装置（PCI のブリッジ）は `N_ERR_UNSUPPORTED`。同じ group の機能をカーネルのドライバーが使っていても、それが
     手放せるもの（`struct iommu_guest`：GPU の音の機能）なら、その機能は止まり、権利ができた後に domain の中で
     動き直す。権利が終わると、次の権利まで止まったまま。
-    権利を持つ間、台帳のその装置は `N_HAL_RUNNING` で、`driver` はアプリの名になる。権利は
+    権利を持つ間、台帳のその装置は `N_HAL_RUNNING` で、`driver` は `n_hal_claim` の `driver` になる。権利は
     最後のハンドルが閉じたとき（アプリの終わりを含む）と、装置がバスから去ったときに終わる。
     終わるとカーネルは (1) その権利の写像（`n_hal_map`）を全アプリから外し（その範囲は予約のまま、触れると
     全 1 が読める読取り専用のページ。バスから消えた装置と同じ）、(2) 割り込みとバスマスターを止め、
@@ -557,7 +561,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     保存状態を装置に保持し、次回に復元を再開する。完了までハンドルを返さない。
     起動画面GPUはgeneric FLRをせず、`N_PCI_NEEDS_RECOVERY`でnative driverへ回復責務を渡す。
     フレームバッファー描画の再開はscanoutの復旧保証ではなく、FLR成功も旧DMAのdrain証明ではない。
-  - 権利の呼出し（`N_CAP_HAL_CLAIM` を持つアプリが、持った権利に対して使う）：
+  - 権利の呼出し（権利の handle を持つアプリが使う）：
     - `n_hal_claim_resources(claim, out, max)`：装置が持つ資源（`struct n_hal_resource`：メモリ、ポート、GSI）の
       一覧を書き、全部の数を返す。`slot` はバスが決める番号で、PCI は BAR の番号である。
     - `n_hal_map(claim, slot)`：メモリの資源を装置メモリの共有オブジェクト（既定は非キャッシュ、プリフェッチ可能なら
@@ -565,8 +569,9 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     - `n_hal_interrupts(claim, count)`・`n_hal_interrupt_take(claim, bits, words, deadline)`：下の割り込み。
     - `n_hal_bus_call(claim, op, in, in_size, out, out_size)`：バスの持つ呼出し。`op` と `in`・`out` の形はバスの
       見出し（`common/hal_buses.h`）が決め、入力は 128 KiB、出力は 1 MiB まで。バスが持たなければ `N_ERR_UNSUPPORTED`。
-      PCI の呼出しは `n_hal_pci_info`・`n_hal_pci_config_read`・`n_hal_pci_config_write`・`n_hal_pci_hold_screen`・
-      `n_hal_pci_acpi_eval`・`n_hal_pci_acpi_notify_take`（libc の包み）で、以降の項がその意味を言う。
+      PCI の呼出しは `n_hal_pci_info`・`n_hal_pci_config_read`・`n_hal_pci_config_write`（libc の包み）で、以降の項が
+      その意味を言う。装置の ACPI の記述（`n_hal_acpi_eval`・`n_hal_acpi_notify_take`）と画面の保持（`n_screen_hold`）は
+      バスを問わない権利の呼出しである。
     - `n_hal_offer(claim, kind, instance, label)`・`n_hal_offer_withdraw(claim, kind, instance)`：この権利の実装が
       装置で提供するもの（`N_OFFER_GPU`、`N_OFFER_SCREEN` など）を台帳に載せ、外す。同じ `kind` と `instance` は
       `N_ERR_EXISTS`。権利が終わると全部外れる。
@@ -631,12 +636,13 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     作る）、回復が必要な機能として残す。primaryが戻らない場合と、回復不能・取消・未準備・
     起動画面のpeerは`N_ERR_NOT_READY`としてgroupを再遮断する。
     native driverへの回復委任は新primaryだけであり、未知peerの回復を暗黙に委ねない。
-  - `n_hal_pci_hold_screen(claim, hold)`：起動時の画面がその機能の BAR にあるとき、ドライバーが
+  - `n_screen_hold(claim, hold)`（`SYS_SCREEN_HOLD`）：起動時の画面が claim した装置のメモリーの資源（PCI なら
+    `n_hal_pci_info` の `framebuffer_bar` の BAR）にあるとき、ドライバーが
     CPU から画面への経路を作り直す間（NVIDIA の RM は GSP が BAR1 を仮想モードにする間）、
     システムは画面へ書かない。`true` は書込み中のものが終わってから戻り、入れ子にできる。最後の
     `false`（または claim の終わり）で画面全体を描き直す。時間切れで描画を再開することはない
     （作り直しの途中で書くことこそ保持が防ぐ競合）。claim の終わりは装置を止めて（BAR の写像の
-    取消し、割り込み、バスマスター）から保持を返す。起動項目 `fbhold=<秒>` を付けると、それだけ
+    取消し、割り込み、バスマスター）から保持を返す。返す保持が無ければ `N_ERR_INVALID`。起動項目 `fbhold=<秒>` を付けると、それだけ
     保持したとき、保持しているドライバーのアプリをシステムが止め、claim の終わりで CPU 描画を
     再開する（scanout の復旧保証ではない。時間の既定は無し：RM の待ちは次々に続き、上限を
     決められない。遅いだけのドライバーを止めると GPU が使えなくなる）。
@@ -783,26 +789,27 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     ない、またはオブジェクトが `n_screen_give` の受け付けないものなら `N_ERR_DENIED`、0 や
     65535 超の大きさ・未知の形式・面に収まらない範囲、または外す番号が無ければ `N_ERR_INVALID`。登録できない絵は表示エンジンへ
     出さないこと（パニック画面が見えなくなる）。
-  - `n_hal_pci_acpi_eval(claim, node, name, args, nargs, data, data_size, out, out_size)`：claim した
-    機能に属する ACPI の名前を一つ評価する（カーネルの AML 解釈器で）。`node` は
-    `N_ACPI_SELF`（その機能の装置：ホストブリッジの `_SEG`／`_BBN` から `_ADR` をたどる）、
-    `N_ACPI_CHILD(i)`（その装置の i 番目の子装置）、`N_ACPI_UPSTREAM`（上流のブリッジ、
-    ルートにある機能ならホストブリッジ）だけ。ほかの名前空間へは届かない。`name` は 4 文字の
+  - `n_hal_acpi_eval(claim, node, name, args, nargs, data, data_size, out, out_size)`（`SYS_HAL_ACPI_EVAL`、
+    要求は `struct n_hal_acpi_call`）：claim した装置に属する ACPI の名前を一つ評価する（カーネルの AML 解釈器で）。
+    どのバスの装置でも同じ。`node` は `N_ACPI_SELF`（その装置の firmware の節。ACPI の装置はその節、PCI の機能は
+    ホストブリッジの `_SEG`／`_BBN` から `_ADR` をたどった節）、`N_ACPI_CHILD(i)`（その節の i 番目の子装置）、
+    `N_ACPI_PARENT`（装置の木で上の装置の節：PCI の機能なら上流のブリッジ、ルートにある機能ならホストブリッジ）
+    だけ。ほかの名前空間へは届かない。`name` は 4 文字の
     名前一つ（`_DSM`、`_ROM` など。3 文字の名前は `_ON_` のように `_` で埋める。上へ探しには
-    行かない）。引数は 7 個まで：整数、`data`（64 KiB まで）の中を指すバッファーと文字列
+    行かない）。引数は `N_ACPI_ARGS_MAX`（7）個まで：整数、`data`（`N_ACPI_DATA_MAX`、64 KiB まで）の中を指すバッファーと文字列
     （`struct n_acpi_value` の `value` が `data` 内の位置、`length` が長さ。文字列の長さに
     終わりの NUL は含めず、AML へはカーネルが NUL を足して渡す）。結果は `out` へ、値の並び
     （幅優先。パッケージの `value` は最初の子の番号、`length` は子の数。文字列とバッファーの
     `value` は値の並びの後ろに続くバイトの位置）とその後のバイトで書き、書いたバイト数を返す
-    （1 MiB まで）。下の断る方法は `N_ERR_DENIED`。`name` が 4 文字の名前でない、引数が多すぎる
-    か `data` の外を指す、子の番号が最後の子より後（機能自体に名前空間の装置が無ければ子も
-    無い）なら `N_ERR_INVALID`、AML が無ければ `N_ERR_UNSUPPORTED`、装置（`N_ACPI_SELF`、
-    `N_ACPI_UPSTREAM`）や名前が無ければ `N_ERR_NOT_FOUND`、`out` が足りなければ
+    （`N_ACPI_OUT_MAX`、1 MiB まで）。下の断る方法は `N_ERR_DENIED`。`name` が 4 文字の名前でない、引数が多すぎる
+    か `data` の外を指す、`reserved` が 0 でない、子の番号が最後の子より後（装置自体に名前空間の節が無ければ子も
+    無い）なら `N_ERR_INVALID`、AML が無ければ `N_ERR_UNSUPPORTED`、節（`N_ACPI_SELF`、
+    `N_ACPI_PARENT`）や名前が無ければ `N_ERR_NOT_FOUND`、`out` が足りなければ
     `N_ERR_TOO_LARGE`、評価の失敗は `N_ERR_IO`。
     - 断る方法：システム自身が装置と機械を動かすための定義済みの方法。ドライバーが評価すると、
-      カーネルが把握している装置の状態（dev/pm.c、dev/pci.c）が裏で変わり、上流のブリッジでは
-      その下の全機能（ホストブリッジなら機械全体）を巻き込む。どの `node` でも、装置を探す前に
-      断るので、名前空間の装置の無い機能でも答えは同じ。
+      カーネルが把握している装置の状態（dev/pm.c、dev/pci.c、hal/power.c）が裏で変わり、上の装置では
+      その下の全装置（ホストブリッジなら機械全体）を巻き込む。どの `node` でも、節を探す前に
+      断るので、名前空間の節の無い装置でも答えは同じ。
       - 電源とリセット：`_PS0`〜`_PS3`、`_ON_`、`_OFF`、`_RST`。D 状態はカーネルのもの（PMCSR
         の D 状態も claim からは書けない）。電源資源はほかの装置と共有されることがある。
       - 取出し・固定・ドッキング：`_EJ0`〜`_EJ4`、`_LCK`、`_DCK`。
@@ -813,9 +820,9 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
       - 初期化と処理：`_INI`、`_REG`、`_EVT`。名前空間の作成、領域の準備、GPIO の事象のときに
         カーネルの AML 処理が呼ぶもので、ドライバーが呼び直すとファームウェアの状態が崩れる。
       - システムの睡眠：`_PTS`、`_WAK`、`_TTS`、`_GTS`、`_BFS`。
-      - `N_ACPI_UPSTREAM` では、`_` で始まらない名前（ファームウェア独自の方法）もすべて断る。
-        ブリッジの独自の方法（スロットの電源やリンクを切るものなど）はその下の全機能に効き、
-        ブリッジのレジスターと同じくプラットフォームのもの（ブリッジは claim できない）。
+      - `N_ACPI_PARENT` では、`_` で始まらない名前（ファームウェア独自の方法）もすべて断る。
+        上の装置の独自の方法（ブリッジのスロットの電源やリンクを切るものなど）はその下の全装置に効き、
+        上の装置はこの claim のものではない（PCI のブリッジは claim できない）。
         ブリッジの `_DSM`（PCI Firmware 仕様の、下の装置のための関数）や `_PRT`、`_HID` などの
         照会はこれまでどおり評価できる。
     - 断る一覧にした理由：ドライバーとファームウェアの取決めには装置ごとの独自の名前（RM の
@@ -823,13 +830,13 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
       なる。危険な定義済みの方法は ACPI 仕様の定める有限の集まりで、増えるのは仕様の改訂の
       ときだけ。自分の装置とその子の独自の名前は、その装置とファームウェアの取決めとして
       ドライバーに任せる（RM の JT の `_DSM` と同じく、装置全体の電源に触れるものもある）。
-      上流のブリッジの独自の名前はその下の全機能（ホストブリッジなら機械全体）に効くので、そこ
+      上の装置の独自の名前はその下の全装置（ホストブリッジなら機械全体）に効くので、そこ
       では全部断る。RM（ports/nvidia/os_acpi.c）が使う、自分の装置と上流の `_DSM`、自分の装置の
       `_ROM`・`_DOD`、子の `_ADR`・`_DDC`・`MXDS`・`MXDM` はどれも断る方法に当たらない。
-  - `n_hal_pci_acpi_notify_take(claim, deadline)`：その機能の装置へ届いた ACPI の Notify を一つ
-    取り出し、値を返す（最初の呼出しで受取りを始め、claim の終わりまで続く。32 個まで溜め、
-    溢れたら古いものから捨てる）。期限（§8）まで届かなければ `N_ERR_TIMEOUT`、装置が
-    無ければ `N_ERR_NOT_FOUND`。
+  - `n_hal_acpi_notify_take(claim, deadline)`（`SYS_HAL_ACPI_NOTIFY_TAKE`）：claim した装置の節へ届いた ACPI の
+    Notify を一つ取り出し、値を返す（最初の呼出しで受取りを始め、claim の終わりまで続く。32 個まで溜め、
+    溢れたら古いものから捨てる）。期限（§8）まで届かなければ `N_ERR_TIMEOUT`、装置に節が
+    無ければ `N_ERR_NOT_FOUND`、claim が終わったら `N_ERR_CLOSED`。
   - `n_hal_interrupts(claim, count)` は MSI-X（無ければ MSI）を、機能と系が出せる本数まで
     つなぎ、本数を返す。INTx はアプリへ渡さない。届いた割り込みは番号のビットを立て、ビットが
     ある間ハンドルは `N_EVENT_RECEIVABLE`。`n_hal_interrupt_take(claim, bits, words, deadline)` は

@@ -277,6 +277,10 @@ struct hal_device *hal_find_firmware(const struct firmware_node *f) {
     return d;
 }
 
+struct firmware_node *hal_parent_firmware(const struct hal_device *d) {
+    return d->parent && d->parent != &hal_root ? d->parent->firmware : NULL;
+}
+
 void hal_put(struct hal_device *d) {
     uint64_t f = spin_lock(&hal_lock);
     ASSERT(d->holds);

@@ -20,12 +20,14 @@ HAL は、機械の全部の装置を一つの木に持ち、実装に結びつ�
 | 提供 | `hal_offer`。実装が装置の上で提供するもの（ディスク、NIC、音の出口、画面）を台帳に見せる |
 | 依存 | `hal_depends`。木の外の依存（ACPI の `_DEP`）。止める順と戻す順に効く |
 | 眠り | 木の順。子と依存する側が先に止まり、親と依存先が先に戻る |
-| プロセスの実装 | 同じ装置を `n_hal_claim` で持つ。資源の写しと割り込みと DMA は同じ口で、バスだけの操作は `n_hal_bus_call` |
+| 機械の装置 | `struct hal_machine`（`HAL_MACHINE`）。核が firmware の表から直に使う装置（HPET、RTC、PCI のホスト、割り込みの link など）を持ち主の部品が宣言する。HAL は結ばず、claim させず、台帳には持ち主の名で `N_HAL_RUNNING` と見せる |
+| firmware の節 | `hal_device` の `firmware`（中身の見えない `struct firmware_node`、今は ACPI の名前空間の節）。バスが書く。`hal_find_firmware`・`hal_parent_firmware` で引く |
+| プロセスの実装 | サービスの管理者が装置ごとに `n_hal_claim` で持ち、claim の handle を実装のプロセスへ渡す。資源の写しと割り込みと DMA は同じ口で、firmware の記述は `n_hal_acpi_eval`、バスだけの操作は `n_hal_bus_call` |
 
 ## 足し方
 
 - **実装を足す**：`struct hal_driver` を書き、`HAL_DRIVER(名前)` を置く。表は無い。
-- **プロセスの実装を足す**：`user/apps/services.c` の宣言に規則を書く。
+- **プロセスの実装を足す**：`user/apps/services.c` の宣言に規則とプログラムを書く。管理者が台帳を見張り、合う空いた装置ごとに claim を取って `N_SERVICE_HANDLE_DEVICE` で渡す。
 - **バスを足す**：`common/hal_buses.h` に名前を足し、見つけた物を `hal_publish` する。`struct hal_bus_ops` を書く。
 - **種類を足す**：種類の見出しと一覧を作り、実装から `hal_offer` する。HAL は種類を知らない。
 - **VM だけの実装**：`HAL_DRIVER` を置かず、`vm/vm.c` が VM の中でだけ `hal_driver_add` で足す。

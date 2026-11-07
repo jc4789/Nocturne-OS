@@ -1,6 +1,6 @@
 /* nvrm: NVIDIA's Resource Manager as a user-space driver app (C:\Nocturne\System\nvrm).
  *
- * サービスの管理者が装置ごとに起こし、nvrm が N_CAP_HAL_CLAIM で自分の装置を claim する
+ * サービスの管理者が装置ごとに起こし、その装置の claim を N_SERVICE_HANDLE_DEVICE で渡す
  * (docs/nocturne-native-abi.md, section 9). nvrm brings RM up on it the way NVIDIA's kernel
  * interface layer does when a device is probed and first opened, then serves RM's client API
  * (nvrm_serve.c) to other apps:
@@ -388,17 +388,20 @@ static void tear_down(void) {
 int main(int argc, char **argv) {
     nvrm_log_init();
     nvrm_log("NVRM: Nocturne user-space RM %s", NVRM_FIRMWARE_VERSION);
-    /* 引数は台帳の装置の id の 16 進数（services.c の gpu の項目）。claim はこの app の持ち物で、
-       装置の DMA ごとこの app と一緒に終わる。 */
+    /* 引数は台帳の装置の id の 16 進数（services.c の gpu の項目）、handle N_SERVICE_HANDLE_DEVICE はその装置の
+       claim。claim はこの app だけが持ち、装置の DMA ごとこの app と一緒に終わる。 */
     if (argc < 2) {
         nvrm_log("NVRM: started without a device id");
         return 1;
     }
     unsigned long device = strtoul(argv[1], NULL, 16);
-    if (nvrm_dev.claim < 0) {
-        nvrm_log("NVRM: cannot claim %s: %s", argv[1], n_result_text(nvrm_dev.claim));
+    n_result kind = n_handle_kind(N_SERVICE_HANDLE_DEVICE);
+    if (kind != N_KIND_HAL_CLAIM) {
+        nvrm_log("NVRM: started without the claim of device %s (%s)", argv[1],
+                 kind < 0 ? n_result_text(kind) : "another kind of handle");
         return 1;
     }
+    nvrm_dev.claim = N_SERVICE_HANDLE_DEVICE;
 
     if (!bring_up()) {
         tear_down();

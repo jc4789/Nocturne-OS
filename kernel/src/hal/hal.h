@@ -145,6 +145,8 @@ void hal_remove(struct hal_device *d);
 void hal_device_discard(struct hal_device *d);
 /* firmware の節 f が記述する装置。見つかれば記録を hold する（hal_put で放す）。去っている装置は見つからない。眠らない。 */
 struct hal_device *hal_find_firmware(const struct firmware_node *f);
+/* 木で d の上の装置の firmware の節。根の子か、上の装置を firmware が記述しなければ NULL。 */
+struct firmware_node *hal_parent_firmware(const struct hal_device *d);
 /* d はこの後、on より先に止まり、on より後に戻る（ACPI の _DEP）。眠ってよい thread から。 */
 void hal_depends(struct hal_device *d, struct hal_device *on);
 static inline uint32_t hal_id(const struct hal_device *d) { return d->id; }
@@ -254,7 +256,8 @@ struct hal_claim_ops {
 extern const struct hal_claim_ops hal_claim_plain;
 
 /* 呼ぶ側が持っている handle を受ける。眠ってよい thread から、spinlock を持たずに呼ぶ。 */
-int64_t hal_claim_open(uint32_t device, struct handle **out);
+/* driver は台帳に見せる実装の名（claim を渡されて動くプログラムの名）。 */
+int64_t hal_claim_open(uint32_t device, const char *driver, struct handle **out);
 int64_t hal_claim_resources(struct handle *h, struct n_hal_resource *user_out, size_t max);
 int64_t hal_claim_interrupts(struct handle *h, uint32_t count);
 int64_t hal_claim_interrupt_take(struct handle *h, uint64_t deadline, uint64_t *user_bits, uint32_t words);
@@ -271,7 +274,8 @@ int64_t hal_claim_power_done(struct handle *h, bool ok);
    hal_claim_revoked：claim は終わった（最後の handle が閉じた、または装置が去った）。写像はもう持ち主のものでない。
    hal_claim_dma_reusable：残っている DMA の頁をメモリーへ返してよい（動いている claim か、装置が届かないと確かめて終わった）。
    hal_claim_memory：メモリーの資源 slot の番地と大きさ（頁に揃っていること）。
-   hal_claim_device・hal_claim_bus：装置の記録と、バスが begin で置いた記録。
+   hal_claim_device・hal_claim_bus：装置の記録と、バスが begin で置いた記録。claim の呼出しの間、装置の記録に触るなら
+   hal_claim_enter で hold する。
    hal_claim_on_end：claim の終わりにバスが装置を止めた後、hook の ended を一度呼ぶ（画面を返す、保持を戻す）。終わりが
    もう始まっていれば false（hook は呼ばれない）。ended は終わりの途中で走り、眠ってよい。 */
 struct hal_claim_end {
@@ -290,6 +294,8 @@ bool hal_claim_dma_map(struct hal_claim *c, const uint64_t *frames, uint64_t bas
 bool hal_claim_dma_unmap(struct hal_claim *c, const uint64_t *frames, uint64_t base, size_t count);
 int64_t hal_claim_memory(struct hal_claim *c, uint32_t slot, uint64_t *address, uint64_t *size, bool *prefetchable);
 struct hal_device *hal_claim_device(const struct hal_claim *c);
+/* claim の終わりが始まっていなければ装置の記録を hold して返す（hal_put で放す）。始まっていれば NULL。 */
+struct hal_device *hal_claim_enter(struct hal_claim *c);
 void *hal_claim_bus(const struct hal_claim *c);
 bool hal_claim_on_end(struct hal_claim *c, struct hal_claim_end *e);
 

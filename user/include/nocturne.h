@@ -136,7 +136,8 @@ n_result n_system_log(char *buf, size_t cap); /* the newest system log text; its
 n_handle n_system_log_open(void);
 n_result n_app_id(n_handle app); /* its identifier, also after its end (identifiers are not reused) */
 /* アプリの中の装置ドライバー（docs/nocturne-native-abi.md §9）。n_hal_claim は N_CAP_HAL_CLAIM の能力で、台帳
-   （n_hal_snapshot）の装置を一つ持つ。持った handle（N_KIND_HAL_CLAIM）は、起こすドライバーのアプリへ渡せる。
+   （n_hal_snapshot）の装置を一つ持つ。driver は台帳に見せる実装の名（claim を受けて動くプログラムの名）。持った
+   handle（N_KIND_HAL_CLAIM）は、起こすドライバーのアプリへ渡す（サービスの管理者は N_SERVICE_HANDLE_DEVICE に渡す）。
    claim は最後の handle が閉じる（アプリの終わりを含む）か、装置が去ると終わる：写像と割り込みと提供が消え、バスが
    装置を止める。動いている実装がある装置は N_ERR_BUSY、プロセスの実装を許さない装置（PCI のブリッジ）は
    N_ERR_DENIED。IOMMU があれば機能の DMA は claim の DMA の object にしか届かず、無ければ n_hal_pci_info が
@@ -144,7 +145,7 @@ n_result n_app_id(n_handle app); /* its identifier, also after its end (identifi
    N_PCI_NEEDS_RECOVERY で知らせる。
    n_hal_claim_resources は装置の資源（struct n_hal_resource）を max 件まで out へ書き、資源の全部の数を返す。slot は
    バスが決める番号で、PCI は BAR の番号である。 */
-n_handle n_hal_claim(n_handle cap, uint32_t device);
+n_handle n_hal_claim(n_handle cap, uint32_t device, const char *driver);
 n_result n_hal_claim_resources(n_handle claim, struct n_hal_resource *out, size_t max);
 /* メモリーの資源の slot を、装置のメモリーの上の共有 object にする（uncached。n_shared_view で write-combining の
    部分や小さい窓を作れる：資源が N_HAL_PREFETCHABLE のときだけ）。頁に揃わない資源は N_ERR_UNSUPPORTED。 */
@@ -168,6 +169,24 @@ n_result n_hal_offer_withdraw(n_handle claim, uint32_t kind, uint32_t instance);
    false で答える（眠りは取りやめになる）。答えない、または呼ばない claim を持つ装置がある間、機械は眠らない。 */
 n_result n_hal_power_wait(n_handle claim, uint64_t deadline);
 n_result n_hal_power_done(n_handle claim, bool ok);
+/* 装置の ACPI の記述（firmware の書いたまま。どのバスの装置でも）：装置の節（N_ACPI_SELF）、その節の device の子
+   （N_ACPI_CHILD(i)、名前空間の順）、木で上の装置の節（N_ACPI_PARENT。PCI の機能なら上のブリッジ、root bus なら
+   ホストブリッジ）。
+   n_hal_acpi_eval は、その節の直下の名前 name（1 区画の 4 文字：「_DSM」「_ADR」）を、nargs 個（N_ACPI_ARGS_MAX
+   まで）の整数、文字列、バッファーの引数（中身は data、N_ACPI_DATA_MAX まで）で評価し、結果を out へ書く：
+   struct n_acpi_value の記録、最初が結果、続いて文字列とバッファーのバイト。書いたバイト数を返す（N_ACPI_OUT_MAX
+   まで）。N_ERR_DENIED（節があってもなくても）：システムが装置と機械を動かすのに使う method（電源とリセット _PS0
+   から _PS3、_ON_、_OFF、_RST。取り外しとドッキング _EJ0 から _EJ4、_LCK、_DCK。資源 _DIS、_SRS。firmware が何を
+   制御するかの交渉 _OSC、_OST。起こし _PSW、_DSW。初期化と handler _INI、_REG、_EVT。システムの眠り _PTS、_WAK、
+   _TTS、_GTS、_BFS）、そして N_ACPI_PARENT では _ で始まらない全部の名前（上の装置の method は、その下の全部の
+   装置と機械のものである）。N_ERR_NOT_FOUND：その節か object が無い。N_ERR_INVALID：最後の子より先の番号（節の
+   無い装置に子は無い）、壊れた名前か引数。N_ERR_TOO_LARGE：out が小さい。N_ERR_IO：AML が失敗。
+   N_ERR_UNSUPPORTED：AML なしで動いている。
+   n_hal_acpi_notify_take は、装置の節への次の Notify の値を、最初の呼出し以後から返す（n_hal_interrupt_take と
+   同じに deadline まで待つ。取られない 32 件を持ち、古いものが譲る。N_ERR_NOT_FOUND：装置に節が無い）。 */
+n_result n_hal_acpi_eval(n_handle claim, uint32_t node, const char *name, const struct n_acpi_value *args,
+                         uint32_t nargs, const void *data, size_t data_size, void *out, size_t out_size);
+n_result n_hal_acpi_notify_take(n_handle claim, uint64_t deadline);
 /* PCI の機能の claim だけの操作（N_PCI_CALL_*、hal_buses.h）。
    n_hal_pci_info：機能の身元、BAR、上のブリッジ、ファームウェアの画面の置き場所。
    構成空間：幅 1、2、4 で、幅に揃った 4096 未満の offset。読みは別の機能（N_PCI_TARGET。例：上のブリッジ）か
@@ -193,6 +212,15 @@ n_result n_hal_pci_config_write(n_handle claim, uint32_t offset, uint32_t width,
    N_ERR_DENIED：ほかの claim の object か、buffer が持てない型。N_ERR_INVALID：count が 0 か N_SCREEN_BUFFERS_MAX
    より多い、大きさが 0 か 65535 より大きい、知らない format、object の外の範囲、返すものが無い。 */
 n_result n_screen_give(n_handle claim, uint32_t output, const struct n_screen_buffers *buffers);
+/* ドライバーが、claim した装置のメモリー（PCI なら n_hal_pci_info が framebuffer_bar で示す BAR）の中のブート画面への
+   CPU の届き方を変える間、システムはそこへ書いてはならない。hold true は書込みが無くなってから返り、画面に触れずに
+   保つ。保持は入れ子になり、最後の false（か claim の終わり）が framebuffer の描画を再開する（GPU の走査ではない）。
+   ドライバーの落ちやリセットの後の回復は保証しない。時間で保持の上に描くことはしない：それが防ぐ競合そのものである。
+   claim の終わりは、CPU の描画が戻る前に装置を止める（写像、割り込み、バスマスター）。起動の引数 fbhold=<秒>（既定は
+   無し）の時間続いた保持は、ドライバーのアプリを止め、その claim の終わりが保持を返す。n_screen_give で画面 0 が
+   描かれているドライバーも、同じように保持する。N_ERR_NOT_FOUND：ブート画面はほかにあり、画面 0 はこの claim の
+   buffer に描かれていない。N_ERR_INVALID：返す保持が無い。 */
+n_result n_screen_hold(n_handle claim, bool hold);
 /* claim の出力の画面が求める flip（struct n_screen_flip）を out へ最大 max 件、deadline（N_CLOCK_NEVER：限りなし）
    まで待って返す：件数、期限なら 0。まだ取られていない flip は出力の次の flip に替わる。ドライバーは flip の
    buffer を次の垂直帰線から見せ、n_screen_report_vblank で知らせる。 */

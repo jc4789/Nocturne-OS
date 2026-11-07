@@ -1,6 +1,6 @@
 /* NVIDIA RM on Nocturne: the PCI function, its BARs and interrupts, and system memory for the GPU.
  *
- * Everything is reached through the claim (N_KIND_HAL_CLAIM) nvrm takes with its N_CAP_HAL_CLAIM (main):
+ * Everything is reached through the claim (N_KIND_HAL_CLAIM) the service manager gives nvrm (main):
  *   config space      n_hal_pci_config_read / n_hal_pci_config_write
  *   register BAR      n_hal_map + n_shared_map (BAR0, mapped whole at start)
  *   other BAR ranges  n_hal_map + n_shared_view (uncached or write-combining) + n_shared_map
@@ -569,19 +569,19 @@ void NV_API_CALL nv_get_screen_info(nv_state_t *nv, NvU64 *base, NvU32 *width, N
 /* RM brackets starting, disabling and shutting down the adapter (and power transitions) with
    these when nv_get_screen_info reports the boot screen in this GPU's BAR: physical RM (GSP)
    rebuilds BAR1 meanwhile, and a CPU write through BAR1 can disturb that. The system stops
-   drawing there (n_hal_pci_hold_screen) until the matching enable. RM keeps the boot screen mapped
+   drawing there (n_screen_hold) until the matching enable. RM keeps the boot screen mapped
    at BAR1 offset 0 through virtual mode when the screen starts there (logged at attach), so
    drawing then goes on where it was. Only the enable or the end of nvrm's claim (which revokes
    BAR access, interrupts and bus mastering first) releases drawing. This does not guarantee
    recovery of GPU firmware or scanout; with boot option fbhold=<s> the system stops nvrm when
    a hold lasts that long. */
 void NV_API_CALL os_disable_console_access(void) {
-    n_result r = n_hal_pci_hold_screen(nvrm_dev.claim, true);
+    n_result r = n_screen_hold(nvrm_dev.claim, true);
     if (r < 0 && r != -N_ERR_NOT_FOUND) nvrm_log("NVRM: cannot hold the boot screen: %s", n_result_text(r));
     else if (r >= 0) nvrm_log("NVRM: the system stopped drawing to the boot screen");
 }
 void NV_API_CALL os_enable_console_access(void) {
-    n_result r = n_hal_pci_hold_screen(nvrm_dev.claim, false);
+    n_result r = n_screen_hold(nvrm_dev.claim, false);
     if (r < 0 && r != -N_ERR_NOT_FOUND) nvrm_log("NVRM: cannot release the boot screen: %s", n_result_text(r));
     else if (r >= 0) nvrm_log("NVRM: the system draws to the boot screen again");
 }

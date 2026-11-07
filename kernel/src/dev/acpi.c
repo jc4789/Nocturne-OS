@@ -163,7 +163,7 @@ const struct acpi_entry *acpi_entry_next(const struct acpi_sdt *table, uint32_t 
 
 /* ---- AML: uACPI (third_party/uacpi) on Nocturne's own kernel services ----
    uACPI is called from any CPU: the "acpi" kernel thread runs its deferred work (GPE methods,
-   Notify), and threads that evaluate a method (dev/pciuser.c) or change the power state call in
+   Notify), and threads that evaluate a method for a claim (dev/acpi_claim.c) or change the power state call in
    where they run. Its locks and events are counting semaphores, each a count under its own
    spinlock with a wait queue; its spinlocks are the kernel's (arch/spin.h); the SCI is an IOAPIC
    line of the interrupt layer's (uacpi_kernel_install_interrupt_handler). */
@@ -962,13 +962,9 @@ void acpi_wake(unsigned state) {
 
 bool acpi_reset(void) { return aml_ready && uacpi_reboot() == UACPI_STATUS_OK; }
 
-/* ---- a PCI function's part of the namespace (acpi.h) ----
-   Names are looked up directly under the node they are relative to (uacpi_eval does not search
-   upwards), and one name segment cannot leave it ("^" and "\" are no name characters): a driver
-   reaches its function's node, that node's children, and the bridge above it, nothing else. */
+/* ---- PCI functions' nodes, and evaluating a name under a node (acpi.h) ---- */
 #define PCI_DEPTH_MAX 32  /* bridges from a root bus down to a function */
 #define EVAL_DEPTH_MAX 32 /* packages in packages of one result */
-#define EVAL_ARGS_MAX 7   /* Arg0..Arg6 */
 
 struct host_search {
     uint64_t segment, bus;
@@ -1142,8 +1138,8 @@ static int64_t result_write(uacpi_object *result, uint8_t *out, size_t out_size)
 int64_t acpi_node_eval(struct firmware_node *node, const char *name, const struct n_acpi_value *args, uint32_t nargs,
                        const uint8_t *data, size_t data_size, uint8_t *out, size_t out_size) {
     if (!aml_ready || !node) return -N_ERR_NOT_FOUND;
-    if (!acpi_name_segment(name) || nargs > EVAL_ARGS_MAX) return -N_ERR_INVALID;
-    uacpi_object *list[EVAL_ARGS_MAX] = {0};
+    if (!acpi_name_segment(name) || nargs > N_ACPI_ARGS_MAX) return -N_ERR_INVALID;
+    uacpi_object *list[N_ACPI_ARGS_MAX] = {0};
     int64_t r = 0;
     for (uint32_t i = 0; i < nargs && !r; i++) {
         const struct n_acpi_value *a = &args[i];

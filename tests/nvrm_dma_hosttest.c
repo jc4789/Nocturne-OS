@@ -122,7 +122,7 @@ n_result n_hal_pci_config_write(n_handle pci, uint32_t offset, uint32_t width, u
     if (!command_ignores_writes) command_register = (uint16_t)value;
     return 0;
 }
-n_result n_hal_pci_hold_screen(n_handle pci, bool hold) {
+n_result n_screen_hold(n_handle pci, bool hold) {
     (void)pci;
     screen_calls++;
     if (screen_result < 0) return screen_result;

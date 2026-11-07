@@ -485,7 +485,9 @@ n_result n_system_log(char *buf, size_t cap) { return NC5(SYS_SYSTEM_LOG, buf, c
 n_handle n_system_log_open(void) { return (n_handle)NC5(SYS_SYSTEM_LOG_OPEN, 0, 0, 0, 0, 0); }
 n_handle n_app_open(int64_t id) { return (n_handle)NC5(SYS_APP_OPEN, id, 0, 0, 0, 0); }
 n_result n_app_id(n_handle app) { return NC5(SYS_APP_ID, app, 0, 0, 0, 0); }
-n_handle n_hal_claim(n_handle cap, uint32_t device) { return (n_handle)NC5(SYS_HAL_CLAIM, cap, device, 0, 0, 0); }
+n_handle n_hal_claim(n_handle cap, uint32_t device, const char *driver) {
+    return (n_handle)NC5(SYS_HAL_CLAIM, cap, device, (uintptr_t)driver, 0, 0);
+}
 n_result n_hal_claim_resources(n_handle claim, struct n_hal_resource *out, size_t max) {
     return NC5(SYS_HAL_CLAIM_RESOURCES, claim, out, max, 0, 0);
 }
@@ -506,6 +508,17 @@ n_result n_hal_offer_withdraw(n_handle claim, uint32_t kind, uint32_t instance) 
 }
 n_result n_hal_power_wait(n_handle claim, uint64_t deadline) { return NC5(SYS_HAL_POWER_WAIT, claim, deadline, 0, 0, 0); }
 n_result n_hal_power_done(n_handle claim, bool ok) { return NC5(SYS_HAL_POWER_DONE, claim, ok ? 1 : 0, 0, 0, 0); }
+n_result n_hal_acpi_eval(n_handle claim, uint32_t node, const char *name, const struct n_acpi_value *args,
+                         uint32_t nargs, const void *data, size_t data_size, void *out, size_t out_size) {
+    if (strlen(name) != 4) return -N_ERR_INVALID;
+    struct n_hal_acpi_call call = {.node = node, .nargs = nargs, .args = args, .data = data, .data_size = data_size,
+                                   .out = out, .out_size = out_size};
+    memcpy(call.name, name, 4);
+    return NC5(SYS_HAL_ACPI_EVAL, claim, &call, 0, 0, 0);
+}
+n_result n_hal_acpi_notify_take(n_handle claim, uint64_t deadline) {
+    return NC5(SYS_HAL_ACPI_NOTIFY_TAKE, claim, deadline, 0, 0, 0);
+}
 n_result n_hal_pci_info(n_handle claim, struct n_hal_pci_info *out) {
     return n_hal_bus_call(claim, N_PCI_CALL_INFO, NULL, 0, out, sizeof *out);
 }
@@ -520,6 +533,7 @@ n_result n_hal_pci_config_write(n_handle claim, uint32_t offset, uint32_t width,
 n_result n_screen_give(n_handle claim, uint32_t output, const struct n_screen_buffers *buffers) {
     return NC5(SYS_SCREEN_GIVE, claim, output, buffers, 0, 0);
 }
+n_result n_screen_hold(n_handle claim, bool hold) { return NC5(SYS_SCREEN_HOLD, claim, hold ? 1 : 0, 0, 0, 0); }
 n_result n_screen_flips(n_handle claim, struct n_screen_flip *out, size_t max, uint64_t deadline) {
     return NC5(SYS_SCREEN_FLIPS, claim, out, max, deadline, 0);
 }

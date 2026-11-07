@@ -257,3 +257,10 @@ int64_t acpi_node_eval(struct firmware_node *node, const char *name, const struc
 struct acpi_watch;
 struct acpi_watch *acpi_node_watch(struct firmware_node *node, void (*fn)(void *context, uint64_t value), void *context);
 void acpi_node_unwatch(struct acpi_watch *w);
+
+/* 持たれた装置の ACPI の記述（dev/acpi_claim.c）。h は呼ぶ側が持つ claim の handle。args と data と out は核の
+   写し。acpi_claim_eval は書いたバイト数、acpi_claim_notify_take は次の Notify の値を返す。眠る。 */
+struct handle;
+int64_t acpi_claim_eval(struct handle *h, uint32_t which, const char *name, const struct n_acpi_value *args,
+                        uint32_t nargs, const uint8_t *data, size_t data_size, uint8_t *out, size_t out_size);
+int64_t acpi_claim_notify_take(struct handle *h, uint64_t deadline);

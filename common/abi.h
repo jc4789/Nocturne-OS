@@ -132,8 +132,8 @@ enum {
     SYS_MEMORY_RESERVE, SYS_MEMORY_RELEASE, SYS_MEMORY_PROTECT,
     SYS_SHARED_MAP, /* (shared handle, bytes, N_MEMORY_READ or N_MEMORY_READ_WRITE) */
     /* アプリの中の装置ドライバー（docs/nocturne-native-abi.md §9）：台帳の装置を持つ権利（N_KIND_HAL_CLAIM）、
-       その資源、割り込み、台帳への提供、眠りの知らせ、バスだけの操作。 */
-    SYS_HAL_CLAIM,            /* (N_CAP_HAL_CLAIM の cap, 台帳の装置の id) -> claim */
+       その資源、割り込み、台帳への提供、眠りの知らせ、バスだけの操作。firmware の記述は SYS_HAL_ACPI_*。 */
+    SYS_HAL_CLAIM,            /* (N_CAP_HAL_CLAIM の cap, 台帳の装置の id, const char *driver：台帳に見せる実装の名) -> claim */
     SYS_HAL_CLAIM_RESOURCES,  /* (claim, struct n_hal_resource *out, max): 資源の全部の数 */
     SYS_HAL_MAP,              /* (claim, メモリーの資源の slot) -> 共有 object */
     SYS_HAL_INTERRUPTS,       /* (claim, count): 割り込みを count 本まで立てる。立てた数 */
@@ -202,6 +202,9 @@ enum {
     SYS_POWER_WINDOWS,        /* (N_CAP_POWER の cap, 閉じるよう頼むなら 1, char *top_title, size): アプリの窓の数 */
     SYS_POWER_SAY,            /* (N_CAP_POWER の cap, const struct n_power_state *, size): 窓を閉じる段取りを知らせる */
     SYS_POWER_WINDOWS_WATCH,  /* (N_CAP_POWER の cap): アプリの窓の数と題の watch */
+    SYS_HAL_ACPI_EVAL,        /* (claim, const struct n_hal_acpi_call *): 装置の ACPI の名前を評価する。書いたバイト数 */
+    SYS_HAL_ACPI_NOTIFY_TAKE, /* (claim, deadline): 装置の ACPI の節への次の Notify の値 */
+    SYS_SCREEN_HOLD,          /* (claim, 保持するなら 1、返すなら 0): ブート画面の画素への書込みを止める */
     SYS_MAX                   /* above every number (what syscallfuzz tries) */
 };
 
@@ -249,7 +252,7 @@ enum {
     X(SYS_SETTINGS_EFFECTIVE) X(SYS_SETTINGS_DESCRIBE) X(SYS_SETTINGS_WATCH)
 
 /* 世代。呼出し、構造体、システムのサービスの文の形を変えたら一つ上げる。溝を末尾へ足すだけなら上げない。 */
-#define N_ABI_GENERATION 4u
+#define N_ABI_GENERATION 5u
 
 /* プログラムの刻印：ELF の PT_NOTE の一つ（user/libc/sys.c が全プログラムに入れる）。カーネルは起こす前に
    読む。世代が違うか、溝がカーネルより多ければ、N_ERR_WRONG_GENERATION で起こさない。 */
@@ -490,6 +493,18 @@ struct n_hal_call {
     void *out;
     uint64_t out_size;
 };
+/* SYS_HAL_ACPI_EVAL の要求（n_hal_acpi_eval）：node の直下の名前 name（一区画の 4 文字）を、nargs 個の引数
+   args（整数、文字列、バッファー。中身は data_size バイトの data の中）で評価し、結果を out へ書く。 */
+struct n_hal_acpi_call {
+    uint32_t node, nargs; /* N_ACPI_SELF・N_ACPI_PARENT・N_ACPI_CHILD(i)、N_ACPI_ARGS_MAX まで */
+    char name[4];
+    uint32_t reserved;
+    const struct n_acpi_value *args;
+    const void *data;
+    uint64_t data_size; /* N_ACPI_DATA_MAX まで */
+    void *out;
+    uint64_t out_size;
+};
 /* SYS_HAL_POWER_WAIT が返す眠りの知らせ。SUSPEND には、装置を止めてから SYS_HAL_POWER_DONE で答える。
    RESUME は知らせるだけ。 */
 #define N_HAL_POWER_SUSPEND 1u
@@ -612,7 +627,7 @@ struct n_screen_state {
     uint32_t pointer[N_SCREEN_POINTER_SIZE * N_SCREEN_POINTER_SIZE];
 };
 
-/* n_hal_pci_acpi_eval (N_PCI_CALL_ACPI_EVAL): an ACPI object, an argument or a result. An integer's value is the number; a
+/* n_hal_acpi_eval (SYS_HAL_ACPI_EVAL): an ACPI object, an argument or a result. An integer's value is the number; a
    string's or buffer's is where its bytes start (in the arguments' data, or in the result) and
    length how many (a string's without a terminating zero); a package's value is the index of its
    first element among the result's values and length how many. A reference (to a namespace
@@ -627,11 +642,15 @@ struct n_acpi_value {
     uint32_t type, length;
     uint64_t value;
 };
-/* Which node an evaluation is relative to: the function's own device node, the node of the bridge
-   it is below (the host bridge's on a root bus), or the function node's device child number i. */
+/* Which node an evaluation is relative to: the claimed device's own node, the node of the device
+   above it in the device tree (a PCI function's bridge, the host bridge on a root bus), or the
+   device node's device child number i in namespace order. */
 #define N_ACPI_SELF 0xFFFFFFFFu
-#define N_ACPI_UPSTREAM 0xFFFFFFFEu
+#define N_ACPI_PARENT 0xFFFFFFFEu
 #define N_ACPI_CHILD(i) ((uint32_t)(i))
+#define N_ACPI_ARGS_MAX 7u          /* Arg0..Arg6 (ACPI 6.5 19.6.84) */
+#define N_ACPI_DATA_MAX (64u * 1024) /* the arguments' bytes */
+#define N_ACPI_OUT_MAX (1024u * 1024) /* the result's bytes the kernel writes at most */
 /* n_pager_take: a page of paged memory was touched without the access it needs. offset is
    the page's (page aligned) in the memory, access N_MEMORY_READ or N_MEMORY_READ_WRITE (a
    write), app the identifier of the app that touched it first. */

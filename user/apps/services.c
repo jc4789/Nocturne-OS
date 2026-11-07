@@ -2,6 +2,9 @@
 
    何を動かすかは下の宣言の表 declared[] が決める。表は C の型のあるデータで、プログラムに
    組み込まれている。起動の順は依存から計算し、依存の準備は相手の知らせ（n_service_ready）で知る。
+   装置ごとのサービス（ドライバー）の実例は台帳（n_hal_watch）から作る：宣言の規則に合う実装の無い装置が
+   来たら作り、管理者が claim を取って N_SERVICE_HANDLE_DEVICE で渡す。装置が去るか、ほかの実装が持ったら、
+   止めて消す。ドライバーは claim の能力を持たない。
 
    名前の持ち主はここだけ。要求は n_service_register の channel で受け、名前を三つに分ける：
      - N_SERVICE_MANAGER：この管理者の口。
@@ -26,7 +29,8 @@
 /* ---- 宣言 ---- */
 enum service_scope {
     SCOPE_MACHINE,  /* 機械に一つ。 */
-    SCOPE_DEVICE,   /* 宣言の rules に合う、実装の無い（N_HAL_UNBOUND）台帳の装置ごとに一つ。引数は装置の id の 16 進数。 */
+    SCOPE_DEVICE,   /* 宣言の rules に合う、実装の無い（N_HAL_UNBOUND）台帳の装置ごとに一つ。引数は装置の id の 16 進数、
+                       handle N_SERVICE_HANDLE_DEVICE はその装置の claim。 */
 };
 /* 失敗したときの扱い。結果 0 で終わるのは失敗ではない。 */
 struct failure_rule {
@@ -60,9 +64,9 @@ struct declared_service {
 static const struct declared_service declared[] = {
     {.name = "systemlog", .program = "systemlog", .cls = N_CLASS_SYSTEM, .at_boot = true,
      .on_failure = {5, 1000, 60000}, .clients_from = CLIENTS_NONE},
-    /* ドライバーは自分の装置だけを claim し、システムの級を持たない。相手は nvrm が申し込む名前で来る。 */
+    /* ドライバーは渡された自分の装置の claim だけを持ち、システムの級を持たない。相手は nvrm が申し込む名前で来る。 */
     {.name = "gpu", .program = "nvrm", .client_image = "nvk", .cls = N_CLASS_USER, .scope = SCOPE_DEVICE, .at_boot = true, .optional = true,
-     CAPS(N_CAP_HAL_CLAIM), .on_failure = {2, 2000, 60000}, .clients_from = CLIENTS_NONE,
+     .on_failure = {2, 2000, 60000}, .clients_from = CLIENTS_NONE,
      .rules = nvrm_gpu_rules, .rule_count = sizeof nvrm_gpu_rules / sizeof *nvrm_gpu_rules},
     {.name = "accounts", .program = "accounts", .cls = N_CLASS_SYSTEM, .at_boot = true,
      CAPS(N_CAP_STORE_PRIVATE), .on_failure = {5, 500, 60000}, .clients_from = N_CLASS_USER},
@@ -119,12 +123,12 @@ struct mouth {
     struct pending_request *pending, **tail;
 };
 
-enum token_kind { TOKEN_REQUESTS, TOKEN_WAKE, TOKEN_APP, TOKEN_CONTROL, TOKEN_SENDABLE, TOKEN_BOUND_CLOSED };
+enum token_kind { TOKEN_REQUESTS, TOKEN_WAKE, TOKEN_APP, TOKEN_CONTROL, TOKEN_SENDABLE, TOKEN_BOUND_CLOSED, TOKEN_LEDGER };
 #define TOKEN_MASK 7ull
 #define TOKEN(p, kind) ((uint64_t)(uintptr_t)(p) | (uint64_t)(kind))
 
 static mtx_t state_lock;
-static n_handle root_cap, grant_cap, requests, events, wake_ends[2];
+static n_handle root_cap, grant_cap, hal_cap, requests, events, ledger_watch, wake_ends[2];
 
 static void wake_main(void) {
     char byte = 0;
@@ -192,7 +196,8 @@ struct instance {
     char argument[N_SERVICE_ARGUMENT_MAX];
     uint32_t state;         /* enum n_service_state */
     uint64_t state_since;
-    uint64_t changed;       /* 状態を変えたときの generation */
+    uint32_t device;        /* SCOPE_DEVICE：台帳の装置の id */
+    bool device_lost;       /* SCOPE_DEVICE：装置が去ったか、ほかの実装が持った。止まったら消す */
     bool wanted;            /* 起こす */
     bool broken;            /* 依存の表が解けない */
     bool stopping;          /* 受け口を閉じた */
@@ -206,14 +211,19 @@ struct instance {
     uint64_t stop_deadline; /* stopping の期限 */
 };
 static struct instance *instances; /* 依存の順に並ぶ */
-static volatile uint32_t generation;
+static volatile uint32_t generation; /* 実例が変わるか増えるか消えるたびに進む */
+static bool declared_broken[DECLARED]; /* 宣言の依存が解けない：装置ごとの実例も壊れて生まれる */
+
+static void instances_changed(void) {
+    __atomic_add_fetch(&generation, 1, __ATOMIC_ACQ_REL);
+    wake_address(&generation, INT_MAX);
+}
 
 static void set_state(struct instance *in, uint32_t state) {
     if (in->state == state) return;
     in->state = state;
     in->state_since = n_clock_monotonic();
-    in->changed = __atomic_add_fetch(&generation, 1, __ATOMIC_ACQ_REL);
-    wake_address(&generation, INT_MAX);
+    instances_changed();
 }
 
 static struct instance *instance_new(const struct declared_service *d, const char *argument, bool broken) {
@@ -229,12 +239,13 @@ static struct instance *instance_new(const struct declared_service *d, const cha
     struct instance **at = &instances;
     while (*at) at = &(*at)->next;
     *at = in;
+    instances_changed();
     return in;
 }
 
 static struct instance *instance_find(const struct declared_service *d, const char *argument) {
     for (struct instance *in = instances; in; in = in->next)
-        if (in->declared == d && !strcmp(in->argument, argument ? argument : "")) return in;
+        if (in->declared == d && !in->device_lost && !strcmp(in->argument, argument ? argument : "")) return in;
     return NULL;
 }
 
@@ -248,14 +259,7 @@ static bool device_matches(const struct declared_service *d, const struct n_hal_
     return false;
 }
 
-static void instances_of(const struct declared_service *d, bool broken, const struct n_hal_snapshot *ledger) {
-    if (d->scope == SCOPE_MACHINE) {
-        instance_new(d, NULL, broken);
-        return;
-    }
-}
-
-static bool visit(const struct declared_service *d, unsigned char *marks, const struct n_hal_snapshot *ledger) {
+static bool visit(const struct declared_service *d, unsigned char *marks) {
     size_t i = (size_t)(d - declared);
     if (marks[i] == VISIT_DONE) return true;
     if (marks[i] == VISIT_OPEN) {
@@ -269,18 +273,86 @@ static bool visit(const struct declared_service *d, unsigned char *marks, const 
         if (!other) {
             printf("services: %s needs %s, which is not declared\n", d->name, *need);
             solved = false;
-        } else if (!visit(other, marks, ledger)) {
+        } else if (!visit(other, marks)) {
             solved = false;
         }
     }
     marks[i] = VISIT_DONE;
-    instances_of(d, !solved, ledger);
+    declared_broken[i] = !solved;
+    if (d->scope == SCOPE_MACHINE) instance_new(d, NULL, !solved);
     return solved;
 }
 
 static void instances_from_table(void) {
     unsigned char marks[DECLARED] = {VISIT_NEW};
-    for (size_t i = 0; i < DECLARED; i++) visit(&declared[i], marks, &ledger);
+    for (size_t i = 0; i < DECLARED; i++) visit(&declared[i], marks);
+}
+
+/* ---- 台帳の装置 ---- */
+static bool ledger_holds(const struct n_hal_snapshot *ledger, uint32_t id) {
+    const struct n_hal_device *f = ledger->first;
+    for (uint32_t i = 0; i < ledger->count; i++, f = n_hal_device_next(f))
+        if (f->id == id) return true;
+    return false;
+}
+
+static bool device_has_instance(const struct declared_service *d, uint32_t id) {
+    for (struct instance *in = instances; in; in = in->next)
+        if (in->declared == d && in->device == id && !in->device_lost) return true;
+    return false;
+}
+
+static void stop(struct instance *in);
+
+/* 実例はもう装置を持たない。動いていれば止め、止まったら instances_sweep が消す。 */
+static void device_lose(struct instance *in, const char *why) {
+    if (in->device_lost) return;
+    in->device_lost = true;
+    printf("services: %s:%s %s\n", in->declared->name, in->argument, why);
+    fflush(stdout);
+    stop(in);
+}
+
+/* 台帳を読み直す：台帳から去った装置の実例を止め、宣言に合う実装の無い装置に実例を作る。 */
+static void devices_refresh(void) {
+    struct n_hal_snapshot ledger = {0};
+    n_result r = n_hal_snapshot(&ledger);
+    if (r < 0) {
+        printf("services: the device ledger cannot be read (%s)\n", n_result_text(r));
+        fflush(stdout);
+        return;
+    }
+    for (struct instance *in = instances; in; in = in->next)
+        if (in->declared->scope == SCOPE_DEVICE && !in->device_lost && !ledger_holds(&ledger, in->device))
+            device_lose(in, "lost its device: it left the ledger");
+    for (size_t i = 0; i < DECLARED; i++) {
+        const struct declared_service *d = &declared[i];
+        if (d->scope != SCOPE_DEVICE) continue;
+        const struct n_hal_device *f = ledger.first;
+        for (uint32_t k = 0; k < ledger.count; k++, f = n_hal_device_next(f)) {
+            if (!device_matches(d, f) || device_has_instance(d, f->id)) continue;
+            char argument[9];
+            snprintf(argument, sizeof argument, "%x", (unsigned)f->id);
+            struct instance *in = instance_new(d, argument, declared_broken[i]);
+            if (in) in->device = f->id;
+        }
+    }
+    free((void *)ledger.first);
+}
+
+/* 装置を失って止まった実例を消す。主のループの報告の組の後：組の中の token はまだ実例を指しうる。 */
+static void instances_sweep(void) {
+    for (struct instance **at = &instances; *at;) {
+        struct instance *in = *at;
+        if (!in->device_lost || in->app >= 0) {
+            at = &in->next;
+            continue;
+        }
+        *at = in->next;
+        mouth_close_all(&in->mouth);
+        free(in);
+        instances_changed();
+    }
 }
 
 /* ---- 起こす ---- */
@@ -289,7 +361,7 @@ static bool needs_met(const struct declared_service *d) {
         const struct declared_service *other = declared_named(*need);
         /* 実例が一つも無い宣言（合う装置が無い）は満たされている */
         for (struct instance *in = instances; in; in = in->next)
-            if (in->declared == other && in->state != N_SERVICE_RUNNING && in->state != N_SERVICE_ABSENT &&
+            if (in->declared == other && !in->device_lost && in->state != N_SERVICE_RUNNING && in->state != N_SERVICE_ABSENT &&
                 !(other->optional && in->state == N_SERVICE_FAILED))
                 return false;
     }
@@ -316,16 +388,31 @@ static void start(struct instance *in) {
         set_state(in, N_SERVICE_ABSENT);
         return;
     }
+    /* 装置の claim：実例のサービスが持つ唯一の handle になる。ほかの実装が持っていれば、装置はこの実例のものではない。 */
+    n_handle claim = -1;
+    if (d->scope == SCOPE_DEVICE) {
+        claim = n_hal_claim(hal_cap, in->device, d->program);
+        if (claim == -N_ERR_BUSY || claim == -N_ERR_NOT_FOUND) {
+            device_lose(in, claim == -N_ERR_BUSY ? "lost its device: another driver has it" : "lost its device: it is gone");
+            return;
+        }
+        if (claim < 0) {
+            give_up(in, "its device cannot be claimed", claim);
+            return;
+        }
+    }
     n_handle ends[2];
     n_result r = n_channel_pair(ends);
     if (r < 0) {
+        if (claim >= 0) n_handle_close(claim);
         give_up(in, "no channel", r);
         return;
     }
     n_handle log = d->console ? -1 : n_system_log_open();
     if (log < 0) log = -1;
-    int32_t handles[4 + N_CAP_COUNT] = {d->console ? 0 : -1, d->console ? 1 : log, d->console ? 2 : log, ends[1]};
+    int32_t handles[5 + N_CAP_COUNT] = {d->console ? 0 : -1, d->console ? 1 : log, d->console ? 2 : log, ends[1]};
     uint32_t handle_count = 4;
+    if (claim >= 0) handles[handle_count++] = claim; /* N_SERVICE_HANDLE_DEVICE */
     for (uint32_t i = 0; i < d->cap_count; i++) {
         n_handle cap = n_cap_derive(root_cap, d->caps[i]);
         if (cap >= 0) handles[handle_count++] = cap;
@@ -370,6 +457,7 @@ static void close_mouth(struct instance *in) {
 
 static void stop(struct instance *in) {
     in->wanted = false;
+    in->restart_after_stop = false;
     if (in->app < 0) {
         if (in->state != N_SERVICE_ABSENT) set_state(in, N_SERVICE_STOPPED);
         return;
@@ -388,7 +476,7 @@ static void advance(void) {
             set_state(in, N_SERVICE_WAITING);
         }
         if (in->stopping && in->app >= 0 && now >= in->stop_deadline) n_app_stop(in->app, N_APP_STOP_TREE);
-        if (!in->wanted || in->app >= 0 || in->state == N_SERVICE_BACKOFF) continue;
+        if (in->device_lost || !in->wanted || in->app >= 0 || in->state == N_SERVICE_BACKOFF) continue;
         if (in->state == N_SERVICE_FAILED || in->state == N_SERVICE_ABSENT) continue;
         if (in->broken) {
             give_up(in, "its needs cannot be solved", -N_ERR_INVALID);
@@ -424,6 +512,10 @@ static void app_ended(struct instance *in) {
     in->last_status = r < 0 ? r : status;
     bool asked = in->stopping;
     in->stopping = false;
+    if (in->device_lost) {
+        set_state(in, N_SERVICE_STOPPED);
+        return;
+    }
     if (in->restart_after_stop) {
         in->restart_after_stop = false;
         in->wanted = true;
@@ -569,8 +661,8 @@ static void status_of(const struct instance *in, struct n_service_status *out) {
     if (d->client_image) strlcpy(out->client_image, d->client_image, sizeof out->client_image);
 }
 
-/* 錠の下で写す。送るのは錠の外。newer_than より後に変わった実例だけ。-1 は全部。 */
-static n_result snapshot(const char *name, const char *argument, int64_t newer_than, struct n_service_status **out) {
+/* 錠の下で写す。送るのは錠の外。装置を失った実例は数えない。 */
+static n_result snapshot(const char *name, const char *argument, struct n_service_status **out) {
     mtx_lock(&state_lock);
     size_t count = 0;
     for (struct instance *in = instances; in; in = in->next) count++;
@@ -578,7 +670,7 @@ static n_result snapshot(const char *name, const char *argument, int64_t newer_t
     size_t n = 0;
     if (all)
         for (struct instance *in = instances; in; in = in->next) {
-            if ((int64_t)in->changed <= newer_than) continue;
+            if (in->device_lost) continue;
             if (name && (strcmp(in->declared->name, name) || strcmp(in->argument, argument))) continue;
             status_of(in, &all[n++]);
         }
@@ -623,16 +715,16 @@ static void watch_client(n_handle channel) {
     if (queue < 0) return;
     enum { WATCH_CLIENT = 1, WATCH_GENERATION };
     n_events_watch(queue, channel, N_EVENT_RECEIVABLE | N_EVENT_CLOSED, WATCH_CLIENT);
-    int64_t seen = -1;
     for (bool open = true; open;) {
         uint32_t now = __atomic_load_n(&generation, __ATOMIC_ACQUIRE);
         struct n_service_status *all;
-        n_result count = snapshot(NULL, NULL, seen, &all);
+        n_result count = snapshot(NULL, NULL, &all);
         if (count < 0) break;
-        n_result sent = send_statuses(channel, all, count);
+        struct n_services_reply list = {.count = (uint32_t)count};
+        n_result sent = n_channel_send(channel, &list, sizeof list, -1);
+        if (sent >= 0) sent = send_statuses(channel, all, count);
         free(all);
         if (sent < 0) break;
-        seen = now;
         n_events_watch_address(queue, &generation, now, WATCH_GENERATION);
         struct n_event reports[2];
         n_result got = n_events_wait(queue, reports, 2, N_CLOCK_NEVER);
@@ -659,10 +751,10 @@ static void manager_serve(void *arg) {
         n_result count = 0;
         switch (request.op) {
         case N_SERVICES_LIST:
-            count = snapshot(NULL, NULL, -1, &all);
+            count = snapshot(NULL, NULL, &all);
             break;
         case N_SERVICES_STATUS:
-            count = snapshot(request.name, request.argument, -1, &all);
+            count = snapshot(request.name, request.argument, &all);
             break;
         case N_SERVICES_RESTART:
         case N_SERVICES_STOP:
@@ -784,6 +876,10 @@ static void report(const struct n_event *e) {
     case TOKEN_BOUND_CLOSED:
         if (!((struct bound_name *)p)->dead) bound_closed(p);
         break;
+    case TOKEN_LEDGER:
+        n_watch_take(ledger_watch);
+        devices_refresh();
+        break;
     }
 }
 
@@ -794,19 +890,25 @@ int main(void) {
     if (mtx_init(&state_lock, mtx_plain) != thrd_success || (events = n_events_create()) < 0) return 1;
     n_handle service_root = n_cap_derive(root_cap, N_CAP_SERVICE_ROOT);
     grant_cap = n_cap_derive(root_cap, N_CAP_IDENTITY_GRANT);
+    hal_cap = n_cap_derive(root_cap, N_CAP_HAL_CLAIM);
     requests = service_root >= 0 ? n_service_register(service_root) : service_root;
-    if (requests < 0 || grant_cap < 0 || n_channel_pair(wake_ends) < 0) {
-        printf("services: the kernel gave no authority (%s)\n", n_result_text(requests < 0 ? requests : grant_cap));
+    ledger_watch = n_hal_watch();
+    n_result missing = requests < 0 ? requests : grant_cap < 0 ? grant_cap : hal_cap < 0 ? hal_cap : ledger_watch;
+    if (missing < 0 || n_channel_pair(wake_ends) < 0) {
+        printf("services: the kernel gave no authority (%s)\n", n_result_text(missing));
         fflush(stdout);
         return 1;
     }
     n_events_watch(events, requests, N_EVENT_RECEIVABLE, TOKEN(NULL, TOKEN_REQUESTS));
     n_events_watch(events, wake_ends[0], N_EVENT_RECEIVABLE, TOKEN(NULL, TOKEN_WAKE));
+    n_events_watch(events, ledger_watch, N_EVENT_RECEIVABLE, TOKEN(NULL, TOKEN_LEDGER));
     instances_from_table();
+    devices_refresh();
     for (;;) {
         mtx_lock(&state_lock);
         advance();
         bound_sweep();
+        instances_sweep();
         uint64_t deadline = next_deadline();
         mtx_unlock(&state_lock);
         struct n_event reports[32];

@@ -1,7 +1,7 @@
 /* PCI の claim（hal/hal.h の struct hal_claim_ops）：アプリの中のドライバーが PCI の機能を持つとき、バスが持つ分。
    docs/nocturne-native-abi.md §9。BAR の写し、割り込み、台帳への提供、眠りの知らせは hal/claim.c が持ち、
-   ここは機能の隔離、構成空間、リセットと回復、ACPI の名前空間、DMA の IOMMU を受け持つ。画面の口は
-   dev/screen_driver.c。
+   ここは機能の隔離、構成空間、リセットと回復、DMA の IOMMU を受け持つ。画面の口は dev/screen_driver.c、firmware の
+   記述の口は dev/acpi_claim.c。
    カーネルが握るもの（BAR のレジスター、MSI と MSI-X の capability）は、ここだけが書く。IOMMU が付いていれば、
    機能の DMA は claim で作った DMA の object にしか届かない。claim の終わりは、機能を止めてから（BAR の写像の取消し、
    割り込み、バスマスター）IOMMU の遮断を確かめ、その後に DMA のメモリーが戻る。遮断を確かめられなければ、残る
@@ -9,18 +9,15 @@
    ならない。終わりは故障した装置を待たず、リセットもしない（pci_end が false を返し、hal_claim_dma_reusable が
    偽になる）。
    claim の開始と終わり、全機能の予約（d->claimed）は claim_mutex が一度に一つにする。claim_mutex は pci.c のリセット
-   と dev/iommu.c の錠より先に取る。claim ごとの notes_lock は ACPI の Notify の値を守る。 */
+   と dev/iommu.c の錠より先に取る。 */
 #include "kernel.h"
 #include "abi.h"
-#include "arch/spin.h"
-#include "dev/acpi.h"
 #include "dev/fb.h"
 #include "dev/iommu.h"
 #include "dev/pci.h"
 #include "dev/pciuser.h"
 #include "hal/hal.h"
 #include "mm/heap.h"
-#include "sys/clock.h"
 #include "sys/thread.h"
 #include "sys/wait.h"
 

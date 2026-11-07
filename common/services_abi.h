@@ -14,6 +14,9 @@
 /* 宣言のサービスは handle 3 に管理者との channel を受ける。受ける向きは受け口（n_inlet_accept）で、
    管理者がこの channel を閉じたら片付けて終わる。送る向きは準備の知らせ一通（n_service_ready）。 */
 #define N_SERVICE_HANDLE_CONTROL 3
+/* 装置ごとのサービス（ドライバー）は handle 4 に装置の claim（N_KIND_HAL_CLAIM）を受ける。claim は管理者が台帳の
+   装置ごとに取り、サービスが持つ唯一の handle である：サービスが終わると claim も終わる。引数は装置の id の 16 進数。 */
+#define N_SERVICE_HANDLE_DEVICE 4
 struct n_service_ready_message { uint32_t kind; };
 #define N_SERVICE_READY 1u
 
@@ -38,7 +41,7 @@ enum n_services_op {
     N_SERVICES_STATUS,   /* name と argument の実例。応答の後に count 通の n_service_status。 */
     N_SERVICES_RESTART,  /* N_CLASS_ADMIN 以上。 */
     N_SERVICES_STOP,     /* N_CLASS_ADMIN 以上。 */
-    N_SERVICES_WATCH,    /* 以後、状態が変わるたびに n_service_status を一通送る。 */
+    N_SERVICES_WATCH,    /* 応答の後、実例が変わるか増えるか消えるたびに、n_services_reply と count 通の n_service_status で全部を送る。 */
 };
 enum n_service_state {
     N_SERVICE_STOPPED = 0, /* 動いていない。要求が来れば起こす。 */

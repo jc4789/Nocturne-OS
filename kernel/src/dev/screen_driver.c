@@ -93,7 +93,7 @@ static void screen_say(const struct screen_claim *sc, uint32_t output, const cha
     kprintf("screen: device %u (%s): output %u: %s\n", hal_id(d), d->location, output, what);
 }
 
-/* ---- 画面を持つドライバー（N_PCI_CALL_HOLD_SCREEN、dev/fb.c） ----
+/* ---- 画面を持つドライバー（SYS_SCREEN_HOLD、dev/fb.c） ----
    ファームウェアの画面の画素がある装置の claim だけが保持できるので、保持するのは高々一つの claim である。保持は
    ドライバーが返すか claim が終わると終わる。終わりはバスが装置を止めた後に来るので、ドライバーが装置へ届く間は
    描画は再開しない。起動の引数 fbhold=<秒> の秒数を超えた保持は、画面の見張りの thread がドライバーのアプリを
@@ -625,7 +625,9 @@ int64_t screen_driver_image_end(struct handle *h, int64_t number) {
 
 /* claim の thread を screen_lock の下で一度に一つ：数と、それが始め、終える保持が一緒に変わる。最後の保持の後の
    描き直しは、その後に来る。 */
-int64_t screen_driver_hold(struct hal_claim *c, bool hold) {
+int64_t screen_driver_hold(struct handle *h, bool hold) {
+    struct hal_claim *c = hal_claim_of(h);
+    if (!c) return -N_ERR_WRONG_KIND;
     int64_t r = 0;
     mutex_lock(&screen_lock);
     struct screen_claim *sc = screen_claim_of(c, hold, &r);

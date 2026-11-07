@@ -20,7 +20,7 @@ void fbcon_start(void);
 /* The window manager took the screen (gui/wm.c): nothing is drawn on it any more but the panic
    screen. */
 void fbcon_stop(void);
-/* The screen lost what the boot screen drew there (a display driver held it, dev/pciuser.c):
+/* The screen lost what the boot screen drew there (a display driver held it, dev/screen_driver.c):
    all of it again, while the boot screen is shown. */
 void fbcon_repaint(void);
 /* sys/panic.c: the report and the log's newest lines, straight to the screen shown. */

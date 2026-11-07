@@ -9,10 +9,10 @@
  * and stops it, outside RM's locks).
  *
  * Nocturne's kernel holds the AML interpreter (uACPI, kernel/src/dev/acpi.c); a driver app
- * reaches its claimed function's part of the namespace through the PCI claim: the function's
- * device node and the device nodes under it, and the upstream bridge's node, nothing outside.
- * The evaluation entry (n_hal_pci_acpi_eval) and the notification feed (n_hal_pci_acpi_notify_take) are
- * part of that claim's ABI. Where the firmware has no such method (or no AML at all), the method
+ * reaches its claimed device's part of the namespace through the claim: the device's node and
+ * the device nodes under it, and the node of the device above it (the upstream bridge), nothing
+ * outside. The evaluation entry (n_hal_acpi_eval) and the notification feed
+ * (n_hal_acpi_notify_take) are part of every claim's ABI. Where the firmware has no such method (or no AML at all), the method
  * answers as the original does then, and RM goes on without it.
  *
  * Outside the claim, and so not reachable here: the power source device (_PSR), batteries
@@ -48,7 +48,7 @@ static NV_STATUS acpi_eval(uint32_t node, const char *path, const struct n_acpi_
                            const void *arg_data, size_t arg_data_size, struct acpi_result *out) {
     out->block = malloc(ACPI_RESULT_ROOM);
     if (!out->block) return NV_ERR_NO_MEMORY;
-    n_result r = n_hal_pci_acpi_eval(nvrm_dev.claim, node, path, args, nargs, arg_data, arg_data_size, out->block,
+    n_result r = n_hal_acpi_eval(nvrm_dev.claim, node, path, args, nargs, arg_data, arg_data_size, out->block,
                                  ACPI_RESULT_ROOM);
     if (r < (n_result)sizeof(struct n_acpi_value)) {
         free(out->block);
@@ -211,7 +211,7 @@ static int notify_loop(void *arg) {
     (void)arg;
     nvrm_thread_admin = true;
     while (!atomic_load(&notify_stop)) {
-        n_result value = n_hal_pci_acpi_notify_take(nvrm_dev.claim, n_clock_after(250 * N_NS_PER_MS));
+        n_result value = n_hal_acpi_notify_take(nvrm_dev.claim, n_clock_after(250 * N_NS_PER_MS));
         if (value == -N_ERR_TIMEOUT) continue;
         if (value < 0) break;
         notify_rm(value);
@@ -223,7 +223,7 @@ void nvrm_acpi_notify_start(void) {
     if (notify_running) return;
     /* The first take starts the system's feed, so a Notify sent once this returns is kept (the
        D-notifier's state that rm_request_dnotifier_state asks the firmware for next). */
-    n_result first = n_hal_pci_acpi_notify_take(nvrm_dev.claim, 0);
+    n_result first = n_hal_acpi_notify_take(nvrm_dev.claim, 0);
     if (first < 0 && first != -N_ERR_TIMEOUT) {
         nvrm_log("NVRM: no ACPI notifications for the GPU (%s)", n_result_text(first));
         return; /* no node of its own (or no AML): nothing can come */
@@ -275,7 +275,7 @@ NV_STATUS NV_API_CALL nv_acpi_d3cold_dsm_for_upstream_port(nv_state_t *nv, NvU8 
     if (nv != &nvrm_dev.nv || !guid || !data) return NV_ERR_INVALID_ARGUMENT;
     NvU32 result = 0;
     NvU16 size = sizeof result;
-    NV_STATUS status = acpi_dsm(N_ACPI_UPSTREAM, guid, revision, function, data, sizeof *data, true, &result, &size);
+    NV_STATUS status = acpi_dsm(N_ACPI_PARENT, guid, revision, function, data, sizeof *data, true, &result, &size);
     if (status == NV_OK) *data = result;
     return status;
 }

@@ -22,7 +22,7 @@ Nocturne のネイティブ ABI（`n_*`）と ISO C（`malloc`、`<threads.h>`�
 | `os_ioctl.c` | nv.c の要求の受け口：全エスケープの引数の大きさの検査と、RM でないエスケープ（カード情報、GPU の結付け、版の照合、システム引数、NUMA、デバイス割り込み、開き終わりの状態）。`nvrm_gpu_get／put`（nvidia_dev_get／put） |
 | `rm_api.c` | リクエストサーバーが使う入口 `nvrm_rm_file_open／close／ioctl／mapping_object`（`os_ioctl.c` の後に `rm_ioctl` へ。GPU 専用のエスケープは GPU の `nv_state_t` で渡す） |
 | `os_caps.c` | RM の能力（nv-caps.c と nvlink_caps.c の fabric management）。能力ファイルの代わりに、認証済みの接続の権利で mode を判定する |
-| `os_acpi.c` | RM の ACPI メソッド（nv-acpi.c）と Notify。カーネルの claim の PCI バスの呼出し（`n_hal_pci_acpi_eval`、`n_hal_pci_acpi_notify_take`）で評価する。claim の外の名前は下の「未対応」。Notify の受取りスレッド（`nvrm_acpi_notify_start`／`_stop`、`nvrm.c` が呼ぶ）は RM が扱う値（0x81、0xC0、0xD1〜0xD5）だけを `rm_acpi_notify` へ渡し、ほかはログに書いて捨てる |
+| `os_acpi.c` | RM の ACPI メソッド（nv-acpi.c）と Notify。カーネルの claim の呼出し（`n_hal_acpi_eval`、`n_hal_acpi_notify_take`）で評価する。claim の外の名前は下の「未対応」。Notify の受取りスレッド（`nvrm_acpi_notify_start`／`_stop`、`nvrm.c` が呼ぶ）は RM が扱う値（0x81、0xC0、0xD1〜0xD5）だけを `rm_acpi_notify` へ渡し、ほかはログに書いて捨てる |
 | `os_stubs.c` | Nocturne に対応が無い、または RM のこの構成で要らない `os_*`／`nv_*`（下の「未対応」） |
 | `nvlink_os.c` | NVLink／NVSwitch ライブラリーが求める OS 関数（メモリ・文字列・時刻・識別） |
 | `spdm_crypto.c` | libspdm の暗号バックエンド 71 個（libspdm_*.c の移植）。BearSSL で SHA-2、HMAC、HKDF、AES-GCM、ECDH／ECDSA（P-256／P-384）、RSA-PSS、X.509 の検証、乱数は `n_random` |
@@ -32,7 +32,7 @@ Nocturne のネイティブ ABI（`n_*`）と ISO C（`malloc`、`<threads.h>`�
 | `nvkms.mk`、`nvkms_os.c／.h`、`nvkms_kapi_rm.c` | NVIDIA の画面設定ドライバー NVKMS（nvidia-modeset）を nvrm に入れるビルド規則、その OS 層と RM との接続、KAPI の memory の RM ハンドル（下の「NVKMS」「直接表示」） |
 | `display.c／.h` | nvrm が画面を持つ：KAPI の唯一のクライアントとしてモニターの接続を張り直し、カーネルの画面を走査面へ移す。全画面のアプリの絵の直接表示（下の「画面」） |
 
-起動手順（`nvrm.c`）：サービスの管理者が `N_CAP_HAL_CLAIM` を渡して起こす → 引数の装置を claim する → `n_hal_pci_info` → `nv_state_t` を埋めて BAR0 を写す →
+起動手順（`nvrm.c`）：サービスの管理者が装置を claim し、その claim を handle `N_SERVICE_HANDLE_DEVICE` で渡して起こす → `n_hal_pci_info` → `nv_state_t` を埋めて BAR0 を写す →
 `NVRM_REGISTRY_DWORDS`（環境変数、任意）を `rm_parse_option_string` へ → `rm_init_rm` → `rm_is_supported_device`
 → `rm_init_private_state` → `rm_init_event_locks` → `rm_init_dynamic_power_management`
 → `rm_set_rm_firmware_requested` → 除外の確かめ → `rm_enable_dynamic_power_management` → 割り込みスレッド
@@ -52,7 +52,7 @@ RM の取決めどおりメソッドの準備と片付けだけをする。
 サービスの管理者（`user/apps/services.c` の `gpu` の項目）／libnvrm／NVK は共通の PCI 選別条件（NVIDIA、VGA または 3D、progif 0）を使う。
 NVK は生の PCI 件数を GPU 数にせず、HELLO で adapter 初期化成功を確認し、接続先 RM の probed ID と PCI 情報が一致する BDF の動的 snapshot を列挙する。probed ID だけでは初期化成功を保証しない。
 
-装置ごとにサービスの実例 `gpu` がある（引数は台帳の装置の id の 16 進数）。nvrm は引数の装置を `N_CAP_HAL_CLAIM` で claim し、名前 `nocturne.nvidia.rm.<8桁の id>` を `n_service_listen` で申し込む。
+装置ごとにサービスの実例 `gpu` がある（引数は台帳の装置の id の 16 進数）。nvrm は管理者が取って渡した引数の装置の claim を受け、名前 `nocturne.nvidia.rm.<8桁の id>` を `n_service_listen` で申し込む。
 `nvrm_connect_device()` は指定装置へ、従来の `nvrm_connect()` は動的 PCI 列挙から最初に接続可能な装置へつなぐ。
 描画側の `nvrm_connect_ready()` は診断専用の未初期化装置を飛ばし、後続の ready 装置も探す。旧 HELLO の echo を ready と誤認しない。
 `nvrm_connect_ready_status()` は同じ探索で、使える装置が無い理由も返す（nvrm がどの GPU も出していない `N_ERR_NOT_FOUND`、
@@ -138,7 +138,7 @@ RM のオブジェクト（`nv-kernel.o`）が必要とするが RM 自身は定
 | `os_get_random_bytes`、`os_get_version_info` ほか | `n_random`（システムの乱数）、版は "Nocturne OS" の固定値 |
 
 スレッドの前提：割り込みスレッド（`n_hal_interrupt_take` → `rm_isr` → 必要なら `rm_isr_bh`）、ACPI の Notify の
-受取りスレッド（`n_hal_pci_acpi_notify_take` → `rm_acpi_notify`）とリクエストスレッド
+受取りスレッド（`n_hal_acpi_notify_take` → `rm_acpi_notify`）とリクエストスレッド
 は、**RM 自身のロック（GPU ロック、スピンロック＝mutex）だけで互いを守る**。nvrm はその外側に追加のロックを置かない。
 `nvrm_in_isr` は `rm_isr` の間だけ真。
 
@@ -158,7 +158,7 @@ RM が OS 層に求める約束（`os_*`／`nv_*`／`nvlink_*`／`libspdm_*`）�
 | `nv-pci.c` | PCI の probe／remove、BAR、バスマスター、電源 | `nvrm.c` の起動手順、`os_pci.c`（`nvrm_pci_attach`、`nvrm_pci_bus_master`、`nvrm_pci_detach`） | 移植済み。Grace の C2C／EGM／NUMA の部分は該当ハードウェア無し。ランタイム電源管理は下の「未対応」 |
 | `nv-pci-table.c` | 引き受ける PCI 装置の表 | init／libnvrm／NVK の共通の選別（NVIDIA、VGA か 3D、progif 0）と `rm_is_supported_device` | 移植済み |
 | `nv-msi.c` | MSI／MSI-X の有効化 | `os_pci.c`（`nvrm_irq_enable`：`n_hal_interrupts`、`NV_FLAG_USES_MSI(X)`） | 移植済み（ベクター 1 本） |
-| `nv-acpi.c` | GPU の ACPI メソッド（`_DSM`、`_ROM`、`_DOD`、`_DDC`、MUX）と Notify | `os_acpi.c`（全メソッド。`nv_acpi_register_notifier`／`unregister_notifier` は `nvrm_acpi_notify_start`／`_stop`） | 移植済み：GPU の装置・その子・上流のブリッジのメソッドと Notify は、カーネルの claim の PCI バスの呼出し（`n_hal_pci_acpi_eval`、`n_hal_pci_acpi_notify_take`）で評価する。カーネルが断る ACPI のメソッド（ABI 文書 §9。電源・取出し・`_OSC` など）は RM のどのメソッドにも当たらない。claim の外（`_PSR`、電池、`\_SB.NPCF`、NVIF／WMMX）は下の「未対応」 |
+| `nv-acpi.c` | GPU の ACPI メソッド（`_DSM`、`_ROM`、`_DOD`、`_DDC`、MUX）と Notify | `os_acpi.c`（全メソッド。`nv_acpi_register_notifier`／`unregister_notifier` は `nvrm_acpi_notify_start`／`_stop`） | 移植済み：GPU の装置・その子・上流のブリッジのメソッドと Notify は、カーネルの claim の呼出し（`n_hal_acpi_eval`、`n_hal_acpi_notify_take`）で評価する。カーネルが断る ACPI のメソッド（ABI 文書 §9。電源・取出し・`_OSC` など）は RM のどのメソッドにも当たらない。claim の外（`_PSR`、電池、`\_SB.NPCF`、NVIF／WMMX）は下の「未対応」 |
 | `nv-caps.c` | 能力（MIG、fabric、profiler など）の木と、その証明 | `os_caps.c`（`os_nv_cap_*`。能力ファイルの代わりに、システムが認証した接続の権利で mode を判定） | 移植済み |
 | `nvlink_caps.c` | NVLink の能力ファイル（fabric-mgmt） | `os_caps.c`（`nvlink_fabric_mgmt`、RM の FM session） | 移植済み |
 | `nv-caps-imex.c` | IMEX チャンネル（複数ノードの NVLink のメモリ共有） | `os_stubs.c`（`os_imex_channel_get` は −1、`count` は 0） | 該当ハードウェア無し（複数ノードの NVLink 構成） |

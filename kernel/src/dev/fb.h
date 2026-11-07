@@ -203,5 +203,5 @@ int64_t screen_driver_state(struct handle *h, uint32_t output, uint64_t seen, st
 int64_t screen_driver_modes(struct handle *h, uint32_t output, const struct n_screen_modes *m);
 int64_t screen_driver_image(struct handle *h, uint32_t output, struct handle *surface, const struct n_scanout *desc);
 int64_t screen_driver_image_end(struct handle *h, int64_t number);
-int64_t screen_driver_hold(struct hal_claim *c, bool hold);
+int64_t screen_driver_hold(struct handle *h, bool hold);
 int screen_driver_boot_slot(const struct hal_device *d);

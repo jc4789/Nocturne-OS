@@ -7,7 +7,7 @@
    錠の順（先 → 後）：end_mutex → claims_mutex、end_mutex → バスの錠と mm/shared.c の錠、offers_mutex → hal_lock、
    irq_lock → 待ち行列と事象の錠、power_lock → 待ち行列の錠。ends_lock は葉。
    終わりは claim ごとに一度だけ走る（end_mutex）。最後の handle の close と hal_remove が同時に来ても、後の者は
-   終わりが済むまで待つ。呼出しは claim_enter で記録を hold するので、hal_remove が戻った後に claim が装置に触ることは
+   終わりが済むまで待つ。呼出しは hal_claim_enter で記録を hold するので、hal_remove が戻った後に claim が装置に触ることは
    無い。 */
 #include "kernel.h"
 #include "abi.h"
@@ -101,12 +101,12 @@ bool hal_claim_dma_reusable(const struct hal_claim *c) { return !c || !__atomic_
 bool hal_claim_sleeps(const struct hal_claim *c) { return __atomic_load_n(&c->sleeps, __ATOMIC_ACQUIRE); }
 
 /* 終わりが始まった claim は入れない。released は hal_lock の下で立つので、入った者の間 c->d は生きている。 */
-static bool claim_enter(struct hal_claim *c) {
+struct hal_device *hal_claim_enter(struct hal_claim *c) {
     uint64_t f = spin_lock(&hal_lock);
     bool in = !__atomic_load_n(&c->released, __ATOMIC_SEQ_CST);
     if (in) c->d->holds++;
     spin_unlock(&hal_lock, f);
-    return in;
+    return in ? c->d : NULL;
 }
 
 static uint32_t claim_ready(struct handle *h);
@@ -241,7 +241,7 @@ static int64_t interrupts_on(struct hal_claim *c, uint32_t count) {
 int64_t hal_claim_interrupts(struct handle *h, uint32_t count) {
     struct hal_claim *c = hal_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
-    if (!claim_enter(c)) return -N_ERR_CLOSED;
+    if (!hal_claim_enter(c)) return -N_ERR_CLOSED;
     struct hal_device *d = c->d;
     mutex_lock(&c->vectors_mutex);
     int64_t r = hal_claim_revoked(c) ? -N_ERR_CLOSED : interrupts_on(c, count);
@@ -322,7 +322,7 @@ int64_t hal_claim_interrupt_take(struct handle *h, uint64_t deadline, uint64_t *
 int64_t hal_claim_resources(struct handle *h, struct n_hal_resource *uout, size_t max) {
     struct hal_claim *c = hal_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
-    if (!claim_enter(c)) return -N_ERR_CLOSED;
+    if (!hal_claim_enter(c)) return -N_ERR_CLOSED;
     struct hal_device *d = c->d;
     uint32_t total = d->resource_count;
     size_t n = MIN(max, (size_t)total);
@@ -332,7 +332,7 @@ int64_t hal_claim_resources(struct handle *h, struct n_hal_resource *uout, size_
 }
 
 int64_t hal_claim_memory(struct hal_claim *c, uint32_t slot, uint64_t *address, uint64_t *size, bool *prefetchable) {
-    if (!claim_enter(c)) return -N_ERR_CLOSED;
+    if (!hal_claim_enter(c)) return -N_ERR_CLOSED;
     struct hal_device *d = c->d;
     const struct n_hal_resource *r = hal_resource(d, N_HAL_MEMORY, slot);
     int64_t result = 0;
@@ -356,7 +356,7 @@ int64_t hal_claim_bus_call(struct handle *h, uint32_t op, const void *in, size_t
     struct hal_claim *c = hal_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     if (!c->ops->call) return -N_ERR_UNSUPPORTED;
-    if (!claim_enter(c)) return -N_ERR_CLOSED;
+    if (!hal_claim_enter(c)) return -N_ERR_CLOSED;
     struct hal_device *d = c->d;
     *used = 0;
     int64_t r = c->ops->call(c, op, in, in_size, out, out_size, used);
@@ -374,7 +374,7 @@ int64_t hal_claim_offer(struct handle *h, uint32_t kind, uint32_t instance, cons
     if (!o) return -N_ERR_NO_MEMORY;
     o->kind = kind;
     o->instance = instance;
-    if (!claim_enter(c)) {
+    if (!hal_claim_enter(c)) {
         kfree(o);
         return -N_ERR_CLOSED;
     }
@@ -398,7 +398,7 @@ int64_t hal_claim_offer(struct handle *h, uint32_t kind, uint32_t instance, cons
 int64_t hal_claim_offer_withdraw(struct handle *h, uint32_t kind, uint32_t instance) {
     struct hal_claim *c = hal_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
-    if (!claim_enter(c)) return -N_ERR_CLOSED;
+    if (!hal_claim_enter(c)) return -N_ERR_CLOSED;
     struct hal_device *d = c->d;
     struct claim_offer *found = NULL;
     mutex_lock(&c->offers_mutex);
@@ -594,7 +594,7 @@ static void claim_release(struct object *o) {
 }
 
 /* d->bind を持っている：hal_remove は始まりが済むまで待つ。 */
-static int64_t claim_begin(struct hal_device *d, struct process *t, struct handle **out) {
+static int64_t claim_begin(struct hal_device *d, struct process *t, const char *driver, struct handle **out) {
     const struct hal_claim_ops *ops = d->ops ? d->ops->claim : NULL;
     if (!ops) return -N_ERR_UNSUPPORTED;
     struct hal_claim *c = kzalloc(sizeof *c);
@@ -603,7 +603,7 @@ static int64_t claim_begin(struct hal_device *d, struct process *t, struct handl
     c->d = d;
     c->ops = ops;
     c->refs = 1;
-    int r = hal_bind_process(d, c, t->name);
+    int r = hal_bind_process(d, c, driver);
     if (r < 0) {
         kfree(c);
         return r;
@@ -627,18 +627,18 @@ static int64_t claim_begin(struct hal_device *d, struct process *t, struct handl
     claims = c;
     c->listed = true;
     mutex_unlock(&claims_mutex);
-    kprintf("hal: %s (%s) claimed by pid %d\n", d->location, d->name, t->pid);
+    kprintf("hal: %s (%s) claimed for %s by pid %d\n", d->location, d->name, driver, t->pid);
     *out = h;
     return 0;
 }
 
-int64_t hal_claim_open(uint32_t device, struct handle **out) {
+int64_t hal_claim_open(uint32_t device, const char *driver, struct handle **out) {
     struct process *t = process_current();
     if (!t) return -N_ERR_DENIED;
     struct hal_device *d = hal_find(device);
     if (!d) return -N_ERR_NOT_FOUND;
     mutex_lock(&d->bind);
-    int64_t r = d == &hal_root ? -N_ERR_NOT_FOUND : claim_begin(d, t, out);
+    int64_t r = d == &hal_root ? -N_ERR_NOT_FOUND : claim_begin(d, t, driver, out);
     mutex_unlock(&d->bind);
     hal_put(d);
     return r;
