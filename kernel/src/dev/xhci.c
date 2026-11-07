@@ -12,7 +12,10 @@
  *
  * Interrupters (4.17): commands, port changes and control transfers go to interrupter 0, the
  * interrupt endpoints to a second one and the bulk endpoints to a third, each with its own MSI-X
- * vector, where the controller and the PCI layer give that many; with fewer they share. */
+ * vector, where the controller and the PCI layer give that many; with fewer they share.
+ *
+ * 電源（hal/hal.h の契約、下の「眠り」の節）。眠りと休止の写しでは装置を残す形で止め（4.15、4.23.2）、状態を保った装置は
+ * 戻りの後も同じ装置として残る。状態を失った装置は去り、つながっていれば数え直される。 */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/irq.h"
@@ -51,6 +54,7 @@ enum {
 #define TRB_TYPE(t) ((uint32_t)(t) << 10)
 #define TRB_TARGET(i) ((uint32_t)(i) << 22) /* a transfer TRB's Interrupter Target (6.4.1) */
 #define TRB_DC (1u << 9) /* Configure Endpoint: Deconfigure (4.6.6) */
+#define TRB_SP (1u << 23) /* Stop Endpoint: 中断する装置の端点（6.4.3.8） */
 #define CC_SUCCESS 1
 #define CC_TRANSACTION_ERROR 4
 #define CC_TRB_ERROR 5
@@ -75,10 +79,16 @@ enum { EP_DISABLED, EP_RUNNING, EP_HALTED, EP_STOPPED, EP_ERROR };
 #define CONFIG 0x38
 #define PORTSC(p) (0x400 + 0x10 * ((p) - 1))
 #define PORTLI(p) (PORTSC(p) + 8)
+#define CMD_HCRST (1u << 1)
 #define CMD_INTE (1u << 2)
+#define CMD_CSS (1u << 8) /* Controller Save State (5.4.1) */
+#define CMD_CRS (1u << 9) /* Controller Restore State */
 #define STS_HCH 1u
 #define STS_HSE (1u << 2)
 #define STS_EINT (1u << 3)
+#define STS_SSS (1u << 8)  /* Save State Status (5.4.2) */
+#define STS_RSS (1u << 9)  /* Restore State Status */
+#define STS_SRE (1u << 10) /* Save/Restore Error, RW1C */
 #define STS_CNR (1u << 11)
 #define STS_HCE (1u << 12)
 #define CRCR_CA (1u << 2)
@@ -91,14 +101,19 @@ enum { EP_DISABLED, EP_RUNNING, EP_HALTED, EP_STOPPED, EP_ERROR };
 #define PS_PR (1u << 4)
 #define PS_PLS(sc) (((sc) >> 5) & 15)
 #define PS_PP (1u << 9)
+#define PS_LWS (1u << 16) /* PLS を書くときに立てる（Table 5-27） */
 #define PS_CSC (1u << 17)
 #define PS_WRC (1u << 19)
 #define PS_PRC (1u << 21)
 #define PS_PLC (1u << 22)
+#define PS_CAS (1u << 24) /* Cold Attach Status (4.19.8) */
 #define PS_WPR (1u << 31)
+#define PLS_U0 0
+#define PLS_U3 3
 #define PLS_RXDETECT 5
 #define PLS_INACTIVE 6
 #define PLS_COMPLIANCE 10
+#define PLS_RESUME 15
 #define PS_CHANGES (0x7Fu << 17)
 #define PS_PIC (3u << 14)
 #define SLOT_CONFIGURED 3u /* the Slot Context's Slot State (Table 6-7) */
@@ -121,6 +136,7 @@ enum { EP_DISABLED, EP_RUNNING, EP_HALTED, EP_STOPPED, EP_ERROR };
 #define HALT_NS (16 * NS_PER_MS)      /* USBSTS.HCH follows USBCMD.R/S within this (5.4.2) */
 #define COMMAND_ABORT_NS (5 * NS_PER_S) /* an aborted command's ring stops within this (4.6.1.2) */
 #define CONTROL_NS (5 * NS_PER_S)     /* a control request ends within this (USB 2.0 9.2.6.1) */
+#define SAVE_NS NS_PER_S /* Save State と Restore State の終わり（SSS、RSS）：文書は時間を決めない */
 
 /* The kinds of transfer events, each on an interrupter of its own when there are enough. */
 enum ring_kind { RING_CONTROL, RING_PERIODIC, RING_BULK, RING_KINDS };
@@ -146,7 +162,7 @@ struct trb_meta {
 
 enum { EP_STREAM = 1, EP_SYNC, EP_SEND };
 
-/* An endpoint. lock guards its ring, meta, busy, gen, trbs, inflight, next, halted, dead and the
+/* An endpoint. lock guards its ring, meta, busy, gen, trbs, inflight, next, halted, dead, asleep and the
    sync result, between the drain that completes its transfers, the thread that queues them
    (usb_bulk, usb_send) and the worker that recovers it. The rest is set before mode is, and stays. */
 struct endpoint {
@@ -178,6 +194,9 @@ struct endpoint {
     usb_report_fn fn;
     void *ctx;
     bool halted, dead;
+    /* 眠りの間（device_sleep から device_wake まで）：輪に何も積まず doorbell も鳴らさない（4.23.2：止めた制御器が指す
+       構造は変えない）。起きなかった装置の端点は、装置が外されるまでこのまま */
+    bool asleep;
     unsigned fails;    /* recoveries since the last good transfer, the end of it at 8 (the worker's and a drain's) */
     uint64_t retry_at; /* when the next recovery may run (clock_now_ns; the worker's) */
 };
@@ -209,6 +228,8 @@ struct xdev {
     bool hub, multi_tt;
     bool ctl_broken; /* the control ring could not be restarted: nothing more may be queued on it */
     bool work;       /* atomic: a class driver asked for its work functions (usb_note_work) */
+    bool asleep;     /* 端点は止まり、link は中断している：device_sleep から device_wake まで。ctl_mutex の下で書き、
+                        control と電源の walk が読む */
 };
 
 struct interrupter {
@@ -248,18 +269,24 @@ struct usb_hc {
     struct interrupter *intr;
     unsigned nintr;
     uint8_t target[RING_KINDS]; /* the interrupter each kind of event goes to */
-    bool running; /* atomic; written under every interrupter's lock (hc_set_running), or by resume, where no drain runs */
+    bool running; /* atomic; written under every interrupter's lock (hc_set_running) */
     bool polled;  /* atomic: no interrupt comes, the poll alarm drains the rings */
     bool messages; /* the interrupters raise MSI or MSI-X messages, not the INTx pin; set before running */
     struct alarm poll;
     uint32_t periodic[16]; /* open interrupt endpoints by service interval exponent (atomic) */
     /* the worker: kicks counts the notes of work (wq_wait_unless), the rest is the worker's but
-       port_pending, recover and woke, which drains and resume set */
+       port_pending, port_lost, recover and lost, which drains and resume set */
     struct thread *worker;
     struct wait_queue work_wq;
     uint64_t kicks;
     uint32_t port_pending[8];
-    bool recover, woke;
+    uint32_t port_lost[8]; /* atomic：眠りから戻らなかった装置の root port。root_port が装置を外し、reset から数え直す */
+    bool recover;
+    bool lost; /* atomic：xhci_resume が制御器の状態を戻せなかった。worker が立て直し、全部を数え直す */
+    /* 眠り：xhci_suspend と xhci_resume だけが書く（worker は電源の門で待っている） */
+    bool slept;        /* suspend が制御器を止めた：resume が戻す */
+    bool saved;        /* Save State が済んだ（4.23.2） */
+    uint64_t quiet_at; /* 端点と root port が止まった時：10 ms は戻さない（6.4.3.8） */
     bool wedged; /* atomic: an aborted command's ring did not stop (4.6.1.2) */
     bool failed, settled;
     bool stopping; /* atomic: detach asks the worker to remove the devices, halt the controller and end */
@@ -606,8 +633,8 @@ static void transfer_event(struct usb_hc *hc, uint64_t param, uint32_t status, u
     if (ep->fn) ep->fn(&xd->dev, ep->ctx, ep->buf + (size_t)b * ep->stride, got, at);
     if (ep->mode != EP_STREAM) return;
     spin_take(&ep->lock);
-    /* a recovery on the worker may have queued the whole stream again meanwhile */
-    if (!removed(&xd->dev) && !ep->halted && !ep->dead && !(ep->busy & (1u << b))) {
+    /* a recovery on the worker may have queued the whole stream again meanwhile. 眠りの間は device_wake が積む */
+    if (!removed(&xd->dev) && !ep->halted && !ep->dead && !ep->asleep && !(ep->busy & (1u << b))) {
         endpoint_push(ep, b, ep->len, false);
         doorbell(hc, slot, dci);
     }
@@ -686,6 +713,16 @@ static enum irq_result xhci_isr(void *context) {
     }
     spin_give(&ir->lock);
     return ours ? IRQ_HANDLED : IRQ_NONE;
+}
+
+/* 全部の interrupter の輪をいま排水する（割り込みの外から）。 */
+static void hc_drain(struct usb_hc *hc) {
+    uint64_t now = clock_now_ns();
+    for (unsigned i = 0; i < hc->nintr; i++) {
+        uint64_t f = spin_lock(&hc->intr[i].lock);
+        drain(&hc->intr[i], now, false);
+        spin_unlock(&hc->intr[i].lock, f);
+    }
 }
 
 /* A polled controller's rings looked at: as often as its fastest interrupt endpoint completes,
@@ -826,20 +863,27 @@ static void state_set(struct xdev *xd, unsigned dci, unsigned state) {
     spin_unlock(ep ? &ep->lock : &xd->ctl_lock, f);
 }
 
+/* A running endpoint stopped by Stop Endpoint; returns the state it is in, -1 when the command failed. A command
+   refused with a Context State Error says the state followed here is not the endpoint's, whose output context
+   then tells (4.6.9, 4.8.3). sp：装置を中断する前の Stop Endpoint（6.4.3.8、4.15.1.1）。 */
+static int endpoint_stop(struct xdev *xd, unsigned dci, bool sp) {
+    unsigned state = state_get(xd, dci);
+    if (state != EP_RUNNING) return (int)state;
+    int cc = hc_command(xd->dev.hc, 0, TRB_TYPE(TRB_STOP_EP) | (sp ? TRB_SP : 0) | dci << 16 | (uint32_t)xd->dev.slot << 24, NULL);
+    if (cc == CC_SUCCESS) return EP_STOPPED;
+    if (cc == CC_CONTEXT_STATE) return (int)(out_ctx(xd, dci)[0] & 7);
+    return -1;
+}
+
 /* The endpoint to where Set TR Dequeue Pointer takes it: a running one stopped, a halted one reset
-   (TSP 0: its data toggle too, and *halted says so, if asked). A command refused with a Context State Error
-   says the state followed here is not the endpoint's, whose output context then tells (4.6.9, 4.8.3):
-   stopped or in error is where it was to go. */
+   (TSP 0: its data toggle too, and *halted says so, if asked). Stopped or in error is where it was to go. */
 static bool endpoint_quiet(struct xdev *xd, unsigned dci, bool *halted) {
     struct usb_hc *hc = xd->dev.hc;
-    unsigned slot = xd->dev.slot, state = state_get(xd, dci);
+    unsigned slot = xd->dev.slot;
     if (halted) *halted = false;
-    if (state == EP_RUNNING) {
-        int cc = hc_command(hc, 0, TRB_TYPE(TRB_STOP_EP) | dci << 16 | slot << 24, NULL);
-        if (cc == CC_SUCCESS) state = EP_STOPPED;
-        else if (cc == CC_CONTEXT_STATE) state = out_ctx(xd, dci)[0] & 7;
-        else return false;
-    }
+    int stopped = endpoint_stop(xd, dci, false);
+    if (stopped < 0) return false;
+    unsigned state = (unsigned)stopped;
     if (state == EP_HALTED) {
         int cc = hc_command(hc, 0, TRB_TYPE(TRB_RESET_EP) | dci << 16 | slot << 24, NULL);
         if (cc == CC_SUCCESS) {
@@ -914,7 +958,7 @@ static int control(struct xdev *xd, uint8_t type, uint8_t request, uint16_t valu
     struct usb_device *d = &xd->dev;
     struct usb_hc *hc = d->hc;
     *over = true;
-    if (removed(d) || xd->ctl_broken || hc_dead(hc)) return -1;
+    if (removed(d) || xd->ctl_broken || xd->asleep || hc_dead(hc)) return -1;
     bool in = type & 0x80;
     if (!in && length) memcpy(mem, buffer, length);
     uint64_t setup = type | (uint64_t)request << 8 | (uint64_t)value << 16 | (uint64_t)index << 32 |
@@ -1046,12 +1090,7 @@ static void slot_quiet(struct usb_hc *hc, unsigned slot, struct xdev *xd) {
         if (state == EP_HALTED) hc_command(hc, 0, TRB_TYPE(TRB_RESET_EP) | dci << 16 | slot << 24, NULL);
         else if (state == EP_ERROR) set_dequeue(xd, dci, ep ? &ep->ring : &xd->ep0);
     }
-    uint64_t now = clock_now_ns();
-    for (unsigned i = 0; i < hc->nintr; i++) {
-        uint64_t f = spin_lock(&hc->intr[i].lock);
-        drain(&hc->intr[i], now, false);
-        spin_unlock(&hc->intr[i].lock, f);
-    }
+    hc_drain(hc);
 }
 
 /* The controller owns the device context and rings until Disable Slot completes; if it never
@@ -1288,9 +1327,13 @@ static bool pipe_reset(struct xdev *xd, struct endpoint *ep) {
 int usb_clear_halt(struct usb_device *d, uint8_t address) {
     struct endpoint *ep = find_endpoint(d, address);
     if (!ep) return -1;
+    uint64_t f = spin_lock(&ep->lock);
+    bool asleep = ep->asleep; /* 眠りの間は端点の文脈と輪を変えない（4.23.2） */
+    spin_unlock(&ep->lock, f);
+    if (asleep) return -1;
     endpoint_restart(ep, true);
     if (!pipe_reset((struct xdev *)d, ep)) return -1;
-    uint64_t f = spin_lock(&ep->lock);
+    f = spin_lock(&ep->lock);
     ep->halted = false;
     spin_unlock(&ep->lock, f);
     return 0;
@@ -1310,6 +1353,10 @@ int usb_bulk(struct usb_device *d, uint8_t address, void *buf, unsigned len, uns
     bool in = address & 0x80;
     if (!in && len) memcpy(ep->buf, buf, len);
     uint64_t f = spin_lock(&ep->lock);
+    if (ep->asleep) {
+        spin_unlock(&ep->lock, f);
+        return -1;
+    }
     if (ep->halted) {
         spin_unlock(&ep->lock, f);
         return USB_STALL;
@@ -1354,7 +1401,7 @@ int usb_send(struct usb_device *d, uint8_t address, const void *a, unsigned alen
     unsigned len = alen + blen;
     if (!ep || ep->mode != EP_SEND || len > ep->len || !len) return -1;
     uint64_t f = spin_lock(&ep->lock);
-    if (ep->dead) {
+    if (ep->dead || ep->asleep) {
         spin_unlock(&ep->lock, f);
         return -1;
     }
@@ -1937,9 +1984,10 @@ static bool connect_debounced(struct usb_hc *hc, unsigned p) {
     return false;
 }
 
-/* One try at a port with something at it and no device yet. */
-static void root_port_attach(struct usb_hc *hc, unsigned p) {
-    bool usb3 = hc->port_major[p] >= 3, retry = hc->port_tries[p].count > 1;
+/* One try at a port with something at it and no device yet. lost：居た装置が眠りから戻らず（xhci_resume）、つながったまま：
+   接続の debounce をせず、すぐ reset する。 */
+static void root_port_attach(struct usb_hc *hc, unsigned p, bool lost) {
+    bool usb3 = hc->port_major[p] >= 3, retry = hc->port_tries[p].count > 1 || lost;
     if (usb3) {
         if (!link_trained(hc, p) || retry) port_reset(hc, p, true);
     } else {
@@ -1964,10 +2012,11 @@ static void root_port_attach(struct usb_hc *hc, unsigned p) {
 }
 
 static void root_port(struct usb_hc *hc, unsigned p) {
-    uint32_t sc = rd32(hc->op, PORTSC(p));
+    uint32_t sc = rd32(hc->op, PORTSC(p)), bit = 1u << (p & 31);
     wr32(hc->op, PORTSC(p), (sc & PS_KEEP) | (sc & PS_CHANGES));
-    if (hc->root[p] && (!(sc & PS_CCS) || (sc & PS_CSC) || !(sc & PS_PED))) {
-        /* unplugged, replugged between two looks, or disabled by an error: start over */
+    bool lost = __atomic_fetch_and(&hc->port_lost[p >> 5], ~bit, __ATOMIC_ACQ_REL) & bit;
+    if (hc->root[p] && (lost || !(sc & PS_CCS) || (sc & PS_CSC) || !(sc & PS_PED))) {
+        /* unplugged, replugged between two looks, or disabled by an error: start over. 眠りから戻らなかった装置も */
         struct xdev *gone = hc->root[p];
         hc->root[p] = NULL;
         usb_remove(&gone->dev);
@@ -1987,7 +2036,7 @@ static void root_port(struct usb_hc *hc, unsigned p) {
     }
     bool usb3 = hc->port_major[p] >= 3, stuck = usb3 && port_stuck(hc, p, sc);
     if ((!(sc & PS_CCS) && !stuck) || hc->root[p] || !usb_port_try(t)) return;
-    root_port_attach(hc, p);
+    root_port_attach(hc, p, lost);
     sc = rd32(hc->op, PORTSC(p));
     if (hc->root[p] || port_empty(hc, p, sc)) usb_port_free(t);
     else usb_port_failed(t, usb3 && !(sc & PS_CCS));
@@ -2039,7 +2088,8 @@ static void hc_recover(struct usb_hc *hc) {
         struct xdev *xd = hc->slots[s];
         for (int i = 2; xd && !removed(&xd->dev) && i < 32; i++) {
             struct endpoint *ep = xd->ep[i];
-            if (!ep || !ep->halted || ep->dead || ep->mode == EP_SYNC) continue; /* usb_bulk's caller recovers */
+            /* usb_bulk's caller recovers. 眠りから起きなかった装置の端点は、その装置が外されるまで眠ったまま */
+            if (!ep || !ep->halted || ep->dead || ep->asleep || ep->mode == EP_SYNC) continue;
             if (now < ep->retry_at) { /* backing off: come back later */
                 __atomic_store_n(&hc->recover, true, __ATOMIC_RELEASE);
                 hc->retry_at = MIN(hc->retry_at, ep->retry_at);
@@ -2118,6 +2168,52 @@ static bool wait_reg(volatile uint8_t *b, unsigned off, uint32_t mask, uint32_t 
     }
 }
 
+/* R/S を落とし、HCH を待つ（5.4.2：16 ms のうちに）。割り込みも切る。 */
+static bool hc_halt(struct usb_hc *hc) {
+    wr32(hc->op, USBCMD, rd32(hc->op, USBCMD) & ~(1u | CMD_INTE));
+    return wait_reg(hc->op, USBSTS, STS_HCH, STS_HCH, HALT_NS);
+}
+
+/* 止まった制御器だけを reset する（5.4.1）。戻ると全部のレジスターは既定で、制御器はメモリーを手放している。 */
+static bool hc_reset(struct usb_hc *hc) {
+    wr32(hc->op, USBCMD, CMD_HCRST);
+    sleep_until(clock_after(2 * NS_PER_MS));
+    return wait_reg(hc->op, USBCMD, CMD_HCRST, 0, NS_PER_S) && wait_reg(hc->op, USBSTS, STS_CNR, 0, NS_PER_S);
+}
+
+/* 止まらない制御器は bus master を切る：その DMA はもうメモリーに届かない。 */
+static bool hc_quiesce(struct usb_hc *hc) {
+    if (hc_halt(hc)) return true;
+    kprintf("usb: controller %d does not halt, turned off\n", hc->index);
+    pci_disable_busmaster(hc->pci, NULL);
+    hal_failed(hc->hal, -N_ERR_IO);
+    return false;
+}
+
+/* 拡張機能の一覧（7.0）：HCCPARAMS1 の xECP から、各項の Next で辿る。0 で終わる。 */
+static unsigned cap_first(const struct usb_hc *hc) { return (rd32(hc->cap, 0x10) >> 16) << 2; }
+static unsigned cap_next(const struct usb_hc *hc, unsigned x) {
+    unsigned next = (rd32(hc->cap, x) >> 8) & 0xFF;
+    return next ? x + (next << 2) : 0;
+}
+
+/* Ownership (4.22.1): the OS semaphore set and the BIOS's clear (Table 7-4), whoever had it, or the
+ * firmware may take it later. Only the OS semaphore's byte: a whole-register write could put back a
+ * BIOS bit the firmware cleared in between. 印は Aux の電源の中にあり、それを失えば既定に戻る：Save State から
+ * 戻す時にもう一度受け取る。 */
+static void hc_take_ownership(struct usb_hc *hc) {
+    for (unsigned x = cap_first(hc); x && x + 16 <= hc->bar_size; x = cap_next(hc, x)) {
+        uint32_t v = rd32(hc->cap, x);
+        if ((v & 0xFF) != 1) continue;
+        mmio_write8(hc->cap + x + 3, (uint8_t)(v >> 24) | 1);
+        if (!wait_reg(hc->cap, x, 1u << 16, 0, NS_PER_S))
+            kprintf("usb: controller %d firmware kept ownership, taking it anyway\n", hc->index);
+        uint32_t legacy = rd32(hc->cap, x + 4);
+        wr32(hc->cap, x + 4, (legacy & ~0xE011u) | 0xE0000000u); /* SMIs off, stale events acked */
+        return;
+    }
+}
+
 static void interrupter_free(struct interrupter *ir) {
     if (ir->ev) dma_free(ir->ev_phys, EV_PAGES);
     if (ir->erst) pmm_free(ir->erst_phys);
@@ -2161,6 +2257,29 @@ static bool interrupters_init(struct usb_hc *hc) {
     return true;
 }
 
+/* interrupter の IMAN：polled でなければ割り込みを許す。IMOD：割り込みの端点を運ぶものは間引かない（IMODI_GATHER）。
+   立ち上げ（interrupter_start）と Save State からの戻し（hc_restore）が同じ値を書く。 */
+static uint32_t interrupter_iman(const struct usb_hc *hc) {
+    return __atomic_load_n(&hc->polled, __ATOMIC_ACQUIRE) ? IMAN_IP : IMAN_IP | IMAN_IE;
+}
+static uint32_t interrupter_imod(const struct usb_hc *hc, const struct interrupter *ir) {
+    return hc->target[RING_PERIODIC] == ir->index ? 0 : IMODI_GATHER;
+}
+
+/* R/S を立てて走らせる。割り込みは polled でなければ許し、polled なら見回りの alarm を始める。HCH が落ちなければ
+   false で、走っていない。立ち上げ（hc_start）と眠りからの戻り（hc_wake）が呼ぶ。 */
+static bool hc_run(struct usb_hc *hc) {
+    hc_set_running(hc, true);
+    bool polled = __atomic_load_n(&hc->polled, __ATOMIC_ACQUIRE);
+    wr32(hc->op, USBCMD, rd32(hc->op, USBCMD) | 1 | (polled ? 0 : CMD_INTE));
+    if (!wait_reg(hc->op, USBSTS, STS_HCH, 0, 100 * NS_PER_MS)) {
+        hc_set_running(hc, false);
+        return false;
+    }
+    if (polled) alarm_set(&hc->poll, clock_now_ns());
+    return true;
+}
+
 /* An interrupter's ring empty and in place (4.9.4: ERSTBA last). */
 static void interrupter_start(struct usb_hc *hc, struct interrupter *ir) {
     memset(ir->ev, 0, EV_PAGES * 4096);
@@ -2169,12 +2288,11 @@ static void interrupter_start(struct usb_hc *hc, struct interrupter *ir) {
     ir->ev_idx = 0;
     ir->ev_cycle = 1;
     ir->interrupts = 0;
-    bool periodic = hc->target[RING_PERIODIC] == ir->index;
     wr32(ir->regs, ERSTSZ, 1);
     wr64(ir->regs, ERDP, ir->ev_bus);
     wr64(ir->regs, ERSTBA, ir->erst_bus);
-    wr32(ir->regs, IMOD, periodic ? 0 : IMODI_GATHER);
-    wr32(ir->regs, IMAN, __atomic_load_n(&hc->polled, __ATOMIC_ACQUIRE) ? IMAN_IP : IMAN_IP | IMAN_IE);
+    wr32(ir->regs, IMOD, interrupter_imod(hc, ir));
+    wr32(ir->regs, IMAN, interrupter_iman(hc));
 }
 
 static bool hc_start(struct usb_hc *hc) {
@@ -2195,37 +2313,25 @@ static bool hc_start(struct usb_hc *hc) {
         return false;
     }
     /* extended capabilities: take the controller from the firmware, learn each port's USB revision */
-    for (unsigned x = (hcc1 >> 16) << 2; x && x + 16 <= hc->bar_size;) {
+    hc_take_ownership(hc);
+    for (unsigned x = cap_first(hc); x && x + 16 <= hc->bar_size; x = cap_next(hc, x)) {
         uint32_t v = rd32(hc->cap, x);
-        if ((v & 0xFF) == 1) {
-            /* Ownership: the OS semaphore set and the BIOS's clear (Table 7-4), whoever had it, or the
-             * firmware may take it later (4.22.1). Only the OS semaphore's byte: a whole-register write
-             * could put back a BIOS bit the firmware cleared in between. */
-            mmio_write8(hc->cap + x + 3, (uint8_t)(v >> 24) | 1);
-            if (!wait_reg(hc->cap, x, 1u << 16, 0, NS_PER_S))
-                kprintf("usb: controller %d firmware kept ownership, taking it anyway\n", hc->index);
-            uint32_t legacy = rd32(hc->cap, x + 4);
-            wr32(hc->cap, x + 4, (legacy & ~0xE011u) | 0xE0000000u); /* SMIs off, stale events acked */
-        } else if ((v & 0xFF) == 2) {
-            uint32_t ports = rd32(hc->cap, x + 8), slot_type = rd32(hc->cap, x + 12) & 0x1F;
-            unsigned first = ports & 0xFF, count = (ports >> 8) & 0xFF, psic = ports >> 28;
-            uint32_t *psi = NULL;
-            if (psic && first < 256 && !hc->port_psi[first] && x + 0x10 + psic * 4 <= hc->bar_size &&
-                (psi = kmalloc(psic * sizeof *psi)))
-                for (unsigned i = 0; i < psic; i++) psi[i] = rd32(hc->cap, x + 0x10 + i * 4);
-            for (unsigned p = first; p < first + count && p < 256; p++) {
-                hc->port_major[p] = v >> 24;
-                hc->port_slot_type[p] = (uint8_t)slot_type;
-                hc->port_hubs[p] = (ports >> 25) & 7;
-                if (psi) { /* the same each time the controller starts */
-                    hc->port_psi[p] = psi;
-                    hc->port_psic[p] = (uint8_t)psic;
-                }
+        if ((v & 0xFF) != 2) continue;
+        uint32_t ports = rd32(hc->cap, x + 8), slot_type = rd32(hc->cap, x + 12) & 0x1F;
+        unsigned first = ports & 0xFF, count = (ports >> 8) & 0xFF, psic = ports >> 28;
+        uint32_t *psi = NULL;
+        if (psic && first < 256 && !hc->port_psi[first] && x + 0x10 + psic * 4 <= hc->bar_size &&
+            (psi = kmalloc(psic * sizeof *psi)))
+            for (unsigned i = 0; i < psic; i++) psi[i] = rd32(hc->cap, x + 0x10 + i * 4);
+        for (unsigned p = first; p < first + count && p < 256; p++) {
+            hc->port_major[p] = v >> 24;
+            hc->port_slot_type[p] = (uint8_t)slot_type;
+            hc->port_hubs[p] = (ports >> 25) & 7;
+            if (psi) { /* the same each time the controller starts */
+                hc->port_psi[p] = psi;
+                hc->port_psic[p] = (uint8_t)psic;
             }
         }
-        unsigned next = (v >> 8) & 0xFF;
-        if (!next) break;
-        x += next << 2;
     }
     /* no operational register may be written before Controller Not Ready clears (4.2), and a
      * reset is only allowed once the controller has halted (5.4.1) */
@@ -2233,14 +2339,11 @@ static bool hc_start(struct usb_hc *hc) {
         kprintf("usb: controller %d never became ready\n", hc->index);
         return false;
     }
-    wr32(hc->op, USBCMD, rd32(hc->op, USBCMD) & ~1u);
-    if (!wait_reg(hc->op, USBSTS, STS_HCH, STS_HCH, HALT_NS)) {
+    if (!hc_halt(hc)) {
         kprintf("usb: controller %d did not halt\n", hc->index);
         return false;
     }
-    wr32(hc->op, USBCMD, 2);
-    sleep_until(clock_after(2 * NS_PER_MS));
-    if (!wait_reg(hc->op, USBCMD, 2, 0, NS_PER_S) || !wait_reg(hc->op, USBSTS, STS_CNR, 0, NS_PER_S)) {
+    if (!hc_reset(hc)) {
         kprintf("usb: controller %d did not come out of reset\n", hc->index);
         return false;
     }
@@ -2278,15 +2381,10 @@ static bool hc_start(struct usb_hc *hc) {
     wr64(hc->op, DCBAAP, bus_of(hc, hc->dcbaa_phys));
     wr64(hc->op, CRCR, hc->cmd.bus | 1);
     for (unsigned i = 0; i < hc->nintr; i++) interrupter_start(hc, &hc->intr[i]);
-    hc_set_running(hc, true);
-    bool polled = __atomic_load_n(&hc->polled, __ATOMIC_ACQUIRE);
-    wr32(hc->op, USBCMD, 1 | (polled ? 0 : CMD_INTE));
-    if (!wait_reg(hc->op, USBSTS, STS_HCH, 0, 100 * NS_PER_MS)) {
+    if (!hc_run(hc)) {
         kprintf("usb: controller %d did not start\n", hc->index);
-        hc_set_running(hc, false);
         return false;
     }
-    if (polled) alarm_set(&hc->poll, clock_now_ns());
     /* a No Op command shows that interrupts arrive (or that they do not: polled from then on) */
     if (hc_command(hc, 0, TRB_TYPE(TRB_NOOP_CMD), NULL) != CC_SUCCESS) {
         kprintf("usb: controller %d does not answer commands\n", hc->index);
@@ -2295,6 +2393,7 @@ static bool hc_start(struct usb_hc *hc) {
     }
     memset(hc->port_tries, 0, sizeof hc->port_tries); /* the reset took every port back (4.19.1.2.3) */
     memset(hc->port_power, 0, sizeof hc->port_power);
+    for (unsigned w = 0; w < 8; w++) __atomic_store_n(&hc->port_lost[w], 0, __ATOMIC_RELEASE);
     if (hcc1 & 8) /* port power control */
         for (unsigned p = 1; p <= hc->max_ports; p++) {
             if (!hc->port_major[p]) continue; /* no protocol defines it: not to be touched (7.2.2) */
@@ -2304,7 +2403,7 @@ static bool hc_start(struct usb_hc *hc) {
     sleep_until(clock_after(20 * NS_PER_MS));
     for (unsigned p = 1; p <= hc->max_ports; p++)
         if (hc->port_major[p]) __atomic_fetch_or(&hc->port_pending[p >> 5], 1u << (p & 31), __ATOMIC_RELEASE);
-    polled = __atomic_load_n(&hc->polled, __ATOMIC_ACQUIRE);
+    bool polled = __atomic_load_n(&hc->polled, __ATOMIC_ACQUIRE);
     kprintf("usb: xHCI %d (%04x:%04x) version %x, %u ports, %u slots, %u interrupter%s of %u, %s\n", hc->index,
             pci->vendor, pci->device, rd32(hc->cap, 0) >> 16, hc->max_ports, hc->max_slots, hc->nintr,
             hc->nintr > 1 ? "s" : "", hc->max_intrs, polled ? "polled" : !hc->messages ? "INTx" : pci->msi_count ? "MSI" : "MSI-X");
@@ -2323,18 +2422,8 @@ static bool hc_start(struct usb_hc *hc) {
    False when it will not halt: it keeps its DMA until bus mastering goes off, and stays off. */
 static bool hc_stop(struct usb_hc *hc) {
     hc_set_running(hc, false);
-    wr32(hc->op, USBCMD, rd32(hc->op, USBCMD) & ~(1u | CMD_INTE));
-    /* a reset is only for a halted controller (5.4.1) */
-    bool halted = wait_reg(hc->op, USBSTS, STS_HCH, STS_HCH, HALT_NS);
-    if (halted) {
-        wr32(hc->op, USBCMD, 2);
-        sleep_until(clock_after(2 * NS_PER_MS));
-        wait_reg(hc->op, USBCMD, 2, 0, NS_PER_S);
-    } else {
-        kprintf("usb: controller %d does not halt, turned off\n", hc->index);
-        pci_disable_busmaster(hc->pci, NULL);
-        hal_failed(hc->hal, -N_ERR_IO);
-    }
+    bool halted = hc_quiesce(hc);
+    if (halted) hc_reset(hc);
     for (unsigned p = 1; p <= hc->max_ports; p++) {
         struct xdev *gone = hc->root[p];
         hc->root[p] = NULL;
@@ -2350,7 +2439,7 @@ static bool hc_stop(struct usb_hc *hc) {
 /* A Host System Error or Host Controller Error stops the controller for good (4.24.1, 5.4.2) and
  * every device with it: reset it so it lets go of memory, have the drivers drop their devices,
  * then bring it up again and enumerate from scratch. A controller that keeps failing is left off.
- * After a sleep the same happens, without counting as a failure: the devices lost their addresses. */
+ * 眠りの間に状態を失った制御器（xhci_resume の lost）も同じにするが、失敗には数えない。 */
 static bool hc_start_again(struct usb_hc *hc) {
     bool up = hc_start(hc);
     if (up) {
@@ -2386,7 +2475,7 @@ static void hc_settled(struct usb_hc *hc) {
 
 /* One round of the worker: restarts, ports, hubs, recoveries and the class drivers' work. */
 static void hc_round(struct usb_hc *hc, uint64_t settle_at) {
-    if (__atomic_exchange_n(&hc->woke, false, __ATOMIC_ACQ_REL)) hc_restart(hc, true);
+    if (__atomic_exchange_n(&hc->lost, false, __ATOMIC_ACQ_REL)) hc_restart(hc, true);
     uint32_t sts = hc_running(hc) ? rd32(hc->op, USBSTS) : 0;
     if ((sts == 0xFFFFFFFFu) != hc->gone) {
         hc->gone = !hc->gone;
@@ -2445,6 +2534,305 @@ static void hc_worker(void *arg) {
     hc_kick(hc);
 }
 
+/* ---- 眠り、休止の写し、電源断（hal.h の suspend と resume） ----
+ *
+ * 眠り（S3）と休止の写しでは装置は残る。中断した装置は address と構成を持つ（USB 2.0 9.1.1.6、USB 3.2 9.2.5.2）。
+ * 止め方は 4.15 と 4.23.2：各装置の端点を SP つきの Stop Endpoint で止め（4.15.1.1）、link を U3 にし、R/S を落とし、
+ * 眠りでは Save State で内の状態を写す。戻りは逆に、Restore State（電源を失った時）、R/S、link を U0、端点の doorbell。
+ * 電源を失った・抜かれた装置は port が変わって戻り、worker が外して数え直す。制御器が状態を持たず Save State も無い時
+ * （休止の写しから戻った：起動のカーネルの電源断が reset した）は、worker が制御器を立て直して全部を数え直す（lost）。
+ * 電源断は端点を閉じて止め、reset する：resume は来ず、写しのカーネルは DCBAAP の 0 で状態の無いことを知る。
+ *
+ * USB の装置の node は動いていない（実装も claim も無い）ので、walk の段は木の順を持たない：同じ制御器の interface は
+ * hub の下のものも全部同じ段で、制御器より先に止まり、後に戻る。木の順（深い装置から止め、浅い装置から戻す）はここで
+ * 辿る。worker は電源の門で待っていて、hc->slots と装置の木は動かない。 */
+
+/* 生きている装置の一番深い段。 */
+static unsigned deepest(const struct usb_hc *hc) {
+    unsigned depth = 0;
+    for (unsigned s = 1; s <= hc->max_slots; s++)
+        if (hc->slots[s] && hc->slots[s]->dev.depth > depth) depth = hc->slots[s]->dev.depth;
+    return depth;
+}
+
+/* 装置のデータの端点に何も積ませない：usb_bulk、usb_send、usb_clear_halt と stream の積み直しが断る。 */
+static void endpoints_close(struct xdev *xd) {
+    for (unsigned dci = 2; dci < 32; dci++) {
+        struct endpoint *ep = xd->ep[dci];
+        if (!ep) continue;
+        uint64_t f = spin_lock(&ep->lock);
+        ep->asleep = true;
+        spin_unlock(&ep->lock, f);
+    }
+}
+
+/* 装置を中断の前の形に（4.15.1.1）：端点を閉じ、制御の端点は ctl_mutex で進行中の要求の終わりを待ってから閉じ
+   （control が断る）、動いている端点を全部止める。止まらない端点は命令の時間切れが言い、止まらない命令の輪は
+   Save State を断る（hc_save）。 */
+static void device_sleep(struct xdev *xd) {
+    endpoints_close(xd);
+    mutex_lock(&xd->ctl_mutex);
+    xd->asleep = true;
+    mutex_unlock(&xd->ctl_mutex);
+    for (unsigned dci = 1; dci < 32; dci++) {
+        if (dci != 1 && !xd->ep[dci]) continue;
+        int state = endpoint_stop(xd, dci, true);
+        if (state >= 0) state_set(xd, dci, (unsigned)state);
+        else kprintf("usb: slot %u endpoint %u did not stop for sleep\n", xd->dev.slot, dci);
+    }
+}
+
+/* 深い装置から止める。SuperSpeed の hub の下の装置は、端点の後にその port を U3 にする（USB 3.2 10.16.2.10）：
+   Enhanced SuperSpeed の hub は選んだ port の中断だけを持ち（10.10）、上り口が U3 になった hub には要求が届かないので、
+   hub より先に下の装置。USB2 の hub の下は root port の中断で木の全部が中断する（USB 2.0 7.1.7.6）。 */
+static void devices_sleep(struct usb_hc *hc) {
+    for (unsigned depth = deepest(hc) + 1; depth-- > 0;)
+        for (unsigned s = 1; s <= hc->max_slots; s++) {
+            struct xdev *xd = hc->slots[s];
+            if (!xd || xd->dev.depth != depth) continue;
+            device_sleep(xd);
+            struct usb_device *hub = xd->dev.parent;
+            if (hub && hub->speed >= USB_SPEED_SUPER) usbhub_link_suspend(hub, xd->dev.port);
+        }
+}
+
+/* root port の link を pls へ（Table 5-27：LWS を立てて PLS を書く）。PED と変化の旗は書かない。 */
+static void port_link(struct usb_hc *hc, unsigned p, unsigned pls) {
+    uint32_t sc = rd32(hc->op, PORTSC(p));
+    wr32(hc->op, PORTSC(p), (sc & PS_KEEP) | PS_LWS | pls << 5);
+}
+
+/* bits の root port が pls に着くまで、ns まで待つ。着かなかった port が bits に残る。 */
+static void ports_wait(struct usb_hc *hc, uint32_t bits[8], unsigned pls, uint64_t ns) {
+    uint64_t deadline = clock_after(ns);
+    for (;;) {
+        bool left = false;
+        for (unsigned w = 0; w < 8; w++)
+            for (uint32_t b = bits[w]; b; b &= b - 1) {
+                unsigned p = w * 32 + (unsigned)__builtin_ctz(b);
+                uint32_t sc = rd32(hc->op, PORTSC(p));
+                if (sc != 0xFFFFFFFFu && PS_PLS(sc) == pls) bits[w] &= ~(1u << (p & 31));
+                else left = true;
+            }
+        if (!left || clock_now_ns() >= deadline) return;
+        sleep_until(clock_after(NS_PER_MS));
+    }
+}
+
+/* 有効な root port（PED、PLS が U3 より下）を全部 U3 にする（4.15、4.15.1）。PLS が U3 になるのは中断の信号が
+   装置に届いてからで、10 ms までかかり、制御器を止める前に待つ（4.15.1）。 */
+static void ports_sleep(struct usb_hc *hc) {
+    uint32_t bits[8] = {0};
+    for (unsigned p = 1; p <= hc->max_ports; p++) {
+        if (!hc->port_major[p]) continue;
+        uint32_t sc = rd32(hc->op, PORTSC(p));
+        if (sc == 0xFFFFFFFFu || !(sc & PS_PED) || PS_PLS(sc) >= PLS_U3) continue;
+        port_link(hc, p, PLS_U3);
+        bits[p >> 5] |= 1u << (p & 31);
+    }
+    ports_wait(hc, bits, PLS_U3, 10 * NS_PER_MS);
+    for (unsigned w = 0; w < 8; w++)
+        for (uint32_t b = bits[w]; b; b &= b - 1)
+            kprintf("usb: controller %d port %u did not suspend\n", hc->index, w * 32 + (unsigned)__builtin_ctz(b));
+}
+
+/* 中断した root port を U0 へ（4.15.2.2）。D0 に戻った制御器は U3 と Resume の port を自分では戻さない（4.15）。
+   U3 に入れてから 10 ms は戻さない（6.4.3.8）。R/S を立ててから（4.15.2.1 の注）。USB3 の port は U0 を書けば
+   LFPS の握手で戻り、装置が起こした Resume も同じ（4.15.2.1）：U3 からの出口は USB_U3_EXIT_NS まで。USB2 の port は
+   Resume を書いて TDRSMDN の 20 ms を送り、U0 を書く（4.15.2.2、USB 2.0 7.1.7.7）。その後の TRSMRCY の 10 ms は装置に
+   話しかけない。 */
+static void ports_wake(struct usb_hc *hc) {
+    sleep_until(hc->quiet_at + 10 * NS_PER_MS);
+    uint32_t bits[8] = {0}, usb2[8] = {0};
+    bool any2 = false;
+    for (unsigned p = 1; p <= hc->max_ports; p++) {
+        if (!hc->port_major[p]) continue;
+        uint32_t sc = rd32(hc->op, PORTSC(p));
+        unsigned pls = PS_PLS(sc);
+        if (sc == 0xFFFFFFFFu || !(sc & PS_PED) || (pls != PLS_U3 && pls != PLS_RESUME)) continue;
+        bits[p >> 5] |= 1u << (p & 31);
+        if (hc->port_major[p] >= 3) {
+            port_link(hc, p, PLS_U0);
+            continue;
+        }
+        if (pls == PLS_U3) port_link(hc, p, PLS_RESUME);
+        usb2[p >> 5] |= 1u << (p & 31);
+        any2 = true;
+    }
+    if (any2) {
+        sleep_until(clock_after(20 * NS_PER_MS));
+        for (unsigned w = 0; w < 8; w++)
+            for (uint32_t b = usb2[w]; b; b &= b - 1) port_link(hc, w * 32 + (unsigned)__builtin_ctz(b), PLS_U0);
+    }
+    ports_wait(hc, bits, PLS_U0, USB_U3_EXIT_NS);
+    if (any2) sleep_until(clock_after(10 * NS_PER_MS));
+}
+
+/* 眠りの後も同じ装置がつながっている root port：つながったまま抜き差しが無く（CSC）、D3 の間に接続が変わらず
+   （CAS：その時 PLS は当てにならない、4.15）、有効で U0 か省電力の U1、U2 にいる。 */
+static bool port_kept(uint32_t sc) {
+    return sc != 0xFFFFFFFFu && (sc & PS_CCS) && !(sc & (PS_CSC | PS_CAS)) && (sc & PS_PED) && PS_PLS(sc) <= 2;
+}
+
+/* 戻った装置の端点を開け、積んであるものの端点を鳴らす（4.15.1.1、4.23.2 の 10）。止める間に終わった stream の転送は
+   transfer_event が積み直さなかったので、ここで積む。 */
+static void device_wake(struct xdev *xd) {
+    struct usb_hc *hc = xd->dev.hc;
+    mutex_lock(&xd->ctl_mutex);
+    xd->asleep = false;
+    mutex_unlock(&xd->ctl_mutex);
+    for (unsigned dci = 2; dci < 32; dci++) {
+        struct endpoint *ep = xd->ep[dci];
+        if (!ep) continue;
+        uint64_t f = spin_lock(&ep->lock);
+        ep->asleep = false;
+        bool live = !ep->halted && !ep->dead;
+        if (live && ep->mode == EP_STREAM)
+            for (unsigned b = 0; b < ep->count; b++)
+                if (!(ep->busy & (1u << b))) endpoint_push(ep, b, ep->len, false);
+        if (live && ep->busy) {
+            ep->state = EP_RUNNING;
+            doorbell(hc, xd->dev.slot, dci);
+        }
+        spin_unlock(&ep->lock, f);
+    }
+}
+
+/* 浅い装置から戻す。root port の装置は port が保ったか（port_kept）。hub の下の装置は hub が戻ってから：SuperSpeed の
+   hub ではその port を U0 に戻せたか（usbhub_link_resume）、USB2 の hub の下は上の Resume が下へ伝わる（USB 2.0 11.9）。
+   戻らない装置の端点は閉じたままで、worker が外して数え直す：root port の装置は port_lost で、hub の下の装置は hub が
+   覚えて（usbhub_link_resume）、戻らない hub の下の装置はその hub と一緒に。 */
+static void devices_wake(struct usb_hc *hc) {
+    unsigned last = deepest(hc);
+    for (unsigned depth = 0; depth <= last; depth++)
+        for (unsigned s = 1; s <= hc->max_slots; s++) {
+            struct xdev *xd = hc->slots[s];
+            if (!xd || xd->dev.depth != depth) continue;
+            struct usb_device *hub = xd->dev.parent;
+            unsigned p = xd->dev.root_port;
+            bool up;
+            if (!hub) up = port_kept(rd32(hc->op, PORTSC(p)));
+            else if (((struct xdev *)hub)->asleep) up = false;
+            else up = hub->speed < USB_SPEED_SUPER || usbhub_link_resume(hub, xd->dev.port);
+            if (up) {
+                device_wake(xd);
+            } else if (!hub) {
+                kprintf("usb: controller %d port %u: its device did not stay through the sleep\n", hc->index, p);
+                __atomic_fetch_or(&hc->port_lost[p >> 5], 1u << (p & 31), __ATOMIC_RELEASE);
+            }
+        }
+}
+
+/* Save State（4.23.2 の 5）：止めた制御器が内の状態を scratchpad か自分の中へ写す。SSS が落ちて終わり、SRE（RW1C）が
+   失敗を言う。止まらなかった命令の輪（wedged）は reset のほかに戻し方が無い（4.6.1.2）。 */
+static bool hc_save(struct usb_hc *hc) {
+    if (__atomic_load_n(&hc->wedged, __ATOMIC_ACQUIRE)) return false;
+    wr32(hc->op, USBCMD, rd32(hc->op, USBCMD) | CMD_CSS);
+    bool done = wait_reg(hc->op, USBSTS, STS_SSS, 0, SAVE_NS);
+    bool error = rd32(hc->op, USBSTS) & STS_SRE;
+    if (error) wr32(hc->op, USBSTS, STS_SRE);
+    if (done && !error) return true;
+    kprintf("usb: controller %d could not save its state (%s)\n", hc->index, done ? "error" : "timed out");
+    return false;
+}
+
+/* Restore State（4.23.2 の戻しの 4 から 7）：レジスターを DCBAAP、CONFIG、各 interrupter の ERSTSZ、ERSTBA、ERDP、
+   IMAN、IMOD の順に書き戻し（DNCTRL は使わず既定のまま）、CRS で内の状態を戻し、命令の輪を空から始め直す（止める前に
+   空にした）。所有の印は Aux の電源の中にあり、それを失えば既定に戻る（4.22.1）。 */
+static bool hc_restore(struct usb_hc *hc) {
+    if (!wait_reg(hc->op, USBSTS, STS_CNR, 0, NS_PER_S)) {
+        kprintf("usb: controller %d never became ready after sleep\n", hc->index);
+        return false;
+    }
+    hc_take_ownership(hc);
+    wr64(hc->op, DCBAAP, bus_of(hc, hc->dcbaa_phys));
+    wr32(hc->op, CONFIG, (rd32(hc->op, CONFIG) & ~0xFFu) | hc->max_slots);
+    for (unsigned i = 0; i < hc->nintr; i++) {
+        struct interrupter *ir = &hc->intr[i];
+        wr32(ir->regs, ERSTSZ, 1);
+        wr64(ir->regs, ERSTBA, ir->erst_bus);
+        wr64(ir->regs, ERDP, ir->ev_bus + ir->ev_idx * sizeof(struct trb));
+        wr32(ir->regs, IMAN, interrupter_iman(hc));
+        wr32(ir->regs, IMOD, interrupter_imod(hc, ir));
+    }
+    wr32(hc->op, USBCMD, rd32(hc->op, USBCMD) | CMD_CRS);
+    bool done = wait_reg(hc->op, USBSTS, STS_RSS, 0, SAVE_NS);
+    bool error = rd32(hc->op, USBSTS) & STS_SRE;
+    if (error) wr32(hc->op, USBSTS, STS_SRE);
+    if (!done || error) {
+        kprintf("usb: controller %d could not restore its state (%s)\n", hc->index, done ? "error" : "timed out");
+        return false;
+    }
+    mutex_lock(&hc->cmd_mutex);
+    ring_reset(&hc->cmd);
+    wr64(hc->op, CRCR, hc->cmd.bus | 1);
+    mutex_unlock(&hc->cmd_mutex);
+    return true;
+}
+
+/* 止めた制御器を走らせ直す：止めたままの状態を持つ時と、Save State から戻せた時。D3cold を通らなければ内の状態は
+   残り、Restore State は要らない（4.23.2）。D3hot から D0 への移りと HCRST は Core の電源の側のレジスターを既定に
+   戻す（4.23.1）：DCBAAP が自分の DCBAA を指していなければ、レジスターは失われた。 */
+static bool hc_wake(struct usb_hc *hc) {
+    uint32_t sts = rd32(hc->op, USBSTS);
+    if (sts == 0xFFFFFFFFu) return false;
+    bool kept = (sts & STS_HCH) && mmio_read64(hc->op + DCBAAP) == bus_of(hc, hc->dcbaa_phys);
+    if (!kept && !(hc->saved && hc_restore(hc))) return false;
+    if (hc_run(hc)) return true;
+    kprintf("usb: controller %d did not start after sleep\n", hc->index);
+    return false;
+}
+
+/* 電源の段（hal.h）。interface の実装はもう止まり、worker は電源の門で待っている。 */
+static bool xhci_suspend(struct hal_device *d, enum hal_power_target target) {
+    struct usb_hc *hc = d->driver_data;
+    hc->slept = hc->saved = false;
+    /* 立ち上がらなかった、立て直しで止まったままの、バスから消えた制御器：止めるものが無い */
+    if (!hc->op || !hc_running(hc) || rd32(hc->op, USBSTS) == 0xFFFFFFFFu) return true;
+    switch (target) {
+    case HAL_POWER_SLEEP:
+    case HAL_POWER_IMAGE:
+        devices_sleep(hc);
+        ports_sleep(hc);
+        hc->quiet_at = clock_now_ns();
+        break;
+    case HAL_POWER_OFF:
+        for (unsigned s = 1; s <= hc->max_slots; s++)
+            if (hc->slots[s]) endpoints_close(hc->slots[s]);
+        break;
+    }
+    hc->slept = true;
+    bool halted = hc_quiesce(hc);
+    hc_drain(hc); /* 止まるまでに来た事象：命令の完了と port の変化（4.23.2 の 2） */
+    hc_set_running(hc, false);
+    if (!halted) return false;
+    switch (target) {
+    case HAL_POWER_SLEEP: hc->saved = hc_save(hc); break;
+    case HAL_POWER_IMAGE: break; /* 写しから戻る時、制御器は起動のカーネルのもの：写す状態は無い */
+    case HAL_POWER_OFF: hc_reset(hc); break;
+    }
+    return true;
+}
+
+/* 状態を失った制御器も true：worker が立て直す（hc_round の lost）。それも駄目なら worker が hal_failed で言う。 */
+static bool xhci_resume(struct hal_device *d) {
+    struct usb_hc *hc = d->driver_data;
+    if (!hc->slept) return true;
+    hc->slept = false;
+    if (hc_wake(hc)) {
+        ports_wake(hc);
+        devices_wake(hc);
+    } else {
+        kprintf("usb: controller %d lost its state while asleep, starting it again\n", hc->index);
+        __atomic_store_n(&hc->lost, true, __ATOMIC_RELEASE);
+    }
+    /* 眠りの間の接続の変化は事象にならないことがある：worker が全部の port を見る */
+    for (unsigned p = 1; p <= hc->max_ports; p++)
+        if (hc->port_major[p]) __atomic_fetch_or(&hc->port_pending[p >> 5], 1u << (p & 31), __ATOMIC_RELEASE);
+    hc_kick(hc);
+    return true;
+}
+
 static int xhci_attach(struct hal_device *d) {
     const struct n_hal_resource *bar = hal_resource(d, N_HAL_MEMORY, 0);
     if (!bar || bar->size < 0x1000) {
@@ -2500,5 +2888,8 @@ static const struct hal_driver xhci_driver = {
     .rule_count = ARRAY_SIZE(xhci_rules),
     .attach = xhci_attach,
     .detach = xhci_detach,
+    .suspend = xhci_suspend,
+    .resume = xhci_resume,
+    .after_sleep = HAL_AFTER_SLEEP_RESUME,
 };
 HAL_DRIVER(xhci_driver);

@@ -17,7 +17,12 @@
  * an interrupt, or a polled controller's alarm, with interrupts off. It never sleeps, takes no
  * mutex and keeps short; whatever needs the worker it asks for with usb_note_work. usb_control,
  * usb_bulk and usb_clear_halt sleep until their transfer completes and run in any thread, on a
- * device that is not removed meanwhile (its class driver's detach waits for its users). */
+ * device that is not removed meanwhile (its class driver's detach waits for its users).
+ *
+ * 電源（hal.h）。interface の実装は制御器より先に suspend し、後に resume する。suspend では自分のデータの道を自分の
+ * 錠で閉じる。眠り（S3）と休止の写しの間、装置は残り（xhci.c が木を辿って端点を止め、link を中断する）、usb_control、
+ * usb_bulk、usb_send、usb_clear_halt は -1 を返し、報告は来ない。眠りの間に電源を失った・抜かれた装置と、状態を失った
+ * 制御器の装置は、門が開いた後に worker が外して（detach）数え直す（新しい装置として attach）。 */
 #include <stdint.h>
 #include <stdbool.h>
 #include "hal/hal.h"
@@ -60,6 +65,10 @@ static inline void usb_port_failed(struct usb_port_tries *t, bool stuck) {
 static inline bool usb_port_trying(const struct usb_port_tries *t) {
     return t->at && t->at != CLOCK_NEVER && !t->stuck;
 }
+
+/* Enhanced SuperSpeed の link が U3 から U0 に戻るまで：LFPS の握手の tNoLFPSResponseTimeout（U3 から 300 ms）と、
+   Recovery の Active、Configuration、Idle の時間切れ（2、10、12 ms）（USB 3.2 Table 7-12）。 */
+#define USB_U3_EXIT_NS ((300 + 2 + 10 + 12) * NS_PER_MS)
 
 /* The kind of a device's speed. The numbers a Slot Context takes are the root port's own (xhci.c). */
 enum { USB_SPEED_FULL = 1, USB_SPEED_LOW = 2, USB_SPEED_HIGH = 3, USB_SPEED_SUPER = 4, USB_SPEED_SUPER_PLUS = 5 };
@@ -145,7 +154,7 @@ struct usb_ep_info {
    moment on the monotonic clock (clock_now_ns) its completion was taken from the event ring. */
 typedef void (*usb_report_fn)(struct usb_device *d, void *ctx, const uint8_t *data, unsigned len, uint64_t at);
 
-/* A control transfer; returns the bytes moved, or -1 (stall, error, timeout, removal). */
+/* A control transfer; returns the bytes moved, or -1 (stall, error, timeout, removal, sleep). */
 int usb_control(struct usb_device *d, uint8_t type, uint8_t request, uint16_t value, uint16_t index,
                 void *buffer, uint16_t length);
 /* Keep the interrupt IN endpoint polled, handing each transfer of up to `longest` bytes, in whole
@@ -164,7 +173,7 @@ bool usb_open_endpoints(struct usb_device *d, const struct usb_ep_info *eps, int
  * are queued anew, after a recovery dropped them all (data NULL, len 0). */
 bool usb_stream_start(struct usb_device *d, uint8_t address, unsigned len, unsigned count, usb_report_fn fn, void *ctx);
 /* One bulk transfer of up to 64 KiB, waited for. One caller at a time on an endpoint (the class
- * driver's lock). Returns 0, USB_STALL, USB_TIMEOUT, or -1 (error or removal); after any but 0 the
+ * driver's lock). Returns 0, USB_STALL, USB_TIMEOUT, or -1 (error, removal or sleep); after any but 0 the
  * endpoint needs usb_clear_halt; *moved is the bytes that did move, received ones in buf, when the
  * transfer's completion came, and 0 at USB_TIMEOUT and when the device or its controller went. */
 int usb_bulk(struct usb_device *d, uint8_t address, void *buf, unsigned len, unsigned timeout_ms, unsigned *moved);
@@ -213,4 +222,8 @@ void usbhub_work(struct usb_device *d);       /* port changes noticed by its int
 bool usbhub_pending(struct usb_device *d);    /* port changes not handled yet, or a port's next try */
 bool usbhub_trying(struct usb_device *d);     /* a device at a port is yet to get another try */
 void usbhub_reports_lost(struct usb_device *d, uint8_t address); /* endpoint `address` was given up */
+/* 電源の walk の thread で xhci.c が呼ぶ（Enhanced SuperSpeed の hub だけ）。suspend：下りの port の link を U3 に。
+   resume：U0 に戻す。戻らなければ false で、その port の装置は worker が外して数え直す。 */
+void usbhub_link_suspend(struct usb_device *hub, unsigned port);
+bool usbhub_link_resume(struct usb_device *hub, unsigned port);
 void usbhub_detach(struct usb_device *d); /* the device is going away: its devices go, its state is freed */
