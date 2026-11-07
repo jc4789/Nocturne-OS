@@ -31,9 +31,6 @@
 #define N_PCI_CALL_INFO 1             /* out: struct n_hal_pci_info。戻りはその大きさ */
 #define N_PCI_CALL_CONFIG_READ 2      /* in: struct n_hal_pci_config。戻りは読んだ値 */
 #define N_PCI_CALL_CONFIG_WRITE 3     /* in: struct n_hal_pci_config（value を書く） */
-#define N_PCI_CALL_HOLD_SCREEN 4      /* in: uint32_t（0：返す、1：保持する） */
-#define N_PCI_CALL_ACPI_EVAL 5        /* in: struct n_hal_pci_acpi と引数と data。out: struct n_acpi_value の並びと data。戻りは書いた数 */
-#define N_PCI_CALL_ACPI_NOTIFY_TAKE 6 /* in: uint64_t の deadline。戻りは次の Notify の値 */
 
 #define N_PCI_ISOLATED 1u       /* n_hal_pci_info.flags: DMA は claim の DMA の object にしか届かない */
 #define N_PCI_NEEDS_RECOVERY 2u /* 前のドライバーは動いたまま終わった。装置の回復がドライバーの仕事 */
@@ -72,15 +69,6 @@ struct n_hal_pci_info {
 struct n_hal_pci_config {
     uint64_t target; /* N_PCI_SELF か N_PCI_TARGET。書きは N_PCI_SELF だけ */
     uint32_t offset, width, value, reserved;
-};
-/* N_PCI_CALL_ACPI_EVAL の入力：この構造体、nargs 個の struct n_acpi_value、data_size バイトの data が続く。node は
-   N_ACPI_SELF（機能の node）、N_ACPI_UPSTREAM（上のブリッジの node。root bus ならホストブリッジの）、
-   N_ACPI_CHILD(i)（機能の node の i 番目の子）。name は名前の一区画（4 文字、"_DSM" など）。引数は整数、
-   文字列、バッファーで、中身は data の中にある。 */
-struct n_hal_pci_acpi {
-    uint32_t node, nargs;
-    char name[4];
-    uint32_t data_size;
 };
 
 /* USB の装置と、その interface。interface は装置の子である。 */

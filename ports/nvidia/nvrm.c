@@ -395,7 +395,6 @@ int main(int argc, char **argv) {
         return 1;
     }
     unsigned long device = strtoul(argv[1], NULL, 16);
-    nvrm_dev.claim = n_hal_claim(n_cap_find(N_CAP_HAL_CLAIM), (uint32_t)device);
     if (nvrm_dev.claim < 0) {
         nvrm_log("NVRM: cannot claim %s: %s", argv[1], n_result_text(nvrm_dev.claim));
         return 1;

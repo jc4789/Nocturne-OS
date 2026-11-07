@@ -25,9 +25,6 @@
 #include "sys/wait.h"
 
 #define CLAIM_GUARDS 32     /* registers with bits only the kernel changes (guards_init) */
-#define CLAIM_ACPI_NOTES 32 /* Notify values of the function's node not yet taken */
-#define ACPI_ARGS_MAX 7
-#define ACPI_DATA_MAX (64u * 1024)
 
 /* A config dword some of whose bits are the kernel's: a write that would change them is refused. */
 struct guard {
@@ -43,17 +40,6 @@ struct pci_claim {
     uint16_t pmcsr; /* the power management capability's control register, or 0 */
     struct iommu_domain *domain; /* where an IOMMU isolates the function (dev/iommu.h) */
     struct pci_device *reset_port; /* where this claim's attempt sent a Secondary Bus Reset (bus_reset) */
-    /* Its function's part of the ACPI namespace (N_PCI_CALL_ACPI_EVAL): the nodes, looked up at the
-       first evaluation under acpi_lock, and the function node's Notify values from the first
-       N_PCI_CALL_ACPI_NOTIFY_TAKE on, kept until taken (a ring; the oldest give way). */
-    struct mutex acpi_lock;
-    bool acpi_looked;
-    struct firmware_node *acpi_node, *acpi_upstream;
-    struct acpi_watch *acpi_watch;
-    uint32_t acpi_notes[CLAIM_ACPI_NOTES];
-    unsigned acpi_first, acpi_count; /* notes_lock */
-    struct spinlock notes_lock;      /* the ring above; before acpi_wq's lock */
-    struct wait_queue acpi_wq;
 };
 
 #define PCI_OF(hal_device) ((struct pci_device *)((char *)(hal_device) - offsetof(struct pci_device, hal)))
@@ -339,103 +325,6 @@ static int64_t info(struct pci_claim *c, struct n_hal_pci_info *out) {
     return 0;
 }
 
-/* ---- the function's part of the ACPI namespace (dev/acpi.c) ---- */
-
-/* The function's node and the one above it, once. acpi_lock held. */
-static void acpi_look(struct pci_claim *c) {
-    if (c->acpi_looked) return;
-    c->acpi_looked = true;
-    c->acpi_node = c->d->hal.firmware;
-    c->acpi_upstream = c->d->upstream ? c->d->upstream->hal.firmware : c->d->host;
-}
-
-/* The predefined methods through which the system itself runs devices and the platform, as the
-   kernel runs its config bits (guards_init): power and reset, removal and docking, resources, the
-   handshake that decides what the firmware or the system controls, wake, initialisation and
-   handlers (operation regions, GPIO events), system sleep. A driver's evaluation would change
-   behind the kernel what it keeps track of (dev/pm.c, dev/pci.c), and on the bridge above it
-   every function below that bridge. None is part of a driver's own protocol with its firmware
-   (RM's: _DSM, _ROM, _DOD, _DDC, _ADR, MXDS, MXDM). */
-static const char acpi_system_methods[][5] = {
-    "_PS0", "_PS1", "_PS2", "_PS3", "_ON_", "_OFF", "_RST", /* power, reset */
-    "_EJ0", "_EJ1", "_EJ2", "_EJ3", "_EJ4", "_LCK", "_DCK", /* removal, docking */
-    "_DIS", "_SRS",                                         /* resources */
-    "_OSC", "_OST",                                         /* the system and firmware's handshake */
-    "_PSW", "_DSW",                                         /* wake */
-    "_INI", "_REG", "_EVT",                                 /* initialisation, handlers */
-    "_PTS", "_WAK", "_TTS", "_GTS", "_BFS",                 /* system sleep */
-};
-
-/* Whether a driver may evaluate name (a name segment) on node which: none of the methods above,
-   and on the bridge above it predefined names only: the bridge's own methods (the firmware's
-   power and link control of its slot) belong to the platform and every function below it, as
-   its registers do (a bridge is never claimed). Decided before the node is looked up, so a
-   function with a node and one without get the same answer. */
-static bool acpi_name_allowed(uint32_t which, const char *name) {
-    if (which == N_ACPI_UPSTREAM && name[0] != '_') return false;
-    for (size_t i = 0; i < ARRAY_SIZE(acpi_system_methods); i++)
-        if (!memcmp(name, acpi_system_methods[i], 4)) return false;
-    return true;
-}
-
-static int64_t acpi_eval(struct pci_claim *c, uint32_t which, const char *name, const struct n_acpi_value *args,
-                         uint32_t nargs, const uint8_t *data, size_t data_size, uint8_t *out, size_t out_size) {
-    if (!acpi_name_segment(name)) return -N_ERR_INVALID;
-    if (!acpi_name_allowed(which, name)) return -N_ERR_DENIED;
-    if (!acpi_aml_ready()) return -N_ERR_UNSUPPORTED;
-    mutex_lock(&c->acpi_lock);
-    acpi_look(c);
-    struct firmware_node *node = which == N_ACPI_SELF ? c->acpi_node : which == N_ACPI_UPSTREAM ? c->acpi_upstream : NULL;
-    int64_t r = 0;
-    if (which != N_ACPI_SELF && which != N_ACPI_UPSTREAM) {
-        node = c->acpi_node ? acpi_node_child(c->acpi_node, which) : NULL;
-        if (!node) r = -N_ERR_INVALID; /* past the last child (a function without a node has none) */
-    }
-    mutex_unlock(&c->acpi_lock);
-    if (r) return r;
-    if (!node) return -N_ERR_NOT_FOUND;
-    return acpi_node_eval(node, name, args, nargs, data, data_size, out, out_size);
-}
-
-/* Notify(function node, value), on the acpi thread (any CPU). */
-static void acpi_noted(void *context, uint64_t value) {
-    struct pci_claim *c = context;
-    uint64_t irq = spin_lock(&c->notes_lock);
-    if (c->acpi_count == CLAIM_ACPI_NOTES) {
-        c->acpi_first = (c->acpi_first + 1) % CLAIM_ACPI_NOTES;
-        c->acpi_count--;
-    }
-    c->acpi_notes[(c->acpi_first + c->acpi_count++) % CLAIM_ACPI_NOTES] = (uint32_t)value;
-    wq_wake_all(&c->acpi_wq);
-    spin_unlock(&c->notes_lock, irq);
-}
-
-static int64_t acpi_notify_take(struct pci_claim *c, uint64_t deadline) {
-    if (!acpi_aml_ready()) return -N_ERR_UNSUPPORTED;
-    mutex_lock(&c->acpi_lock);
-    acpi_look(c);
-    if (c->acpi_node && !c->acpi_watch) c->acpi_watch = acpi_node_watch(c->acpi_node, acpi_noted, c);
-    bool watched = c->acpi_watch != NULL;
-    mutex_unlock(&c->acpi_lock);
-    if (!watched) return c->acpi_node ? -N_ERR_NO_MEMORY : -N_ERR_NOT_FOUND;
-    uint64_t irq = spin_lock(&c->notes_lock);
-    for (;;) {
-        if (c->acpi_count) {
-            uint32_t value = c->acpi_notes[c->acpi_first];
-            c->acpi_first = (c->acpi_first + 1) % CLAIM_ACPI_NOTES;
-            c->acpi_count--;
-            spin_unlock(&c->notes_lock, irq);
-            return value;
-        }
-        if (thread_current()->killed) { spin_unlock(&c->notes_lock, irq); return -N_ERR_STOPPED; }
-        if (hal_claim_revoked(c->claim)) { spin_unlock(&c->notes_lock, irq); return -N_ERR_CLOSED; }
-        if (clock_now_ns() >= deadline) { spin_unlock(&c->notes_lock, irq); return -N_ERR_TIMEOUT; }
-        /* acpi_noted takes notes_lock to add a value, then wakes acpi_wq */
-        wq_wait_locked_until(&c->acpi_wq, &c->notes_lock, deadline);
-        spin_take(&c->notes_lock); /* a value that came at the time limit is still taken */
-    }
-}
-
 
 static bool config_access_ok(uint32_t offset, uint32_t width) {
     return (width == 1 || width == 2 || width == 4) && offset < 4096 && !(offset & (width - 1));
@@ -579,9 +468,6 @@ static bool pci_end(struct hal_claim *hc) {
                 PCI_ADDRESS_ARGS(d->address));
     d->claimed = false;
     mutex_unlock(&claim_mutex);
-    acpi_node_unwatch(c->acpi_watch); /* no Notify reaches the claim any more */
-    c->acpi_watch = NULL;
-    wq_wake_all(&c->acpi_wq);
     return blocked;
 }
 
@@ -628,32 +514,6 @@ static int64_t pci_call(struct hal_claim *hc, uint32_t op, const void *in, size_
         if (in_size != sizeof *q) return -N_ERR_INVALID;
         return op == N_PCI_CALL_CONFIG_READ ? config_read(c, q->target, q->offset, q->width)
                                             : config_write(c, q->offset, q->width, q->value);
-    }
-    case N_PCI_CALL_HOLD_SCREEN: {
-        uint32_t hold;
-        if (in_size != sizeof hold) return -N_ERR_INVALID;
-        memcpy(&hold, in, sizeof hold);
-        return screen_driver_hold(hc, hold != 0);
-    }
-    case N_PCI_CALL_ACPI_EVAL: {
-        const struct n_hal_pci_acpi *q = in;
-        if (in_size < sizeof *q) return -N_ERR_INVALID;
-        if (q->nargs > ACPI_ARGS_MAX || q->data_size > ACPI_DATA_MAX) return -N_ERR_INVALID;
-        if (in_size != sizeof *q + q->nargs * sizeof(struct n_acpi_value) + q->data_size) return -N_ERR_INVALID;
-        const struct n_acpi_value *args = (const struct n_acpi_value *)(q + 1);
-        const uint8_t *data = (const uint8_t *)(args + q->nargs);
-        char name[5];
-        memcpy(name, q->name, 4);
-        name[4] = 0;
-        int64_t r = acpi_eval(c, q->node, name, args, q->nargs, data, q->data_size, out, out_size);
-        if (r > 0) *used = (size_t)r;
-        return r;
-    }
-    case N_PCI_CALL_ACPI_NOTIFY_TAKE: {
-        uint64_t deadline;
-        if (in_size != sizeof deadline) return -N_ERR_INVALID;
-        memcpy(&deadline, in, sizeof deadline);
-        return acpi_notify_take(c, deadline);
     }
     }
     return -N_ERR_UNSUPPORTED;

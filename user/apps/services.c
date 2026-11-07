@@ -253,13 +253,6 @@ static void instances_of(const struct declared_service *d, bool broken, const st
         instance_new(d, NULL, broken);
         return;
     }
-    const struct n_hal_device *f = ledger->first;
-    for (uint32_t i = 0; i < ledger->count; i++, f = n_hal_device_next(f)) {
-        if (!device_matches(d, f)) continue;
-        char argument[9];
-        snprintf(argument, sizeof argument, "%x", (unsigned)f->id);
-        instance_new(d, argument, broken);
-    }
 }
 
 static bool visit(const struct declared_service *d, unsigned char *marks, const struct n_hal_snapshot *ledger) {
@@ -287,10 +280,7 @@ static bool visit(const struct declared_service *d, unsigned char *marks, const 
 
 static void instances_from_table(void) {
     unsigned char marks[DECLARED] = {VISIT_NEW};
-    struct n_hal_snapshot ledger = {0};
-    if (n_hal_snapshot(&ledger) < 0) ledger = (struct n_hal_snapshot){0};
     for (size_t i = 0; i < DECLARED; i++) visit(&declared[i], marks, &ledger);
-    free((void *)ledger.first);
 }
 
 /* ---- 起こす ---- */

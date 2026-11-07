@@ -176,32 +176,6 @@ n_result n_hal_power_done(n_handle claim, bool ok);
 n_result n_hal_pci_info(n_handle claim, struct n_hal_pci_info *out);
 n_result n_hal_pci_config_read(n_handle claim, uint64_t target, uint32_t offset, uint32_t width);
 n_result n_hal_pci_config_write(n_handle claim, uint32_t offset, uint32_t width, uint32_t value);
-/* ドライバーが機能の BAR（n_hal_pci_info が framebuffer_bar で示す）の中のブート画面への CPU の届き方を変える
-   間、システムはそこへ書いてはならない。hold true は書込みが無くなってから返り、画面に触れずに保つ。保持は入れ子
-   になり、最後の false（か claim の終わり）が framebuffer の描画を再開する（GPU の走査ではない）。ドライバーの
-   落ちやリセットの後の回復は保証しない。時間で保持の上に描くことはしない：それが防ぐ競合そのものである。claim の
-   終わりは、CPU の描画が戻る前に機能を止める（BAR の写像、割り込み、バスマスター）。起動の引数 fbhold=<秒>
-   （既定は無し）の時間続いた保持は、ドライバーのアプリを止め、その claim の終わりが保持を返す。
-   n_screen_give で画面 0 が描かれているドライバーも、同じように保持する。N_ERR_NOT_FOUND：ブート画面はほかにあり、
-   画面 0 はこの claim の buffer に描かれていない。 */
-n_result n_hal_pci_hold_screen(n_handle claim, bool hold);
-/* 機能の ACPI の名前空間の分（firmware の記述のまま）：機能の device node（N_ACPI_SELF）、その device の子
-   （N_ACPI_CHILD(i)、名前空間の順）、下にいるブリッジの node（N_ACPI_UPSTREAM。root bus ならホストブリッジの）。
-   n_hal_pci_acpi_eval は、その node の直下の名前 `name`（1 区画：「_DSM」「_ADR」）を、nargs 個（7 まで）の整数、
-   文字列、バッファーの引数（中身は data、64 KiB まで）で評価し、結果を out へ書く：struct n_acpi_value の記録、
-   最初が結果、続いて文字列とバッファーのバイト。書いたバイト数を返す（1 MiB まで）。
-   N_ERR_DENIED（node があってもなくても）：システムが装置と機械を動かすのに使う method（電源とリセット _PS0 から
-   _PS3、_ON_、_OFF、_RST。取り外しとドッキング _EJ0 から _EJ4、_LCK、_DCK。資源 _DIS、_SRS。firmware が何を制御
-   するかの交渉 _OSC、_OST。wake _PSW、_DSW。初期化と handler _INI、_REG、_EVT。システムの眠り _PTS、_WAK、_TTS、
-   _GTS、_BFS）、そして N_ACPI_UPSTREAM では _ で始まらない全部の名前（ブリッジ自身の method は、その下の全機能と
-   プラットフォームのものである）。N_ERR_NOT_FOUND：その node か object が無い。N_ERR_INVALID：最後の子より先の
-   番号（node の無い機能に子は無い）、壊れた名前か引数。N_ERR_TOO_LARGE：out が小さい。N_ERR_IO：AML が失敗。
-   N_ERR_UNSUPPORTED：AML なしで動いている。
-   n_hal_pci_acpi_notify_take は、機能の node の次の Notify の値を、最初の呼出し以後から返す（n_hal_interrupt_take
-   と同じに待つ。取られない 32 件を持ち、古いものが譲る。N_ERR_NOT_FOUND：機能に node が無い）。 */
-n_result n_hal_pci_acpi_eval(n_handle claim, uint32_t node, const char *name, const struct n_acpi_value *args,
-                             uint32_t nargs, const void *data, size_t data_size, void *out, size_t out_size);
-n_result n_hal_pci_acpi_notify_take(n_handle claim, uint64_t deadline);
 /* 画面のドライバー（どのバスの claim でもよい）：出力（モニター）の buffer を画面へ渡す。output はドライバーの
    コネクター、head、表示 engine の pipe の番号である。ファームウェアの画面の画素がある装置の出力 0 が画面 0
    （タスクバーのある画面）で、ほかの出力は画面を一つずつ持ち、その装置のドライバーが替わっても同じ画面である。

@@ -517,32 +517,6 @@ n_result n_hal_pci_config_write(n_handle claim, uint32_t offset, uint32_t width,
     struct n_hal_pci_config q = {.target = N_PCI_SELF, .offset = offset, .width = width, .value = value};
     return n_hal_bus_call(claim, N_PCI_CALL_CONFIG_WRITE, &q, sizeof q, NULL, 0);
 }
-n_result n_hal_pci_hold_screen(n_handle claim, bool hold) {
-    uint32_t q = hold ? 1 : 0;
-    return n_hal_bus_call(claim, N_PCI_CALL_HOLD_SCREEN, &q, sizeof q, NULL, 0);
-}
-n_result n_hal_pci_acpi_eval(n_handle claim, uint32_t node, const char *name, const struct n_acpi_value *args,
-                             uint32_t nargs, const void *data, size_t data_size, void *out, size_t out_size) {
-    /* 入力は一つの塊：n_hal_pci_acpi、引数の並び、data（hal_buses.h） */
-    size_t name_size = strlen(name);
-    if (name_size != 4) return -N_ERR_INVALID;
-    size_t args_bytes = (size_t)nargs * sizeof *args;
-    size_t total = sizeof(struct n_hal_pci_acpi) + args_bytes + data_size;
-    struct n_hal_pci_acpi *q = malloc(total);
-    if (!q) return -N_ERR_NO_MEMORY;
-    q->node = node;
-    q->nargs = nargs;
-    memcpy(q->name, name, 4);
-    q->data_size = (uint32_t)data_size;
-    memcpy(q + 1, args, args_bytes);
-    memcpy((char *)(q + 1) + args_bytes, data, data_size);
-    n_result r = n_hal_bus_call(claim, N_PCI_CALL_ACPI_EVAL, q, total, out, out_size);
-    free(q);
-    return r;
-}
-n_result n_hal_pci_acpi_notify_take(n_handle claim, uint64_t deadline) {
-    return n_hal_bus_call(claim, N_PCI_CALL_ACPI_NOTIFY_TAKE, &deadline, sizeof deadline, NULL, 0);
-}
 n_result n_screen_give(n_handle claim, uint32_t output, const struct n_screen_buffers *buffers) {
     return NC5(SYS_SCREEN_GIVE, claim, output, buffers, 0, 0);
 }
