@@ -12,10 +12,7 @@
 - 網：TCP/IP を権限の無いサービスへ移す。NIC の実装はカーネルに残し、輪でつなぐ。ソケットは object にする。網の権限は能力の handle で渡す。
 - GPU：virgl と `nvrm` は同じ継ぎ目の後ろの実装にする。試験の門を外す。契約は次の設計 `docs/gpu.md` で決める。
 - UVM：ソースを残し、組みと毎回の起動から外す。選んで入れる形にする。
-- プログラムの形式：我々の形式を作る。ELF は組みの中間物と、Limine が読むカーネルの像にだけ残す。
-- 導入の形式：宣言と中身だけを持つ我々の形式を作る。任意の機能とドライバーも同じ形式で入れる。
 - CPU の機能：有れば使い切り、無くても動く。製造者ごとの実装に分ける。
-- 媒体：同じ一つの像が NVMe、SATA、USB のどれからでも起動する。
 - 試験：試験の媒体を組む目標を一つ作る。製品の宣言の表から `tests` を出す。製品のカーネルに試験の門を残さない。
 
 ## 未決
@@ -38,11 +35,8 @@
 - K1、S11：窓の管理、合成、入力の割り振りがカーネルにある（`kernel/src/gui/`）。
 - K2：ソケットが object でない（`kernel/src/net/net.c`）。
 - K3：`kernel/src/sys/syscall.c` の受け口に四つの形がある。
-- K4：`kernel/src/dev/pciuser.c` に表示と ACPI の役がある。
-- K5：USB の実装の状態が `void *` である（`kernel/src/dev/usb.h` の `hub`、`state[]`）。
 - K6：RDP がカーネルにある（`kernel/src/vm/rdp.c`）。
 - K8：設定の門が持ち主を名指しする（`kernel/src/sys/settings.c`）。
-- K9：電源でカーネルが郵便箱になる（`SYS_POWER_SAY`）。
 - K10：試験と計測が製品に残る（`SYS_NET_TEST`、`kernel/src/sys/prof.c`）。
 - K11：端末と byte stream の形が残る（`kernel/src/sys/syscall.c` の 0・1・2）。
 - S2：設定の宣言の表が 6 か所ある（`user/apps/settings_table.h`、`kernel/src/sys/settings.c`、`user/apps/machine.c`、`user/apps/display.c`、`user/apps/audio.c`、`user/libc/webprefs.c`、`user/apps/agent.c`）。`user/apps/settingsd.c:1256` が適用を推測する。
@@ -67,30 +61,9 @@
 
 ## 既知の欠陥
 
-- `tests/pcitest.c`：`vbe` を外したカーネルで、画面の手渡しの試験のうち 5 件（二つ目の緩衝へ描く、DMA の緩衝へ描く、起動の画面へ戻す、ポインター、手放しを設定が聞く）が通らない。`vbe` が VGA を持つ製品のカーネルでは走らない経路で、前の版との比べは無い。
-- `kernel/src/dev/xhci.c`：detach の後に割り込みが止まるので、controller の記録を返さない。
-- MCE：UC と PCC の bank を飛ばす（`kernel/src/arch/cpu.c:338`）。
-- TSC：AMD の判定が family だけ（`kernel/src/arch/tsc_rate.h:43`）。
-- TSC：`LockTscToCurrentP0` を見ない（`kernel/src/arch/tsc_rate.h:28`）。
-- HD Audio：`link_down` の戻りを捨てて DMA の頁を返す（`kernel/src/dev/hda.c:906`）。
-- 共通コードに hypervisor の判定がある（`kernel/src/arch/cpu.c:143`）。
-- IBPB：`cpu_ibpb` に呼ぶ者が無いのに、起動のログは "IBPB between apps" と書く（`kernel/src/arch/cpu.c:514`）。
-- `nvrm` の帰線とフリップの糸が fair 級である（`ports/nvidia` に `n_thread_schedule` が無い）。
-- カーネルの機能は IOMMU を素通りする（`kernel/src/dev/iommu.h:9-10`）。絞る口が無い（`kernel/src/dev/iommu.c:647`）。
-- PCI に抜き差しと AER が無い。
-- ノート PC の内蔵キーボード（i8042、I2C の HID）の実装が無い。HAL は ACPI の接続の資源（`GpioInt`、`GpioIo`、`I2cSerialBus`、`SpiSerialBus`、`UartSerialBus`）を表さず、GPIO の割り込みの提供者の口も無い（`kernel/src/dev/acpi_devices.c:125`）。
-- 眠り：`nvrm` は `n_hal_power_wait` を呼ばないので、NVIDIA の GPU を持つ機械は眠らず、休止もしない（`ports/nvidia/nvrm.c`）。
-- 眠り：USB のディスク（`usbmsc`、`HAL_AFTER_SLEEP_LOST`）を挿している間、機械は眠らず、休止もしない。USB から起動した機械も同じ。戻った制御器が装置を数え直すと、ディスクは新しい装置になり、その上のボリュームを失うため。同じ装置と分かれば続けて使う道が要る（`kernel/src/dev/usbmsc.c`）。
-- 眠り：起動の画面（`firmware-screen`、`HAL_AFTER_SLEEP_BOOT`）は、claim の GPU ドライバーが画面 0 を持っても結ばれたままで、S3 を拒む。手放すのはカーネルの `vbe` だけ（`kernel/src/dev/fb.c:642`、`kernel/src/vm/vbe.c:182`）。
-- 眠り：起こしの元（`_PRW`、`_DSW`、GPE、PCI の PME）を扱わない。起こせるのは電源のボタンだけ。設定の窓の項目と組で作る。
-- 電源：動作中の装置の電源の管理（使わない装置を D3 へ）が無い。
-- PCI の列挙は、firmware が D3cold で渡した機能（`_PR0` の資源が切れている）を、数える前に D0 にしない（`kernel/src/dev/pci.c`）。
-- HAL：固まった装置をバスでリセットして実装を結び直す口が無い。PCI の FLR と SBR は claim の道（`kernel/src/dev/pciuser.c`）だけが使う。
-- HAL：detach の後に記録と thread を返さない実装がある（`nvme`、`ahci`、`storvsc`）。
-- レジスターを期限つきで待つ関数を実装ごとに写している（9 か所、`docs/records/hal-review-20261107/LEDGER.md` の H21）。
+HAL、装置、機械の所見は `docs/records/hal-review-20261107/LEDGER.md` が持つ。
+
 - AVX-512：カーネルは CPU が持てば有効にするが、FFmpeg は切ってある（`ports/ffmpeg/prepare.py`、`Makefile:190`）。我々のコードは実行時に選ばない。
-- GPU：ドライバーが動作中に落ちると既定の道へ戻らない（`docs/records/audit-gpu-generic-20261102.md` の F1）。
-- virgl：製品のカーネルで起きない（`kernel/src/vm/virtio_gpu.c:579`）。
 - `build/programs/init` がソースの無い古い出力のまま媒体に載る。
 - ブラウザーの音：広告の音が残り本編の音が出ない（ブラウザーの作り直しの中で扱う）。
 

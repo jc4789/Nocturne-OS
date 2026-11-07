@@ -1,6 +1,6 @@
 # HAL の見直しの台帳
 
-目的：HAL を、汎用の OS にふさわしい形にする。新しい装置と新しい種類の装置を、実装（ドライバー）さえあれば HAL を変えずに扱えること。ドライバーを書くか移すとき、HAL を変えないこと。
+目的：汎用の OS の HAL と装置の作りを、混成（hybrid）の形で建てる。全部が ring 0 で動き、層の境は厳しく、実装（ドライバー）は版の付いた ABI で組む別の像。どんな装置もどんなバスも、実装さえあれば HAL と核を変えずに扱えること。ドライバーを書くか移すとき、HAL と核を変えないこと。範囲は OS の全部で、今のコードは正しいと示されるまで残す理由にならない。
 この台帳は作業の正本。区切りごとに読み、所見・決定・状態を更新する。
 
 ## 0. 前提
@@ -11,7 +11,7 @@
 
 ## 1. 所見
 
-番号は H。状態：未・直・外（範囲の外、`docs/open.md` へ）。
+番号は H。状態：未・直。範囲の外は無い：見つけたものは全部この仕事で直す。
 
 | # | 所見 | 場所 | 状態 |
 |---|---|---|---|
@@ -34,12 +34,38 @@
 | H17 | `hda` が自分の DMA の頁を IOMMU の domain へ `iommu_map` で直に写す（guest の道）。装置が domain に入る・出ることを HAL が知らないので、実装が IOMMU を知っている | `kernel/src/dev/hda.c:566`、`:601`、`:828` | 未 |
 | H18 | `xhci` は AC64 の無い制御器を断る（32 bit の DMA の装置を HAL が扱えないので、実装が諦める） | `kernel/src/dev/xhci.c:2193-2196` | 未 |
 | H19 | `virtio_gpu` が `vmm_map_mmio` と `pci_read32` を直に使う。`ata` は `hal_port` を使わず決まったポートを調べる（どちらも VM の実装） | `kernel/src/vm/virtio_gpu.c:128-142`、`kernel/src/vm/ata.c:132-135` | 未 |
-| H20 | detach の後に記録と thread を返さない実装（`nvme`、`ahci`、`storvsc`）。抜き差しの無いバスなので今は害が無い | §2 | 外 |
-| H21 | レジスターを期限つきで待つ関数を実装ごとに写している（9 か所） | §2 | 外 |
-| H22 | ACPI の接続の資源（`GpioInt`、`GpioIo`、`I2cSerialBus`、`SpiSerialBus`、`UartSerialBus`）を HAL が表さない。GPIO の割り込みを出す実装（割り込みの提供者）の口も無い。I2C の HID（ノートの内蔵のキーボードとタッチパッド）を作るときに、HAL へ資源の種類と提供者の口を足す要がある | `kernel/src/dev/acpi_devices.c:125` | 外 |
-| H23 | 起こしの元（`_PRW`、`_DSW`、GPE、PCI の PME）を扱わない。起こせるのは電源のボタンだけ。設定の窓の項目と組で作るもの | — | 外 |
-| H24 | 動作中の装置の電源の管理（使わない装置を D3 へ）が無い | — | 外 |
-| H25 | 固まった装置をバスでリセットして実装を結び直す口（カーネルの実装の立て直し）が HAL に無い。PCI の FLR と SBR は claim の道（`pciuser.c`）だけが使う | `kernel/src/dev/pci.h:229`、`:264` | 外 |
+| H20 | detach の後に記録と thread を返さない実装（`nvme`、`ahci`、`storvsc`）。抜き差しの無いバスなので今は害が無い | §2 | 未 |
+| H21 | レジスターを期限つきで待つ関数を実装ごとに写している（9 か所） | §2 | 未 |
+| H22 | ACPI の接続の資源（`GpioInt`、`GpioIo`、`I2cSerialBus`、`SpiSerialBus`、`UartSerialBus`）を HAL が表さない。GPIO の割り込みを出す実装（割り込みの提供者）の口も無い。I2C の HID（ノートの内蔵のキーボードとタッチパッド）を作るときに、HAL へ資源の種類と提供者の口を足す要がある | `kernel/src/dev/acpi_devices.c:125` | 未 |
+| H23 | 起こしの元（`_PRW`、`_DSW`、GPE、PCI の PME）を扱わない。起こせるのは電源のボタンだけ。設定の窓の項目と組で作るもの | — | 未 |
+| H24 | 動作中の装置の電源の管理（使わない装置を D3 へ）が無い | — | 未 |
+| H25 | 固まった装置をバスでリセットして実装を結び直す口（カーネルの実装の立て直し）が HAL に無い。PCI の FLR と SBR は claim の道（`pciuser.c`）だけが使う | `kernel/src/dev/pci.h:229`、`:264` | 未 |
+| H26 | 実装に ABI が無い。実装 21 個とバス 4 個は、カーネルの約 50 の部品から 300 を超える記号を直に取る：スケジューラーと CPU ごとの中身（`preempt_count`、`spin_nodes`、`percpu_offsets`、`sched_*`）、`pmm_*`、`vmalloc_*`、`hhdm_offset`、割り込みの vector と MSI（`irq_msi_rewrite`、`irq_request_msi_block`）、`iommu_*`、`uacpi_*`、`topology`、PCI の内部（`pci_device_of` と 25 の関数）。中身の構造体（`struct hal_device` の欄、`struct pci_device`）も読む。核の中を変えると実装が壊れ、実装はカーネルのソースなしに組めない | `build/k` の object の `llvm-nm -u`（作業場の `imports.py`） | 未 |
+| H27 | 実装はリンカーの節 `.hal_drivers` でカーネルの像に焼き込まれる。読み込める実装の像が無く、実装を足すにはカーネルを組み直す | `kernel/linker.ld:34`、`hal.h` の `HAL_DRIVER` | 未 |
+| H28 | 機械の部品（ローカル APIC、IOAPIC、vector と MSI、LAPIC の timer、TSC の測り、HPET・PM timer・RTC、SMP と IPI、起こしの入口、idle、IOMMU、ACPI の表、PCI の ECAM、電源断とリセット、console のシリアル）が `arch/` と `dev/` に散らばり、一つの口が無い。核も実装も直に呼ぶ。`hal/` と呼ぶものは装置の木と結びつけ（NT の PnP と電源の管理者）で、機械の HAL ではない | `kernel/src/arch/*`、`kernel/src/dev/{acpi,refclock,serial,iommu*,pci,power,pm}.c` | 未 |
+| H29 | USB と VMBus の装置は `ops` が NULL で出る。HAL を通る割り込み・DMA・電源・リセット・claim が無い。USB の class の実装は xHCI の実装の口（`dev/usb.h` の `usb_*`、xhci.c が定義）を直に呼ぶ：制御器の実装がバスの口を兼ねる | `kernel/src/dev/xhci.c:1714`、`:1743`、`kernel/src/hal/claim.c:589` | 未 |
+| H30 | `dev/power.c` の電源断とリセットに「emulator の代わりの道」と、AML が読めないときに DSDT から `_S5_` のバイトを探す代わりの道がある | `kernel/src/dev/power.c:1-3` | 未 |
+| H31 | DMA の番地が物理番地に決め打ち（`hal_dma_reach` の `*bus = phys`、`hal/dma.c`）。IOMMU の領域は同じ番地の写しだけで、カーネルの実装の装置は外向きの port（Thunderbolt など）でも隔離されない。幅の外の緩衝は block だけにあり、網・音・USB は持てない | `kernel/src/hal/hal.h`、`kernel/src/hal/dma.c` | 未 |
+| H32 | 眠りの穴：USB のディスク（`usbmsc`）を挿している間は眠りも休止もしない（戻った制御器が数え直すとディスクが新しい装置になる）。`nvrm` が `n_hal_power_wait` を呼ばず、NVIDIA の GPU の機械は眠らない。`firmware-screen` は claim の GPU ドライバーが画面 0 を持っても結ばれたままで S3 を拒む。PCI の列挙は firmware が D3cold で渡した機能を D0 にしない | `kernel/src/dev/usbmsc.c`、`ports/nvidia/nvrm.c`、`kernel/src/dev/fb.c:642`、`kernel/src/dev/pci.c` | 未 |
+| H33 | 起動のたびに QEMU が「Ignoring request for interrupt vector 0」と言う（vector 0 の MSI が送られた）。出所が分からない | 作業場の `serial-c1-qemu-err.txt`、`qemu-err.txt` | 未 |
+| H34 | 利用者の ABI と文書が装置の管理者を「HAL」と呼ぶ（`n_hal_*`、`SYS_HAL_*`、`common/hal_abi.h`）。機械の HAL を分けると、名前が持ち主に着かない | `common/hal_abi.h`、`common/abi.h` | 未 |
+| H35 | `pcitest` の画面の印の数の確かめが 5 件落ちる（refresh の分からない画面での合成の振る舞い）。段 B で範囲の外とした | §5 の段 B | 未 |
+| H36 | 機械の検査：訂正の誤りを拾う道は UC と PCC の bank を飛ばす。#MC の道と分けた理由が SDM と照らしてない | `kernel/src/arch/mca.c:43`、`:85` | 未 |
+| H37 | TSC：AMD は family（19h、1Ah）だけで P-state の欄を読む。`HWCR[LockTscToCurrentP0]` を読まずに 0 と仮定する | `kernel/src/arch/tsc_rate.h:24-45` | 未 |
+| H38 | HD Audio：link を落とす手順の結果を捨てて DMA の頁を返す（`docs/open.md` にあった行。今の名で確かめる） | `kernel/src/dev/hda.c` | 未 |
+| H39 | 共通の CPU のコードに hypervisor の判定がある（`vm_cpu_guest`）。VM の処理は `vm/` の後ろに置く約束 | `kernel/src/arch/cpu.c:137`、`:163` | 未 |
+| H40 | IBPB：`cpu_ibpb` に呼ぶ者が無いのに、起動の行が「IBPB between apps」と書く | `kernel/src/arch/cpu.h:164`、`kernel/src/arch/cpu.c:261` | 未 |
+| H41 | PCI に抜き差し（PCIe の Hot-Plug、ACPI の Notify）と AER が無い | `kernel/src/dev/pci.c` | 未 |
+| H42 | 製品のカーネルで virgl が結ばれない：`virtio_gpu` の attach と要求が試験の旗（`gpu-enable`、`nogpu`、`gpu-slow-test`、`gpu-timing`）で製品の分岐を変える。製品の `test_flag` は常に false | `kernel/src/vm/virtio_gpu.c:296`、`:324`、`:707`、`:813`、`kernel/src/kernel.h:76` | 未 |
+| H43 | GPU のドライバー（claim）が動作中に落ちると、画面が既定の道（起動の画面）へ戻らない。装置の管理者が claim の死で結び直さない | `docs/records/audit-gpu-generic-20261102.md` の F1 | 未 |
+| H44 | `nvrm` の帰線とフリップの thread が fair 級。プロセスの実装が期限の級を使う口が無い（`n_thread_schedule` が `ports/nvidia` に無い） | `ports/nvidia` | 未 |
+| H45 | USB の実装の状態が `void *`（`dev/usb.h` の `hub`、`state[]`）。監査の K5 | `kernel/src/dev/usb.h` | 未 |
+| H46 | 電源でカーネルが郵便箱になる（`SYS_POWER_SAY`）。監査の K9 | `kernel/src/sys/syscall.c` | 未 |
+| H47 | DMA の確保に中断点が無い：`hal_dma_alloc` は 0 埋めを一度の `memset` で行う。`virtio_gpu` の絵の backing（1 GiB まで）で、前の頁ごとの中断点（`gpu_checkpoint`）が消えた | `kernel/src/hal/dma.c`、`kernel/src/vm/virtio_gpu.c` | 未 |
+| H48 | 写しの口：`hal_map` は BAR を丸ごと写し、外す口が無い（virtio 1.2 の 4.1.4 は要る部分だけを写すのを勧める）。割り込みの形（メッセージか線か）を言わず、`virtio_gpu` は `pci_device_of(d)->intx` を読む。物理番地を要る装置（ACCESS_PLATFORM の無い virtio）を DMA の口で言えない | `kernel/src/hal/resource.c`、`kernel/src/vm/virtio_gpu.c` | 未 |
+| H49 | `pci_find_cap` は同じ ID の最初の capability だけを返す。virtio は ID 9 の全部を手の walk で辿る。PCI のバスの口に capability の列挙が要る | `kernel/src/dev/pci.c`、`kernel/src/vm/virtio_gpu.c` | 未 |
+| H50 | 一つの装置の状態が file の static にある（`virtio_gpu`、`ata` の `disks[]`・`channels[]`、二度目の attach を断る門）。二つ目の装置を持てない | `kernel/src/vm/virtio_gpu.c`、`kernel/src/vm/ata.c` | 未 |
+| H51 | 固定の節 "ide-ports" の slot の並び（channel c の命令の block が 2c、制御が 2c+1）を書くのは `ata.c` だけで、出す側（`vm/vm.c` の `publish_ide_ports`）に無い | `kernel/src/vm/vm.c` | 未 |
 
 ## 2. 実装ごとの事実
 
@@ -64,7 +90,17 @@
 | D6 | サービスの管理者は台帳を見張り、装置が来たら実例を作り、去ったら止めて消す | H7 |
 | D7 | DMA の契約：装置の番地の幅を実装が申告し（`hal_dma_bits`）、長く使うメモリーは `hal_dma_alloc`、既にあるメモリーは `hal_dma_map`・`hal_dma_unmap`。幅を超えれば HAL が予約した緩衝を通す。装置が domain に入っていれば、バスがその domain に写す。`dma_offset` と `hal_dma_address` を消す | H8、H9、H16、H17、H18 |
 | D8 | PCI の根の機能は ACPI のホストブリッジの下に出す。AML が無ければ根の下 | H6 |
-| D9 | H20〜H25 はこの仕事の範囲の外。`docs/open.md` へ | 範囲。H22〜H24 は端から端まで（制御器の実装、設定の窓）通さないと、口だけで呼ぶ側が無い |
+| D9 | 範囲の外を作らない。H20〜H25 と H26 以降は全部この仕事で直す。`docs/open.md` へ回さない | 目的は「どんな装置も、実装さえあれば HAL を変えずに」。H22〜H25 はそれに直に当たる |
+| D10 | 混成の層：核の CPU（`arch/`）、機械の HAL（`hal/`）、核、装置の管理者（`io/`）、実装の ABI（`ddk/`）、実装の像（`drivers/`）、プロセスの実装（claim）。全部 ring 0（プロセスの実装を除く）、境は組みが強いる | H26〜H28。Gemini の資料の hybrid の形（NT、XNU）：性能のため ring 0、層の境は厳しく、実装の口は版の付いた二進の口 |
+| D11 | 機械の HAL はカーネルの像の中の別の部品（NT の Windows 10 2004 以降の形）。口は `hal/hal.h` 一つ。核と装置の管理者は機械にこれだけで触る。`hal/` の外は機械の部品の見出しを include できない（`tests/check_boundaries.py`） | 機械は x86-64 の UEFI と ACPI の一種で、起動のごく初めから要る部品を別の像にする益が小さい。実装は別の像なので、移す益はそちらで得る |
+| D12 | 実装は Nocturne の像の形式（`docs/open.md` にあった決めたこと：我々の形式を作り、ELF は組みの中間物と Limine が読むカーネルの像にだけ残す。導入の形式もドライバーを同じ形で入れる）。組みが ELF の ET_DYN から変える。プログラムと利用者の空間の像（`C:\Nocturne\Drivers` の GPU の像）も同じ形式を読む。カーネルは輸出の表（名と番地と版）を持ち、読み込みが再配置と輸入を解く。組みは輸出の一覧から作る名ばかりの共有 object に `-z defs` で結ぶ：ABI の外の記号を使う実装は組めない。規則は像の注記の節にあり、像を走らせずに読む。起動に要る像（PCI、ACPI、NVMe、AHCI、xHCI と USB とディスク、VMBus と storvsc、画面）は起動の区画から Limine の module で、ほかは `C:\Nocturne\Drivers` から、合う装置が出たときに読む | H27。実装を足し・移すのにカーネルを組み直さない |
+| D13 | 実装の ABI（DDK）は中身を見せない handle と、大きさの欄を持つ構造体だけ。核のサービス（メモリー、錠、待ち、thread、仕事の列、時計と期限、ログ、乱数、CPU と node の数）、装置の口（性質、資源、写し、ポート、割り込み、DMA、電源、子を出す、口の提供と引き）、種類の口（block、網、音、入力、画面）、バスの口（PCI の構成、USB の転送、I2C・SPI・UART の転送、GPIO の線と割り込み）。版は major と minor：同じ major の大きい minor のカーネルが読む | H26。核の中が変わっても実装が壊れない |
+| D14 | バスも実装の像：PCI（ECAM は機械の HAL から）、ACPI（uACPI、名前空間の列挙、firmware の電源、評価と Notify、`_PRT` の割り込みの道、電源のボタンと蓋と GPE、眠りの値を電源の管理者へ）、USB（xHCI の host の実装と、USB の核と hub の実装）、VMBus、I2C・SPI・GPIO・UART の制御器。バスの装置はどれも本物のバスの操作（割り込み、DMA、電源、リセット、claim）を持つ | H29。ACPI は NT の acpi.sys と同じく firmware のバス |
+| D15 | 装置の間の口：提供者が自分の装置に型つきの口を置き、使う側が引く（GPIO、I2C、SPI、UART、USB の host、HDA の codec のバス、firmware の割り込みの道）。資源に接続の種類（提供者の装置と記述）を足す：ACPI の `GpioInt`・`GpioIo`・`I2cSerialBus`・`SpiSerialBus`・`UartSerialBus`・`CSI2Bus`。GPIO の割り込みは提供者を通して普通の割り込みと同じ口で渡る | H22。NT の resource hub と SPB に当たる |
+| D16 | DMA の層（`io/dma.c`）：装置へ渡す番地はバスが決めて返す。長く使うメモリー（取る・返す）と、要求ごとの流れの写し（区切りの並びと向きを写し、終わりに外す）。幅の外は DMA の層の緩衝（全部の種類が使える）。訳の領域（IOMMU）は IOVA を割り当てて写す。外向きの port の装置（ACPI の外向きの印、DMAR の SATC・`external`、IVRS の印）は既定で隔離し、内向きは素通り（方針は設定で選べる）。キャッシュを覗かない写しは DMA の層が書き出す。`hal_dma_reach` と block の緩衝を消す | H31。NT の DMA adapter（GetScatterGatherList）と Kernel DMA Protection の形 |
+| D17 | 電源と寿命：系の walk（段 C）に加え、動作中の電源の管理（使わない装置を D3、起こしの道つき）、起こしの元（`_PRW`、`_DSW`、GPE、PCI の PME、USB の remote wake）と設定の窓の項目、固まった装置のリセットと結び直し（バスのリセットの段：FLR、SBR、port のリセット）、取り外しで記録と thread を全部返す、レジスターを期限つきで待つ口を DDK に一つ。USB のディスクは同じ装置と分かれば続けて使う。`nvrm` と `firmware-screen` も walk に加わる | H20、H21、H23〜H25、H32 |
+| D18 | 利用者の ABI の名を持ち主に合わせる：`n_hal_*` → `n_device_*`、`SYS_HAL_*` → `SYS_DEVICE_*`、`common/hal_abi.h` → `common/device_abi.h`。プロセスの実装の口を USB・I2C・SPI・UART・GPIO へ広げる（ABI §9） | H34、H29 |
+| D19 | 確かめ：段ごとに `nocturne-project` で、ログインの先のデスクトップで装置を使い、serial.log を全部読む。ゲストの試験（`tests/` と、Nocturne の中で clang で組む試験）と、試験用の実装の像（ソフトの GPIO・I2C の提供者と、`-acpitable` の SSDT）で接続の資源の道を確かめる。QEMU に無い制御器（AMD・Intel の GPIO、DesignWare の I2C、I2C の HID）は、ソフトの提供者の試験と実機の記録に分けて書く | AGENTS.md の「確かめ方」。ログイン画面は何の証拠にもならない |
 
 ## 3.1 段 C の設計
 
@@ -171,6 +207,43 @@
 - `virtio_gpu`：`pmm_*` を `hal_dma_alloc` に、`vmm_map_mmio` を `hal_map` に、`pci_read32` を PCI の口に（H19）。`ata`：`hal_port` で（H19）。
 - VMBus の実装（`netvsc`、`storvsc`）の GPADL の頁：VMBus は訳の無いバス。`hal_dma_alloc` に揃えるかは読んで決める。
 
+## 3.4 混成の設計
+
+**層と持ち主**
+
+| 層 | 場所 | 持つもの | 使ってよい口 |
+|---|---|---|---|
+| 核の CPU | `kernel/src/arch/` | GDT・IDT・TSS、入口、文脈の切り替え、FPU、頁表、CPUID の機能、CPU ごとの区画、錠の命令 | — |
+| 機械の HAL | `kernel/src/hal/` | 割り込みの制御器（ローカル APIC と x2APIC、IOAPIC、MSI の文の組み立て、vector の割り当て、再割り当て）、割り込みの物、時計と timer（TSC、LAPIC の timer、HPET、PM timer、RTC）、SMP と IPI と NMI、IOMMU（訳の領域と IOVA）、firmware の静的な表（MADT、SRAT・SLIT・HMAT・CEDT、DMAR・IVRS、MCFG、FADT、HPET）と topology、PCI の構成の空間の読み書き（ECAM）、眠りの入口（CPU の保存と起こしの頁、PM1 の書き込み）、リセットと電源断の register、キャッシュの書き出し、idle と性能の要求、MCA、console のシリアル、機械の装置の宣言 | `arch/`、核のメモリー |
+| 核 | `kernel/src/{sys,mm,fs,net,gui}/` | スケジューラー、メモリー、object と IPC、syscall、C: の store、網の stack、窓の管理、電源の管理者（機械の眠りの順、休止） | `hal/hal.h`、`io/io.h`、種類の口 |
+| 種類の層 | `kernel/src/class/` | block、網の adapter、音の出口、入力、画面と面。実装の側の口は DDK、使う側の口は核の中 | `hal/hal.h`、`io/io.h` |
+| 装置の管理者 | `kernel/src/io/` | 装置の木、性質と規則、実装の一覧と読み込み、輸出の表、結びつけ、資源、割り込みと DMA の層、装置の間の口、電源（系の walk、動作中の管理、起こし）、リセットと結び直し、取り外し、claim、台帳 | `hal/hal.h` |
+| 実装の ABI | `ddk/` | 版の付いた見出しと輸出の一覧。SDK に入る | — |
+| 実装の像 | `drivers/<名>/` | バスと装置の実装。`ddk/` だけを include し、輸出だけを呼ぶ | DDK |
+| プロセスの実装 | `user/`、`ports/` | claim で持つ装置の実装（GPU の `nvrm` など） | 利用者の ABI |
+
+**実装の像**
+- 形：Nocturne の像の形式（頭、区画と権限、再配置、輸入と輸出の表、注記、署名の場所）。組みは位置に依らない ELF64 の ET_DYN（`-fPIC`、見せる記号は入口だけ）を作り、ホストの道具が形式へ変える。カーネルの実装、プログラム、利用者の空間の像を、頭の種類で分ける。読む口は `common/` の一つで、カーネルの読み込みとプロセスの起動が使う。節の権限は text が RX、rodata が R、data が RW（NX）。
+- 輸入：`GLOB_DAT`・`JUMP_SLOT` を輸出の表の名で解く。`RELATIVE` と `64` を当てる。解けない名があれば読まず、台帳に理由を出す。
+- 注記：`.note.nocturne`（実装の名、DDK の版、規則の表、起動に要るか）。装置の管理者は像を写さずに注記だけを読み、規則の一覧を作る。合う装置が出たときに像を写して入口を呼ぶ。
+- 入口：`n_driver_entry(module)` が一つ以上の実装を登録する。像を外すのは、結んだ装置が無く参照が 0 のとき。
+- 組み：`ddk/exports.list` から、名だけを輸出する共有 object（`build/ddk/libnocturne_kernel.so`）と、カーネルの中の輸出の表（生成した C）を作る。実装はこれに `-z defs` で結ぶ。
+- 起動：`scripts/layout.py` が起動に要る像を起動の区画の `boot/drivers/` へ置き、`limine.conf` に module として書く。C: の `C:\Nocturne\Drivers` に全部を置く。C: が開いた後、残りの規則を読む。
+
+**DDK の口（形）**
+- 装置：`n_device`（handle）。性質を読む、資源（メモリー、ポート、割り込み、接続）を引く、写す、ポートを読み書きする、割り込みを立てる（処理と、CPU の近さの望み）、DMA（幅、取る・返す、流れの写し）、電源の段、子を出す（バスの操作の表と一緒）、口を置く・引く、失敗と回復を言う、レジスターを期限つきで待つ。
+- 実装の表：`struct n_driver`（大きさの欄、名、`attach`・`detach`・`suspend`・`resume`・`refuse`・`after_sleep`・`dma_pause`・`dma_restart`・動作中の電源の段・リセットの段）。
+- バスの表：`struct n_bus_ops`（大きさの欄、割り込み、DMA の写し、電源、リセット、claim の口、子の身元）。
+- 核のサービス：`n_alloc`（node つき）、`n_spin_*`・`n_mutex_*`（大きさの決まった不透明な物）、待ちと事象、thread、仕事の列、期限の callback、時計、ログ、乱数、CPU と node の数と近さ。
+- 種類の口：`n_block_*`、`n_netif_*`、`n_audio_output_*`、`n_input_*`、`n_screen_*`。
+- バスの口：`n_pci_config_*`・`n_pci_reset`、`n_usb_*`（端点、制御・bulk・interrupt・isochronous の転送）、`n_i2c_transfer`、`n_spi_transfer`、`n_uart_*`、`n_gpio_*`（線の読み書き、割り込み）。
+
+**ここから決めること（段ごとの設計で書く）**
+- 割り込みの物の形（共有の線、MSI の塊、CPU の近さ、再割り当て）と、HAL と装置の管理者の分け目。
+- 輸出の表の版の上げ方と、互換を持たない範囲（同じ major の中だけ）。
+- 種類の層の口（block の要求と DMA の写し、網の送受の輪）。
+- ACPI の像と電源の管理者の口（`_TTS`・`_PTS`・`_WAK`・SLP_TYP、GPE と SCI）。
+
 ## 4. 段
 
 | 段 | 中身 | 状態 |
@@ -178,14 +251,19 @@
 | A | 機械の装置（D4）、木（D8）、H10、H11 | 済：宣言 `struct hal_machine`（`.hal_machine`）、firmware の節 `struct firmware_node`、ACPI の二度の出し方、QEMU で木を確かめた |
 | B | firmware の口（D3）、claim の渡し方（D5）、台帳の見張り（D6） | 済：`dev/acpi_claim.c`（`SYS_HAL_ACPI_EVAL`・`_NOTIFY_TAKE`、`N_ACPI_PARENT`）、`SYS_SCREEN_HOLD`、`n_hal_claim` の実装の名、管理者が claim を取って `N_SERVICE_HANDLE_DEVICE` で渡す、台帳の見張りで実例を作り・消す、見張りの相手へ一覧の全部。確かめは下の 5 |
 | C | 電源（D1、D2、H3、H12、H14） | 済：`hal/power.c` の walk、`dev/acpi_power.c`、PCI の `power`、`dev/pm.c` の機械の順、claim の段、実装ごとの suspend・resume（3.2）。確かめは下の 5 |
-| D | DMA（D7）、H19 | 未 |
-| E | 文書（`docs/hal.md`、ABI の §9、地図、`docs/open.md`）と全体の確かめ | 未 |
+| D | DMA の長く使うメモリー（D7）、H19 | 進行中：口（`hal/dma.c`）を建てた。実装のつなぎはサブエージェント四人（xHCI、virtio_gpu と ata、block と NVMe と AHCI、音と網） |
+| E | 機械の HAL を分ける（D10、D11）：`hal/` と `io/`、H28、H30、H33、H36、H37、H40、H41 | 未 |
+| F | 実装の ABI と像（D12、D13、D16）：像の形式、DDK、輸出、読み込み、組み、起動の module（NVMe、SATA、USB のどれからでも起動する）、DMA の層、全部の実装とバスを像に（D14）、プログラムも同じ形式に、導入の形式（宣言と中身。ドライバーと任意の機能とアプリを同じ形で入れる）。H26、H27、H31、H39、H42、H47〜H51 | 未 |
+| G | USB を本物のバスに（D14、H29、H45）、USB のプロセスの実装 | 未 |
+| H | 接続の資源と提供者（D15、H22）、GPIO・I2C の制御器の実装、I2C の HID、i8042 | 未 |
+| I | 電源と寿命（D17、H20、H21、H23〜H25、H32、H38、H43、H44、H46）、H35 | 未 |
+| J | 利用者の ABI の名（D18、H34）、文書（`docs/hal.md`、ABI の §9、地図）、全体の確かめ、台帳を閉じる | 未 |
 
 ## 5. 確かめの記録
 
 **段 B（コミット 6babecc2 の媒体、QEMU 窓付き、WHPX、q35、`intel-iommu,intremap=off,caching-mode=on`、`edu,dma_mask=0xffffffff`）**
 - `nvrmtest`：0 failed。試験が edu を `nvrm` の名で claim し、`N_SERVICE_HANDLE_DEVICE` で nvrm に渡す。nvrm は動き、終わると claim が終わり、試験の名で取り直せる。
-- `pcitest`（起動の画面を `bochs-display` にした回）：ACPI の口（`N_ACPI_SELF`・`N_ACPI_PARENT`・`N_ACPI_CHILD` の評価と断り）と `n_screen_hold` の場合に失敗は無い。5 件は画面に描かれた印の数の確かめで落ちる（refresh の分からない画面での合成の振る舞い。HAL の範囲の外、`docs/open.md` へ）。
+- `pcitest`（起動の画面を `bochs-display` にした回）：ACPI の口（`N_ACPI_SELF`・`N_ACPI_PARENT`・`N_ACPI_CHILD` の評価と断り）と `n_screen_hold` の場合に失敗は無い。5 件は画面に描かれた印の数の確かめで落ちる（refresh の分からない画面での合成の振る舞い。H35）。
 - 前提の食い違い：`-device VGA` ではカーネルの `vbe` が VGA を持つので、pcitest の VGA の場合は claim できない（busy）。AMD の IOMMU は QEMU で x2APIC に要る形式（XTSup）を持たず使われない。WHPX は split の irqchip を持たないので、Intel の IOMMU は割り込みの再割り当てなしで使う。
 - `C:\Tests` で tcc で組んだプログラムは公開の呼出ししか持たず、claim の能力を引けない。pcitest と nvrmtest はホストで組み（`build/tests/pcitest`、`build/tests/nvrmtest`）、試験の媒体の `C:\Nocturne\System` に置く。
 - 確かめていないこと：管理者が台帳の見張りで装置ごとの実例を作り・消す道（QEMU に宣言に合う装置が無い）。
@@ -195,6 +273,7 @@
 - S3 の入り（`powertest sleep`）：QMP の `query-status` が `suspended`。walk の全部の装置が止まり D3 になり、`_PTS`、CPU の停止、入りまで通った。WHPX は S3 から戻れない：戻りは確かめていない。
 - 休止の全部の輪（`powertest hibernate`、作業場の qcow2 の overlay）：一度目は IMAGE の walk、写し（30 MiB を 152 ms）、戻る walk（AHCI の見直し）、OFF の walk、電源断。二度目の起動は写しへ戻り「awake after 30 s」「the image is removed」、続く電源断も通る。
 - 見つけて直したこと：止まらないと答えた装置に resume が来なかった（`hal/power.c`、3811a86a）。眠る前から使えない装置が眠りのたびに「戻らなかった」と言う形（7f414941）。止まらない suspend が自分で戻す二つ目の道（88c1d6fc）。
-- xHCI の取り込みの後（コミット 0aadf56b の媒体、`qemu-xhci`＋`usb-kbd`＋`usb-tablet` を足した）：取りやめの walk は 0 failed で、xHCI と USB の実装の失敗は無い。S3 の入りは QMP の `suspended`。休止の全部の輪では、写しから戻ると制御器が状態を失ったと分かり（起動のカーネルの電源断が HCRST した）、装置を外して立て直し、port 5 と 6 の装置を数え直す。普通の起動で、タブレットで欄を押しキーボードで打てる。
+- xHCI の取り込みの後（コミット 0aadf56b の媒体、`qemu-xhci`＋`usb-kbd`＋`usb-tablet` を足した）：取りやめの walk は 0 failed で、xHCI と USB の実装の失敗は無い。S3 の入りは QMP の `suspended`。休止の全部の輪では、写しから戻ると制御器が状態を失ったと分かり（起動のカーネルの電源断が HCRST した）、装置を外して立て直し、port 5 と 6 の装置を数え直す。「普通の起動で、タブレットで欄を押しキーボードで打てる」は、最初の利用者を作る画面だけを見た記録で、確かめになっていない。
 - 試験の側の注意：`n_power_request` の眠りと休止はすぐ戻る（pm の thread が後で行う）。試験の終わりの電源断の頼みが先に来ると、そちらが行われる。
 - 確かめていないこと：実機と Hyper-V。tulip、ata、rtl8125、ac97、usbmsc、usbnet の walk（QEMU のこの構成に無い）。S3 からの戻り（WHPX）。
+- 段 B と段 C の確かめは足りない：ログインの先のデスクトップで装置を使っていない（ファイルの保存と再起動、音、網、開始メニューからの眠りと休止とその後の装置）。serial.log の全部と QEMU の stderr（H33）を読んでいない。段 D の媒体で、この手順の全部をやり直す。
