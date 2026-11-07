@@ -240,15 +240,21 @@ static void signal(struct hda *h) {
 
 /* ---- link ---- */
 
+/* engine を持って：CORBSIZE か RIRBSIZE（3.3.24、3.3.31）を、能力の bit（7:4）が言う一番大きな大きさにする。3:2 は
+   RsvdP。項の数。 */
+static unsigned ring_size_set(struct hda *h, unsigned at) {
+    static const uint16_t entries[] = {2, 16, 256};
+    uint8_t v = read8(h, at);
+    unsigned caps = v >> 4;
+    unsigned size = caps & 4 ? 2 : caps & 2 ? 1 : 0;
+    write8(h, at, (uint8_t)((v & 0x0C) | size));
+    return entries[size];
+}
+
 /* engine を持って：CORB と RIRB を置き場に、制御器が持つ一番大きな大きさで置く。まだ回さない（4.4.1.3、4.4.2.2）。 */
 static void rings_place(struct hda *h) {
-    static const uint16_t sizes[] = {2, 16, 256};
-    uint8_t corb_caps = read8(h, CORBSIZE) >> 4, rirb_caps = read8(h, RIRBSIZE) >> 4;
-    unsigned corb_size = corb_caps & 4 ? 2 : corb_caps & 2 ? 1 : 0, rirb_size = rirb_caps & 4 ? 2 : rirb_caps & 2 ? 1 : 0;
-    write8(h, CORBSIZE, (uint8_t)corb_size);
-    write8(h, RIRBSIZE, (uint8_t)rirb_size);
-    h->corb_entries = sizes[corb_size];
-    h->rirb_entries = sizes[rirb_size];
+    h->corb_entries = ring_size_set(h, CORBSIZE);
+    h->rirb_entries = ring_size_set(h, RIRBSIZE);
     uint64_t rings = h->dma_bus, rirb = rings + PAGE_SIZE / 2;
     write32(h, CORBLBASE, (uint32_t)rings);
     write32(h, CORBUBASE, (uint32_t)(rings >> 32));
