@@ -122,6 +122,22 @@
 - QEMU の表には電源資源が無い。試験の SSDT（`-acpitable`）で電源資源と `_PS0`・`_PS3` を持つ装置を作り、試験のプログラムが claim する。浅い段の claim が断ると取りやめになるので、深い段の装置の D3 と D0、同じ段の NVMe・e1000・xHCI の D3hot から D0 と構成の戻りを、眠らずに見られる。
 - 休止の全部の輪、電源断、再起動を QEMU で見る。
 
+## 3.2 実装ごとの電源の段
+
+サブエージェント四つ（Opus 5.5、作業木ごと）が書き、差分を読んでから取り込んだ。どれも `after_sleep` は `RESUME`（`usbmsc` を除く）。
+
+| 実装 | suspend | resume |
+|---|---|---|
+| `nvme` | `asleep` で道を閉じ、I/O の命令の終わりを待ち、I/O の提出の queue、続けて完了の queue を消す（3.6.1、5.3.3、5.3.4）。SLEEP と OFF は CC.SHN の正常の shutdown と CSTS.SHST の完了を待つ | Controller Reset から 3.5.1 の順で立ち上げ、Identify で同じ装置かを見る。眠りの間の要求は retry の列から出る |
+| `ahci` | port ごとに `asleep`、命令の終わりを待つ。SLEEP と OFF は FLUSH CACHE、STANDBY IMMEDIATE、Slumber、engine を止めて listen（10.10.3） | adapter を 10.1.2 の順で立ち上げ、円盤が居うる port を見直す |
+| `xhci` | 装置を深い方から：端点を閉じ、SP つきの Stop Endpoint、SuperSpeed の hub の port を U3。root port を U3、制御器を止める。SLEEP は Save State（4.23.2）。OFF は HCRST | 状態を持つか Restore State で戻せれば R/S、port を U0（4.15.2）、浅い装置から端点を開ける。戻らない装置と状態を失った制御器は、門が開いた後に worker が数え直す |
+| `usbhid`、`usbnet` | 押されたキーを離し報告を捨てる／送ることを閉じる | 受け直す／開けて `net_rx_notify` |
+| `usbhub` | 無し（木の順は `xhci` が辿り、`usbhub_link_suspend`・`_resume` を呼ぶ） | 無し |
+| `usbmsc` | OFF だけ（`LOST`：眠りと休止は USB のディスクを挿している間しない） | — |
+| `hda` | stream を止め、codec の function group を D3、link を reset（4.5.8.2） | link を reset から上げ、thread が codec を初めから戻す（4.5.8.1） |
+| `rtl8125` | 道を閉じて MAC を reset。SLEEP と OFF は D3 の前の設定と PHY の電源断（Realtek の FreeBSD の driver の手順） | `hw_init` から立て直し、道を開く |
+| `e1000`、`tulip`、`ac97`、`vbe`、`ata` | 送受を止め reset ／過程を止め reset ／RPBM を落とす ／フリップを覚える ／channel の錠で要求を待たせる | 同じ初期化の関数で立て直す ／`ata` は IDENTIFY で同じ drive かを見る |
+
 ## 3.3 段 D の設計
 
 照らしたもの：PCI の DMA の番地の幅（32 bit は全部の機能が持ち、64 bit は機能ごとの申告：NVMe 1.4 の PRP と SGL は 64 bit、AHCI 1.3.1 の CAP.S64A、xHCI 1.2 の HCCPARAMS1.AC64）、`dev/iommu.h` の domain と guest の約束、`dev/blk.h` の要求の形。
@@ -160,7 +176,7 @@
 |---|---|---|
 | A | 機械の装置（D4）、木（D8）、H10、H11 | 済：宣言 `struct hal_machine`（`.hal_machine`）、firmware の節 `struct firmware_node`、ACPI の二度の出し方、QEMU で木を確かめた |
 | B | firmware の口（D3）、claim の渡し方（D5）、台帳の見張り（D6） | 済：`dev/acpi_claim.c`（`SYS_HAL_ACPI_EVAL`・`_NOTIFY_TAKE`、`N_ACPI_PARENT`）、`SYS_SCREEN_HOLD`、`n_hal_claim` の実装の名、管理者が claim を取って `N_SERVICE_HANDLE_DEVICE` で渡す、台帳の見張りで実例を作り・消す、見張りの相手へ一覧の全部。確かめは下の 5 |
-| C | 電源（D1、D2、H3、H12、H14） | HAL の側は建てた：`hal/power.c` の walk、`dev/acpi_power.c`、PCI の `power`、`dev/pm.c` の機械の順、claim の段。実装ごとの suspend・resume は 3.2。確かめは下の 5 |
+| C | 電源（D1、D2、H3、H12、H14） | 済：`hal/power.c` の walk、`dev/acpi_power.c`、PCI の `power`、`dev/pm.c` の機械の順、claim の段、実装ごとの suspend・resume（3.2）。確かめは下の 5 |
 | D | DMA（D7）、H19 | 未 |
 | E | 文書（`docs/hal.md`、ABI の §9、地図、`docs/open.md`）と全体の確かめ | 未 |
 
@@ -178,4 +194,6 @@
 - S3 の入り（`powertest sleep`）：QMP の `query-status` が `suspended`。walk の全部の装置が止まり D3 になり、`_PTS`、CPU の停止、入りまで通った。WHPX は S3 から戻れない：戻りは確かめていない。
 - 休止の全部の輪（`powertest hibernate`、作業場の qcow2 の overlay）：一度目は IMAGE の walk、写し（30 MiB を 152 ms）、戻る walk（AHCI の見直し）、OFF の walk、電源断。二度目の起動は写しへ戻り「awake after 30 s」「the image is removed」、続く電源断も通る。
 - 見つけて直したこと：止まらないと答えた装置に resume が来なかった（`hal/power.c`、3811a86a）。眠る前から使えない装置が眠りのたびに「戻らなかった」と言う形（7f414941）。止まらない suspend が自分で戻す二つ目の道（88c1d6fc）。
-- 確かめていないこと：実機と Hyper-V。tulip、ata、rtl8125、ac97 の walk（QEMU のこの構成に無い）。S3 からの戻り。
+- xHCI の取り込みの後（コミット 0aadf56b の媒体、`qemu-xhci`＋`usb-kbd`＋`usb-tablet` を足した）：取りやめの walk は 0 failed で、xHCI と USB の実装の失敗は無い。S3 の入りは QMP の `suspended`。休止の全部の輪では、写しから戻ると制御器が状態を失ったと分かり（起動のカーネルの電源断が HCRST した）、装置を外して立て直し、port 5 と 6 の装置を数え直す。普通の起動で、タブレットで欄を押しキーボードで打てる。
+- 試験の側の注意：`n_power_request` の眠りと休止はすぐ戻る（pm の thread が後で行う）。試験の終わりの電源断の頼みが先に来ると、そちらが行われる。
+- 確かめていないこと：実機と Hyper-V。tulip、ata、rtl8125、ac97、usbmsc、usbnet の walk（QEMU のこの構成に無い）。S3 からの戻り（WHPX）。

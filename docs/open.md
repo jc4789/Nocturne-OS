@@ -80,6 +80,7 @@
 - PCI に抜き差しと AER が無い。
 - ノート PC の内蔵キーボード（i8042、I2C の HID）の実装が無い。HAL は ACPI の接続の資源（`GpioInt`、`GpioIo`、`I2cSerialBus`、`SpiSerialBus`、`UartSerialBus`）を表さず、GPIO の割り込みの提供者の口も無い（`kernel/src/dev/acpi_devices.c:125`）。
 - 眠り：`nvrm` は `n_hal_power_wait` を呼ばないので、NVIDIA の GPU を持つ機械は眠らず、休止もしない（`ports/nvidia/nvrm.c`）。
+- 眠り：USB のディスク（`usbmsc`、`HAL_AFTER_SLEEP_LOST`）を挿している間、機械は眠らず、休止もしない。USB から起動した機械も同じ。戻った制御器が装置を数え直すと、ディスクは新しい装置になり、その上のボリュームを失うため。同じ装置と分かれば続けて使う道が要る（`kernel/src/dev/usbmsc.c`）。
 - 眠り：起動の画面（`firmware-screen`、`HAL_AFTER_SLEEP_BOOT`）は、claim の GPU ドライバーが画面 0 を持っても結ばれたままで、S3 を拒む。手放すのはカーネルの `vbe` だけ（`kernel/src/dev/fb.c:642`、`kernel/src/vm/vbe.c:182`）。
 - 眠り：起こしの元（`_PRW`、`_DSW`、GPE、PCI の PME）を扱わない。起こせるのは電源のボタンだけ。設定の窓の項目と組で作る。
 - 電源：動作中の装置の電源の管理（使わない装置を D3 へ）が無い。
