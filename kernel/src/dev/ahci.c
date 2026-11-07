@@ -1611,6 +1611,7 @@ static bool ahci_suspend(struct hal_device *d, enum hal_power_target target) {
    分かった円盤は命令を受ける。 */
 static bool ahci_resume(struct hal_device *d) {
     struct hba *h = d->driver_data;
+    if (__atomic_load_n(&h->dead, __ATOMIC_ACQUIRE)) return true; /* 眠る前から使わない（hba_kill で言ってある） */
     mutex_lock(&h->reset);
     __atomic_store_n(&h->lost, true, __ATOMIC_RELEASE);
     bool up = hba_ready(h);

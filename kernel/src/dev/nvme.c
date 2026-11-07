@@ -1322,7 +1322,8 @@ static bool nvme_resume(struct hal_device *d) {
     struct nvme *c = d->driver_data;
     mutex_lock(&c->reset_lock);
     __atomic_store_n(&c->asleep, false, __ATOMIC_RELEASE);
-    bool up = enable_recorded(c);
+    /* 眠る前から使わない controller（cut。hal_failed で言ってある）は、そのまま：戻すものが無い */
+    bool up = __atomic_load_n(&c->cut, __ATOMIC_ACQUIRE) || enable_recorded(c);
     mutex_unlock(&c->reset_lock);
     work_wake(c);
     if (!up) kprintf("nvme%d: did not come back after the sleep\n", c->index);

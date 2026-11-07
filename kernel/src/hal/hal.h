@@ -108,7 +108,8 @@ enum hal_after_sleep {
    になり、resume が呼ばれる。HAL_POWER_OFF では false でも電源は切れる。NULL は止めるものが無い。
    resume：suspend の後に戻す。HAL は先に装置を D0 にし、バスの構成（PCI なら BAR、命令、MSI と MSI-X）を戻してある。
    装置そのものは電源を失っていてもよく（眠りと休止の後）、そのままでもよい（取りやめと写しの後）。どちらでも元どおり
-   にする。false は戻らなかった（実装は持ち続け、hal_failed で言う）。NULL はすることが無い。
+   にする。false は戻らなかった（実装は持ち続け、hal_failed で言う）。眠る前から使えなかった装置（hal_failed で言って
+   ある）は、そのままで true。NULL はすることが無い。
    refuse：今は眠れない理由（ログのため）か NULL。眠りと休止のたびに聞く。
    after_sleep：enum hal_after_sleep。 */
 #define HAL_DECLINE 1
