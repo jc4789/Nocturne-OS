@@ -238,6 +238,14 @@ static void on_offer(const struct msg_offer *o) {
     }
 }
 
+/* channel の頁の一覧（GPADL）のうち host がまだ持つかもしれないもの：作った時から、host が外したと答えるまで。
+   chan_lock の下。 */
+struct vmbus_gpadl {
+    struct vmbus_gpadl *next;
+    uint64_t gpa;
+    uint32_t id;
+};
+
 /* chan_lock held: the channel leaves the list; channel_free hands its relid back and frees it. */
 static void channel_unlink(struct vmbus_channel *ch) {
     by_relid[ch->relid] = NULL;
@@ -254,6 +262,12 @@ static void channel_unlink(struct vmbus_channel *ch) {
 static void channel_free(struct vmbus_channel *ch) {
     uint32_t m[2 + 1] = {CHMSG_RELID_RELEASED, 0, ch->relid};
     hv_post_message(msg_conn_id, 1, m, sizeof m);
+    /* 外せなかった一覧の記録だけを捨てる：その頁は持ち主（HAL、輪）が使わずに残している */
+    while (ch->gpadls) {
+        struct vmbus_gpadl *g = ch->gpadls;
+        ch->gpadls = g->next;
+        kfree(g);
+    }
     kfree(ch);
 }
 
@@ -271,9 +285,12 @@ static void channel_reap(struct vmbus_channel *ch, bool in_handler) {
 
 /* ---- nodes (the node thread) ---- */
 
+static bool channel_stop(struct hal_device *d);
+static const struct hal_bus_ops vmbus_bus_ops = {.stop = channel_stop};
+
 static void node_publish(struct vmbus_channel *ch) {
     char location[24];
-    hal_device_init(&ch->hal, N_BUS_VMBUS, NULL);
+    hal_device_init(&ch->hal, N_BUS_VMBUS, &vmbus_bus_ops);
     hal_prop_bytes(&ch->hal, N_PROP_VMBUS_TYPE, ch->type.b, sizeof ch->type.b);
     ksnprintf(location, sizeof location, "VMBus %u", ch->relid);
     hal_location(&ch->hal, location);
@@ -513,9 +530,41 @@ bool vmbus_init(void) {
 
 bool vmbus_ready(void) { return __atomic_load_n(&connected, __ATOMIC_ACQUIRE); }
 
-uint32_t vmbus_gpadl_create(struct vmbus_channel *ch, uint64_t pa, uint32_t pages) {
+/* host が持つかもしれない一覧を覚える・忘れる・問う。 */
+static void gpadl_hold(struct vmbus_channel *ch, struct vmbus_gpadl *g) {
+    uint64_t f = spin_lock(&chan_lock);
+    g->next = ch->gpadls;
+    ch->gpadls = g;
+    spin_unlock(&chan_lock, f);
+}
+
+static void gpadl_forget(struct vmbus_channel *ch, uint32_t id) {
+    struct vmbus_gpadl *gone = NULL;
+    uint64_t f = spin_lock(&chan_lock);
+    for (struct vmbus_gpadl **p = &ch->gpadls; *p; p = &(*p)->next) {
+        if ((*p)->id != id) continue;
+        gone = *p;
+        *p = gone->next;
+        break;
+    }
+    spin_unlock(&chan_lock, f);
+    kfree(gone);
+}
+
+static bool gpadl_held(struct vmbus_channel *ch, uint64_t gpa) {
+    bool held = false;
+    uint64_t f = spin_lock(&chan_lock);
+    for (struct vmbus_gpadl *g = ch->gpadls; g && !held; g = g->next) held = g->gpa == gpa;
+    spin_unlock(&chan_lock, f);
+    return held;
+}
+
+uint32_t vmbus_gpadl_create(struct vmbus_channel *ch, uint64_t gpa, uint32_t pages) {
     uint8_t buf[HV_MESSAGE_PAYLOAD_BYTES];
+    struct vmbus_gpadl *g = kmalloc(sizeof *g);
+    if (!g) return 0;
     uint32_t gpadl = __atomic_fetch_add(&next_gpadl, 1, __ATOMIC_SEQ_CST);
+    *g = (struct vmbus_gpadl){.gpa = gpa, .id = gpadl};
     const uint32_t first_max = (sizeof buf - sizeof(struct msg_gpadl_header)) / 8;
     const uint32_t body_max = (sizeof buf - sizeof(struct msg_gpadl_body)) / 8;
 
@@ -529,35 +578,53 @@ uint32_t vmbus_gpadl_create(struct vmbus_channel *ch, uint64_t pa, uint32_t page
     h->byte_count = pages * 4096;
     h->byte_offset = 0;
     uint32_t n = MIN(pages, first_max);
-    for (uint32_t i = 0; i < n; i++) h->pfn[i] = (pa >> 12) + i;
+    for (uint32_t i = 0; i < n; i++) h->pfn[i] = (gpa >> 12) + i;
     uint32_t sent = n;
 
     mutex_lock(&request_mutex);
     waiter_arm(CHMSG_GPADL_CREATED, gpadl);
-    bool posted = post(buf, sizeof *h + n * 8) == HV_STATUS_SUCCESS;
+    bool started = post(buf, sizeof *h + n * 8) == HV_STATUS_SUCCESS, posted = started;
     while (posted && sent < pages) {
         struct msg_gpadl_body *b = (void *)buf;
         memset(buf, 0, sizeof buf);
         b->h.type = CHMSG_GPADL_BODY;
         b->gpadl = gpadl;
         n = MIN(pages - sent, body_max);
-        for (uint32_t i = 0; i < n; i++) b->pfn[i] = (pa >> 12) + sent + i;
+        for (uint32_t i = 0; i < n; i++) b->pfn[i] = (gpa >> 12) + sent + i;
         sent += n;
         posted = post(buf, sizeof *b + n * 8) == HV_STATUS_SUCCESS;
     }
     struct msg_gpadl_created r;
     bool answered = posted && waiter_take(3000, &r, sizeof r);
     mutex_unlock(&request_mutex);
-    if (!posted) return 0;
-    if (!answered) {
-        kprintf("vmbus: GPADL %x for relid %u timed out\n", gpadl, ch->relid);
+    if (answered && !r.status) {
+        gpadl_hold(ch, g);
+        return gpadl;
+    }
+    if (!started || answered) { /* 頭が届かなかったか、host が断った：host は何も持たない */
+        if (answered) kprintf("vmbus: GPADL %x for relid %u failed (%x)\n", gpadl, ch->relid, r.status);
+        kfree(g);
         return 0;
     }
-    if (r.status) {
-        kprintf("vmbus: GPADL %x for relid %u failed (%x)\n", gpadl, ch->relid, r.status);
-        return 0;
+    /* 答えが無い（体の一部が届かなかった時も）：host が持つかもしれない */
+    kprintf("vmbus: GPADL %x for relid %u was not answered: its pages stay out of use\n", gpadl, ch->relid);
+    gpadl_hold(ch, g);
+    return 0;
+}
+
+/* 輪が host から離れる：host が開いているかもしれないなら閉じさせ、輪の一覧を外させ、host がもう持たないなら頁を
+   返す。持つかもしれないなら頁は使わずに残す。channel の callback も送受も、もう走らない時に。 */
+static void ring_retire(struct vmbus_channel *ch, bool opened) {
+    if (opened && !channel_rescinded(ch)) {
+        uint32_t m[2 + 1] = {CHMSG_CLOSE, 0, ch->relid};
+        post(m, sizeof m);
     }
-    return gpadl;
+    if (ch->ring_gpadl) vmbus_gpadl_teardown(ch, ch->ring_gpadl);
+    uint64_t pa = hhdm_virt_to_phys(ch->ring);
+    if (!gpadl_held(ch, pa)) pmm_free_contig(pa, ch->ring_pages_out + ch->ring_pages_in);
+    else kprintf("vmbus: relid %u keeps its rings out of use: the host may still hold them\n", ch->relid);
+    ch->ring = NULL;
+    ch->ring_gpadl = 0;
 }
 
 /* The channel's callbacks see it open (opened, callback, priv) or not, all at once. */
@@ -590,7 +657,10 @@ int vmbus_open(struct vmbus_channel *ch, uint32_t out_bytes, uint32_t in_bytes, 
     ch->in->feature_bits = 1;
 
     ch->ring_gpadl = vmbus_gpadl_create(ch, pa, total);
-    if (!ch->ring_gpadl) return -N_ERR_IO;
+    if (!ch->ring_gpadl) {
+        ring_retire(ch, false);
+        return -N_ERR_IO;
+    }
 
     struct msg_open m;
     memset(&m, 0, sizeof m);
@@ -605,31 +675,37 @@ int vmbus_open(struct vmbus_channel *ch, uint32_t out_bytes, uint32_t in_bytes, 
     if (!request(&m, sizeof m, CHMSG_OPEN_RESULT, ch->relid, 3000, &r, sizeof r)) {
         channel_set_open(ch, false, NULL, NULL);
         kprintf("vmbus: open of relid %u timed out\n", ch->relid);
+        isr_quiet();
+        ring_retire(ch, true); /* host が開いたかもしれない */
         return -N_ERR_TIMEOUT;
     }
     if (r.status) {
         channel_set_open(ch, false, NULL, NULL);
         kprintf("vmbus: open of relid %u failed (%x)\n", ch->relid, r.status);
+        isr_quiet();
+        ring_retire(ch, false);
         return -N_ERR_IO;
     }
     return 0;
 }
 
 bool vmbus_gpadl_teardown(struct vmbus_channel *ch, uint32_t gpadl) {
+    if (channel_rescinded(ch)) return false; /* host の取り消しは外したという答えではない */
     uint32_t m[2 + 2] = {CHMSG_GPADL_TEARDOWN, 0, ch->relid, gpadl};
     if (!request(m, sizeof m, CHMSG_GPADL_TORNDOWN, gpadl, 3000, NULL, 0)) {
         kprintf("vmbus: GPADL %x teardown timed out\n", gpadl);
         return false;
     }
+    gpadl_forget(ch, gpadl);
     return true;
 }
 
-static bool close_channel(struct vmbus_channel *ch, bool require_ack) {
+void vmbus_close(struct vmbus_channel *ch) {
     uint64_t f = spin_lock(&chan_lock);
     bool was = ch->opened;
     __atomic_store_n(&ch->opened, false, __ATOMIC_RELEASE); /* no more callbacks */
     spin_unlock(&chan_lock, f);
-    if (!was) return false;
+    if (!was) return;
     isr_quiet();
     /* a send or a receive under way on another CPU ends before the rings can go; later ones find
        the channel closed */
@@ -637,28 +713,21 @@ static bool close_channel(struct vmbus_channel *ch, bool require_ack) {
     spin_unlock(&ch->out_lock, f);
     f = spin_lock(&ch->in_lock);
     spin_unlock(&ch->in_lock, f);
-    bool ok = !require_ack;
-    if (!channel_rescinded(ch)) {
-        uint32_t m[2 + 1] = {CHMSG_CLOSE, 0, ch->relid};
-        post(m, sizeof m);
-        uint32_t t[2 + 2] = {CHMSG_GPADL_TEARDOWN, 0, ch->relid, ch->ring_gpadl};
-        ok = request(t, sizeof t, CHMSG_GPADL_TORNDOWN, ch->ring_gpadl, 3000, NULL, 0);
-        if (!ok) kprintf("vmbus: GPADL %x teardown timed out\n", ch->ring_gpadl);
-    }
-    /* Drivers with explicit GPADL ownership do not infer a teardown ACK from
-       rescind. Preserve the existing close contract for other drivers. */
-    if (ok) {
-        uint64_t pa = hhdm_virt_to_phys(ch->ring);
-        pmm_free_contig(pa, ch->ring_pages_out + ch->ring_pages_in);
-    }
-    else kprintf("vmbus: preserving ring GPADL %x without teardown ACK\n", ch->ring_gpadl);
-    ch->ring = NULL;
-    ch->ring_gpadl = 0;
-    return ok;
+    ring_retire(ch, true);
 }
 
-void vmbus_close(struct vmbus_channel *ch) { close_channel(ch, false); }
-bool vmbus_close_confirmed(struct vmbus_channel *ch) { return close_channel(ch, true); }
+/* バスの stop（hal.h）：host が装置のメモリーにもう届かない。channel を閉じ、host が持つかもしれない一覧を全部外さ
+   せる。外したと答えない一覧が残れば false：HAL は装置のメモリーを返さない。 */
+static bool channel_stop(struct hal_device *d) {
+    struct vmbus_channel *ch = vmbus_channel_of(d);
+    vmbus_close(ch);
+    for (;;) {
+        uint64_t f = spin_lock(&chan_lock);
+        uint32_t id = ch->gpadls ? ch->gpadls->id : 0;
+        spin_unlock(&chan_lock, f);
+        if (!id || !vmbus_gpadl_teardown(ch, id)) return !id;
+    }
+}
 
 void vmbus_release(struct vmbus_channel *ch) {
     uint64_t f = spin_lock(&chan_lock);

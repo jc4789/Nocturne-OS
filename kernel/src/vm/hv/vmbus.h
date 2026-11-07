@@ -46,6 +46,7 @@ struct hv_ring {
 } __attribute__((packed));
 
 struct vmbus_channel;
+struct vmbus_gpadl;
 typedef void (*vmbus_callback_t)(struct vmbus_channel *ch);
 
 /* rescinded, opened, claimed, callback, priv, on_rescind and node change only inside vmbus.c (under
@@ -64,6 +65,7 @@ struct vmbus_channel {
     uint8_t *ring;
     uint32_t ring_pages_out, ring_pages_in;
     uint32_t ring_gpadl;
+    struct vmbus_gpadl *gpadls; /* host がまだ持つかもしれない頁の一覧（vmbus.c、channel の錠の下） */
     struct hv_ring *out, *in;
     uint8_t *out_data, *in_data;
     uint32_t out_size, in_size;
@@ -100,13 +102,10 @@ struct vmbus_channel *vmbus_channel_of(struct hal_device *d);
    handler and never close, release or open a channel, or wait for a request. */
 /* Allocate the rings and open the channel. Sizes are rounded up to pages. 0 or -errno. */
 int vmbus_open(struct vmbus_channel *ch, uint32_t out_bytes, uint32_t in_bytes, vmbus_callback_t cb, void *priv);
-/* Close an open channel and free its rings. When it returns, no callback of the channel runs and
-   no send or receive on it is under way. */
+/* 開いた channel を閉じる。戻った時、channel の callback は走らず、送りも受けも途中に無い。輪の頁は、host が輪の頁の
+   一覧を外したと答えた時に返る。答えなければ（host が channel を取り消した時も。取り消しは答えではない）使わずに残す。
+   閉じた channel には何もしない。 */
 void vmbus_close(struct vmbus_channel *ch);
-/* Close, but reclaim ring pages only after an explicit GPADL teardown ACK.
-   False means backing was retained, including on rescind; the channel itself
-   is still closed. This does not change the legacy close contract. */
-bool vmbus_close_confirmed(struct vmbus_channel *ch);
 /* Give up a claimed channel: it is freed (and its relid handed back) once the host rescinds it
    and its node is gone. When it returns, its on_rescind no longer runs. */
 void vmbus_release(struct vmbus_channel *ch);
@@ -116,9 +115,12 @@ void vmbus_set_rescind(struct vmbus_channel *ch, vmbus_callback_t on_rescind);
    channel lock (it takes no vmbus call). It returns true to keep one (the channel is then claimed
    before the hook hands it on); unclaimed ones are freed when the host rescinds them. */
 void vmbus_set_socket_hook(bool (*hook)(struct vmbus_channel *ch));
-/* Share guest memory with the host: returns a GPADL handle, or 0 on failure. */
-uint32_t vmbus_gpadl_create(struct vmbus_channel *ch, uint64_t pa, uint32_t pages);
-/* False leaves the memory shared: it must not be freed or reused. */
+/* 客のメモリー（gpa：HAL の DMA の口が返す装置の番地）を host と分ける頁の一覧（GPADL）を作る。番号か 0。channel は
+   host が持つかもしれない一覧を、作りの答えが無かったものも、host が外したと答えるまで覚える。バスは覚えた一覧が
+   無くなって初めて HAL に装置が止まったと答える（そこで hal_release がメモリーを返す）。 */
+uint32_t vmbus_gpadl_create(struct vmbus_channel *ch, uint64_t gpa, uint32_t pages);
+/* true：host が外したと答えた。false：メモリーは分けたままで、返しても使い直してもいけない。取り消された channel では
+   何も送らずに false。 */
 bool vmbus_gpadl_teardown(struct vmbus_channel *ch, uint32_t gpadl);
 /* Send an in-band packet. 0, or -N_ERR_NOT_READY when the ring is full. */
 int vmbus_send(struct vmbus_channel *ch, uint16_t type, uint16_t flags, const void *data, uint32_t len,

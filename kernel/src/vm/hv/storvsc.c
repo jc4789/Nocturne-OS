@@ -18,7 +18,6 @@
 #include "hal/hal.h"
 #include "vm/hv/vmbus.h"
 #include "mm/heap.h"
-#include "mm/pmm.h"
 #include "sys/clock.h"
 #include "sys/thread.h"
 #include "sys/wait.h"
@@ -116,7 +115,7 @@ struct storvsc {
     struct wait_queue wq;
     struct vstor_packet reply;
     uint8_t *bounce;
-    uint64_t bounce_pa;
+    uint64_t bounce_gpa;
     uint32_t max_sectors;
     struct scsi_disk *disks[LUNS];
     unsigned ndisks;
@@ -201,7 +200,7 @@ static int exchange(struct storvsc *s, struct vstor_packet *p, uint32_t len) {
         h.d.trans_id = tid;
         h.range_count = 1;
         h.len = len;
-        h.pfn[0] = s->bounce_pa >> 12;
+        h.pfn[0] = s->bounce_gpa >> 12;
         r = vmbus_send_raw(s->ch, &h, hlen, p, sizeof *p);
     } else {
         r = vmbus_send(s->ch, VM_PKT_DATA_INBAND, VMBUS_FLAG_COMPLETION_REQUESTED, p, sizeof *p, tid);
@@ -358,8 +357,8 @@ static int packet_send(struct scsi_disk *d, struct blk_request *r, unsigned id) 
             memset(&h, 0, offsetof(struct gpa_header, pfn));
             unsigned pages = 0;
             for (uint32_t i = 0; i < r->segment_count; i++) {
-                uint64_t first = r->segments[i].phys & ~(uint64_t)(PAGE_SIZE - 1);
-                uint64_t last = (r->segments[i].phys + r->segments[i].bytes - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+                uint64_t first = r->segments[i].bus & ~(uint64_t)(PAGE_SIZE - 1);
+                uint64_t last = (r->segments[i].bus + r->segments[i].bytes - 1) & ~(uint64_t)(PAGE_SIZE - 1);
                 for (uint64_t at = first; at <= last; at += PAGE_SIZE) h.pfn[pages++] = at >> 12;
             }
             uint32_t hlen = (uint32_t)(offsetof(struct gpa_header, pfn) + pages * 8);
@@ -370,7 +369,7 @@ static int packet_send(struct scsi_disk *d, struct blk_request *r, unsigned id) 
             h.d.trans_id = id + 1ull;
             h.range_count = 1;
             h.len = n * 512;
-            h.offset = (uint32_t)(r->segments[0].phys & (PAGE_SIZE - 1));
+            h.offset = (uint32_t)(r->segments[0].bus & (PAGE_SIZE - 1));
             e = vmbus_send_raw(s->ch, &h, hlen, &p, sizeof p);
         }
         if (e != -N_ERR_NOT_READY || __atomic_load_n(&s->dead, __ATOMIC_ACQUIRE)) return e;
@@ -445,6 +444,7 @@ static void probe_lun(struct storvsc *s, struct hal_device *hal, uint8_t lun) {
     d->blk.max_segments = MOST_PAGES;
     d->blk.segment_boundary = PAGE_SIZE;
     d->blk.has_cache = true;
+    d->blk.dma = hal;
     d->blk.ops = &scsi_ops;
     d->blk.priv = d;
     s->disks[s->ndisks++] = d;
@@ -457,14 +457,14 @@ static int storvsc_attach(struct hal_device *hal) {
     if (!s) return -N_ERR_NO_MEMORY;
     s->ch = ch;
     s->hal = hal;
-    s->bounce_pa = pmm_alloc();
-    if (!s->bounce_pa) {
+    hal_dma_bits(hal, 64); /* GPA_DIRECT の頁の番号は 64 bit */
+    /* 手放さない：装置が外れた後、バスが host はもう届かないと答えた時に HAL が返す */
+    s->bounce = hal_dma_alloc(hal, PAGE_SIZE, &s->bounce_gpa);
+    if (!s->bounce) {
         kfree(s);
         return -N_ERR_NO_MEMORY;
     }
-    s->bounce = phys_to_virt(s->bounce_pa);
     if (vmbus_open(ch, 64 * 1024, 64 * 1024, storvsc_callback, s)) {
-        pmm_free(s->bounce_pa);
         kfree(s);
         return -N_ERR_IO;
     }
@@ -473,7 +473,6 @@ static int storvsc_attach(struct hal_device *hal) {
     mutex_unlock(&s->control);
     if (r) {
         vmbus_close(ch);
-        pmm_free(s->bounce_pa);
         kfree(s);
         return -N_ERR_IO;
     }

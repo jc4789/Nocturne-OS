@@ -6,6 +6,8 @@
   4. VM の処理は vm/vm.h の後ろ：kernel/src/vm の外から vm/vm.h 以外の vm/ を include しない。
   5. カーネルの gui/ に利用者への言葉を置かない：kprintf の外の文字列と、シェルの部品の語を拒む。
   6. プログラムは入口の像の溝からカーネルへ入る：user・tests・ports のコードの SYSCALL 命令を拒む。
+  7. 実装の DMA は HAL の口を通る：struct hal_driver を定めるファイルの、頁の確保（pmm_）、物理番地の引き
+     （hhdm_virt_to_phys、virt_to_phys、vmm_kernel_translate）、IOMMU（iommu_）、MMIO の写し（vmm_map_mmio）を拒む。
 
   python -X utf8 tests/check_boundaries.py
 """
@@ -55,6 +57,8 @@ SHELL_WORD = re.compile(r"taskbar|start.?menu|\bmenu|toast|wallpaper|volume.?pan
 STRING = re.compile(r'"(?:[^"\\\n]|\\.)*"')
 GUI_LOG = re.compile(r"\b(kprintf|ksnprintf|wish|panic|kthread_create(_on)?)\(")
 GUI_ALLOWED = re.compile(r"^\s*#\s*include")
+DRIVER = re.compile(r"\bstruct\s+hal_driver\s+\w+\s*=")
+DRIVER_BYPASS = re.compile(r"\b(pmm_\w+|hhdm_virt_to_phys|virt_to_phys|vmm_kernel_translate|iommu_\w+|vmm_map_mmio\w*)\s*\(")
 
 
 def gui_log_call(lines, index):
@@ -70,7 +74,9 @@ def report(path, number, rule, line):
 
 for path in sorted([*kernel.rglob("*.c"), *kernel.rglob("*.h")]):
     relative = path.relative_to(kernel).as_posix()
-    lines = code_of(path).split("\n")
+    code = code_of(path)
+    lines = code.split("\n")
+    driver = bool(DRIVER.search(code))
     for i, line in enumerate(lines):
         number = i + 1
         if "init_pid" in line:
@@ -87,6 +93,8 @@ for path in sorted([*kernel.rglob("*.c"), *kernel.rglob("*.h")]):
                 report(path, number, "カーネルの gui/ の文字列", line)
         if relative.startswith("dev/") and (UI_INCLUDE.search(line) or UI_CALL.search(line)):
             report(path, number, "dev/ から UI", line)
+        if driver and DRIVER_BYPASS.search(line):
+            report(path, number, "実装の DMA が HAL の外", line)
         included = VM_INCLUDE.search(line)
         if included and not relative.startswith("vm/") and included.group(2) != "vm.h":
             report(path, number, "vm/ の外の VM", line)

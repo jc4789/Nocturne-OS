@@ -46,8 +46,7 @@ struct blkdev {
     uint32_t segment_boundary;
     bool has_cache; /* 装置は揮発の cache を持ちうる：BLK_PERSIST がそれに届く */
     /* データを DMA で動かす装置（HAL の装置）。blk.c は区切りごとに装置へ渡す番地を HAL に問い（hal_dma_reach）、
-       届かない区切りを持つ要求は装置の届くメモリーの緩衝を通す。NULL：装置はデータを物理番地で受ける（CPU が写す
-       実装、客の物理番地で読む hypervisor の口） */
+       届かない区切りを持つ要求は装置の届くメモリーの緩衝を通す。NULL：CPU がデータを写す実装（物理番地を読む） */
     struct hal_device *dma;
     const struct blk_ops *ops;
     void *priv;

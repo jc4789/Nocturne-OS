@@ -10,7 +10,6 @@
 #include "arch/cpu.h"
 #include "vm/hv/vmbus.h"
 #include "mm/heap.h"
-#include "mm/pmm.h"
 #include "net/net.h"
 #include "sys/clock.h"
 #include "sys/sched.h"
@@ -110,10 +109,11 @@ struct netvsc {
     struct netif nif; /* first: self is the device */
     struct netvsc *next; /* the adapters that are up (netvsc_ip) */
     struct vmbus_channel *ch;
+    struct hal_device *hal;
     uint32_t nvsp_version;
+    /* host と分ける緩衝。HAL の DMA の口で取り、手放さない：装置が外れた後、バスが host はもう持たないと答えた時に
+       HAL が返す（vmbus.h の vmbus_gpadl_create） */
     uint8_t *recv_buf, *send_buf;
-    uint32_t recv_gpadl, send_gpadl;
-    bool recv_shared, send_shared;
     uint32_t recv_size;
     uint32_t section_size, sections;
     uint64_t *section_used; /* bitmap */
@@ -296,12 +296,6 @@ static void netvsc_rescind(struct vmbus_channel *ch) {
     netvsc_signal(c);
 }
 
-static void free_buffer(uint8_t *buffer, uint32_t pages) {
-    if (!buffer) return;
-    uint64_t pa = hhdm_virt_to_phys(buffer);
-    pmm_free_contig(pa, pages);
-}
-
 static void netvsc_shutdown(struct netvsc *c) {
     struct vmbus_channel *ch = c->ch;
     if (!ch) return;
@@ -315,23 +309,9 @@ static void netvsc_shutdown(struct netvsc *c) {
     c->link_up = false;
     if (c->rx_borrowed) c->rx_completion_cancelled++;
     c->rx_borrowed = c->completion_wait = false;
-    vmbus_close_confirmed(ch);
-    /* Rescind retires channel transactions, but is not a GPADL teardown ACK.
-       Preserve shared backing on that path: a late host write must never hit
-       reallocated memory. Normal shutdown can reclaim after explicit ACKs. */
-    bool recv_safe = !c->recv_shared;
-    bool send_safe = !c->send_shared;
-    if (!ch->rescinded) {
-        if (!recv_safe && c->recv_gpadl) recv_safe = vmbus_gpadl_teardown(ch, c->recv_gpadl);
-        if (!send_safe && c->send_gpadl) send_safe = vmbus_gpadl_teardown(ch, c->send_gpadl);
-    }
-    if (recv_safe) free_buffer(c->recv_buf, RECV_BUF_PAGES);
-    else kprintf("netvsc: preserving receive pages: host mapping not retired\n");
-    if (send_safe) free_buffer(c->send_buf, SEND_BUF_PAGES);
-    else kprintf("netvsc: preserving send pages: host mapping not retired\n");
+    vmbus_close(ch);
+    /* 緩衝の一覧はバスの stop が外し、緩衝は HAL が返す（hal_release） */
     c->recv_buf = c->send_buf = NULL;
-    c->recv_gpadl = c->send_gpadl = 0;
-    c->recv_shared = c->send_shared = false;
     kfree(c->section_used);
     c->section_used = NULL;
     c->sections = 0;
@@ -585,13 +565,11 @@ static bool setup_buffers(struct netvsc *c) {
     uint32_t v[NVSP_MSG_SIZE / 4] = {NVSP_SEND_NDIS_VERSION, ndis >> 16, ndis & 0xFFFF};
     if (vmbus_send(c->ch, VM_PKT_DATA_INBAND, 0, v, sizeof v, 0)) return false;
 
-    uint64_t pa = pmm_alloc_contig(RECV_BUF_PAGES, 64);
-    if (!pa) return false;
-    c->recv_buf = phys_to_virt(pa);
+    uint64_t gpa;
     c->recv_size = RECV_BUF_PAGES * PAGE_SIZE;
-    memset(c->recv_buf, 0, c->recv_size);
-    c->recv_shared = true; /* a timeout must not make shared pages reusable */
-    uint32_t g = c->recv_gpadl = vmbus_gpadl_create(c->ch, pa, RECV_BUF_PAGES);
+    c->recv_buf = hal_dma_alloc(c->hal, c->recv_size, &gpa);
+    if (!c->recv_buf) return false;
+    uint32_t g = vmbus_gpadl_create(c->ch, gpa, RECV_BUF_PAGES);
     if (!g) return false;
     uint32_t rb[NVSP_MSG_SIZE / 4] = {NVSP_SEND_RECV_BUF, g, RECV_BUF_ID};
     if (!nvsp_request(c, rb, NVSP_SEND_RECV_BUF_COMPLETE)) return false;
@@ -600,12 +578,9 @@ static bool setup_buffers(struct netvsc *c) {
         return false;
     }
 
-    pa = pmm_alloc_contig(SEND_BUF_PAGES, 64);
-    if (!pa) return false;
-    c->send_buf = phys_to_virt(pa);
-    memset(c->send_buf, 0, SEND_BUF_PAGES * PAGE_SIZE);
-    c->send_shared = true;
-    g = c->send_gpadl = vmbus_gpadl_create(c->ch, pa, SEND_BUF_PAGES);
+    c->send_buf = hal_dma_alloc(c->hal, SEND_BUF_PAGES * PAGE_SIZE, &gpa);
+    if (!c->send_buf) return false;
+    g = vmbus_gpadl_create(c->ch, gpa, SEND_BUF_PAGES);
     if (!g) return false;
     uint32_t sb[NVSP_MSG_SIZE / 4] = {NVSP_SEND_SEND_BUF, g, SEND_BUF_ID};
     if (!nvsp_request(c, sb, NVSP_SEND_SEND_BUF_COMPLETE)) return false;
@@ -744,6 +719,8 @@ static int netvsc_attach(struct hal_device *d) {
     d->driver_data = c;
     c->nif.driver = "netvsc";
     c->ch = ch;
+    c->hal = d;
+    hal_dma_bits(d, 64); /* GPADL の頁の番号は 64 bit */
     if (vmbus_open(ch, 128 * 1024, 128 * 1024, netvsc_callback, c)) goto failed;
     vmbus_set_rescind(ch, netvsc_rescind);
     if (ch->rescinded) c->detaching = true;
