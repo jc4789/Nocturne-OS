@@ -23,10 +23,11 @@
 #define START_MS 30000
 
 /* A storage function. lock: one command at a time, and dev, which detach clears under it, so no
-   command runs on an unplugged device. */
+   command runs on an unplugged device, and stopped, which suspend sets under it. */
 struct msc {
     struct mutex lock;
     struct usb_device *dev; /* NULL once unplugged */
+    bool stopped;           /* 電源断の前に止めた：もう命令を出さない */
     struct usb_interface *node;
     uint8_t intf, in, out;
     uint32_t tag;
@@ -253,7 +254,7 @@ static int msc_transfer(struct blkdev *b, const struct blk_request *r) {
     struct lun *l = b->priv;
     struct msc *m = l->m;
     mutex_lock(&m->lock);
-    int status = !m->dev ? -N_ERR_IO : r->op == BLK_PERSIST ? flush(l) : rw(l, r);
+    int status = !m->dev || m->stopped ? -N_ERR_IO : r->op == BLK_PERSIST ? flush(l) : rw(l, r);
     mutex_unlock(&m->lock);
     return status;
 }
@@ -366,8 +367,17 @@ static void msc_detach(struct hal_device *hal) {
     hal->driver_data = NULL;
 }
 
-/* A disk would come back as a new device under a mounted filesystem after a sleep: none while one is plugged in. */
-static const char *msc_refuse(struct hal_device *hal) { return hal->driver_data ? "A USB disk is plugged in" : NULL; }
+/* 戻せない（HAL_AFTER_SLEEP_LOST）：休止の写しから戻る前に起動のカーネルが制御器を reset し、眠りの間に port の電源
+   （VBUS）が切れれば装置は reset される。どちらでもディスクは新しい装置として戻り、その上のボリュームは失われる。だから
+   suspend に来るのは電源断だけで、進行中の命令の終わりを待ち、その後の要求を断る。 */
+static bool msc_suspend(struct hal_device *hal, enum hal_power_target target) {
+    ASSERT(target == HAL_POWER_OFF);
+    struct msc *m = hal->driver_data;
+    mutex_lock(&m->lock);
+    m->stopped = true;
+    mutex_unlock(&m->lock);
+    return true;
+}
 
 /* Bulk-only (protocol 50h) with a command set that speaks SCSI (MSC Overview Table 1): not reported
    00h, RBC 01h, MMC-5 02h, SCSI transparent 06h. */
@@ -381,6 +391,7 @@ static const struct hal_driver msc_driver = {
     .rule_count = ARRAY_SIZE(msc_rules),
     .attach = msc_attach,
     .detach = msc_detach,
-    .refuse = msc_refuse,
+    .suspend = msc_suspend,
+    .after_sleep = HAL_AFTER_SLEEP_LOST,
 };
 HAL_DRIVER(msc_driver);

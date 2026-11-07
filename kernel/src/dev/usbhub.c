@@ -3,7 +3,8 @@
  * wire front panels and some rear ports through one. A USB 3 hub is two hubs in one package; its
  * SuperSpeed half shows up on a USB 3 root port and its USB 2.0 half on a USB 2 one. Everything
  * here runs on the hub's controller worker but hub_attach, which runs in its interface's attach
- * thread, and hub_report, which runs in the drain (dev/usb.h). */
+ * thread, hub_report, which runs in the drain (dev/usb.h), and usbhub_link_suspend and usbhub_link_resume,
+ * which run in the power walk's thread while the worker waits at the gate. */
 #include "kernel.h"
 #include "dev/usb.h"
 #include "hal/hal.h"
@@ -15,6 +16,7 @@
 #define C_HUB_LOCAL_POWER 0
 #define C_HUB_OVER_CURRENT 1
 #define PORT_ENABLE 1
+#define PORT_LINK_STATE 5 /* SuperSpeed：wIndex の上の byte が U 状態（USB 3.2 10.16.2.10） */
 #define PORT_RESET 4
 #define PORT_POWER 8
 #define C_PORT_CONNECTION 16
@@ -42,6 +44,8 @@
 #define PS_LOW_SPEED (1u << 9)   /* USB 2.0 only */
 #define PS_HIGH_SPEED (1u << 10) /* USB 2.0 only */
 #define PS_LINK(s) (((s) >> 5) & 15) /* SuperSpeed only */
+#define LINK_U0 0
+#define LINK_U3 3
 #define LINK_INACTIVE 6
 #define LINK_COMPLIANCE 10
 #define CH_CONNECTION (1u << 0)
@@ -73,6 +77,7 @@ struct hub {
     struct usb_port_tries *tries; /* by port, from 1 */
     struct usb_port_tries *power; /* by port, from 1: its power turned on again after an over-current */
     uint16_t *held; /* by port, from 1: changes acknowledged, not yet acted on */
+    bool *lost;     /* by port, from 1, atomic：その装置が眠りから戻らなかった（usbhub_link_resume）。hub_port が外す */
     uint32_t *pending; /* atomic words: bit p of the words, the ports whose status changed */
 };
 
@@ -187,12 +192,14 @@ bool usbhub_prepare(struct usb_device *d) {
     h->tries = kzalloc((h->ports + 1u) * sizeof *h->tries);
     h->power = kzalloc((h->ports + 1u) * sizeof *h->power);
     h->held = kzalloc((h->ports + 1u) * sizeof *h->held);
+    h->lost = kzalloc((h->ports + 1u) * sizeof *h->lost);
     h->pending = kzalloc(pending_words(h) * sizeof *h->pending);
-    if (!h->child || !h->tries || !h->power || !h->held || !h->pending) {
+    if (!h->child || !h->tries || !h->power || !h->held || !h->lost || !h->pending) {
         kfree(h->child);
         kfree(h->tries);
         kfree(h->power);
         kfree(h->held);
+        kfree(h->lost);
         kfree(h->pending);
         kfree(h);
         return false;
@@ -228,6 +235,7 @@ void usbhub_detach(struct usb_device *d) {
     kfree(h->tries);
     kfree(h->power);
     kfree(h->held);
+    kfree(h->lost);
     kfree(h->pending);
     kfree(h);
 }
@@ -274,6 +282,8 @@ static int hub_attach(struct hal_device *hal) {
 /* The devices behind the hub go with it (usb_remove), each by its own hub's worker. */
 static void hub_detach(struct hal_device *hal) { usbhub_detach(usb_interface_of(hal)->dev); }
 
+/* 眠りと休止に加わる。止めるものも戻すものも無い：hub の仕事は worker の上で門が止め、状態の変化の端点は制御器の
+   もの。下の装置の link は xhci.c が木の順に usbhub_link_suspend と usbhub_link_resume で動かす。 */
 static const struct n_hal_rule hub_rules[] = {N_USB_INTERFACE_CLASS(9)};
 static const struct hal_driver hub_driver = {
     .name = "usbhub",
@@ -281,6 +291,7 @@ static const struct hal_driver hub_driver = {
     .rule_count = ARRAY_SIZE(hub_rules),
     .attach = hub_attach,
     .detach = hub_detach,
+    .after_sleep = HAL_AFTER_SLEEP_RESUME,
 };
 HAL_DRIVER(hub_driver);
 
@@ -356,6 +367,35 @@ static bool port_reset(struct hub *h, unsigned port, bool warm, uint16_t *status
     return true;
 }
 
+/* 下りの port の link を U3 に（USB 3.2 10.16.2.10）。通らなければ装置は U0 のまま眠る：U0 を求める戻りはどの U 状態
+   からも通る。 */
+void usbhub_link_suspend(struct usb_device *hub, unsigned port) {
+    if (port_feature(hub, USB_REQ_SET_FEATURE, PORT_LINK_STATE, LINK_U3 << 8 | port) < 0)
+        kprintf("usbhub: slot %u port %u did not suspend\n", hub->slot, port);
+}
+
+/* 下りの port の link を U0 に戻し（10.16.2.10：hub は resume の信号を送る、10.10）、有効で U0 になるまで待つ。戻らない
+   port と答えない hub の port の装置は、worker が外して数え直す（hub_port の lost）。 */
+bool usbhub_link_resume(struct usb_device *hub, unsigned port) {
+    struct hub *h = hub->hub;
+    ASSERT(h);
+    bool sent = port_feature(hub, USB_REQ_SET_FEATURE, PORT_LINK_STATE, LINK_U0 << 8 | port) >= 0, up = false;
+    uint64_t deadline = clock_after(USB_U3_EXIT_NS);
+    while (sent && !up) {
+        uint16_t status, change;
+        if (!port_status(hub, port, &status, &change)) break;
+        up = (status & PS_ENABLE) && PS_LINK(status) == LINK_U0;
+        if (up || clock_now_ns() >= deadline) break;
+        sleep_until(clock_after(NS_PER_MS));
+    }
+    if (up) return true;
+    kprintf("usbhub: slot %u port %u did not wake, its device starts over\n", hub->slot, port);
+    __atomic_store_n(&h->lost[port], true, __ATOMIC_RELEASE);
+    pending_mark(h, port);
+    usb_note_work(hub);
+    return false;
+}
+
 bool usbhub_reset_port(struct usb_device *hub, unsigned port) {
     struct hub *h = hub->hub;
     uint16_t status = 0;
@@ -404,11 +444,12 @@ static bool connect_debounced(struct hub *h, unsigned port) {
     return false;
 }
 
-/* One try at a port with something at it and no device yet. */
-static void hub_port_attach(struct hub *h, unsigned port) {
+/* One try at a port with something at it and no device yet. lost：居た装置が眠りから戻らず（usbhub_link_resume）、
+   つながったまま：debounce をせず、SuperSpeed の link は warm reset から。 */
+static void hub_port_attach(struct hub *h, unsigned port, bool lost) {
     struct usb_device *d = h->dev;
     uint16_t status, change;
-    bool retry = h->tries[port].count > 1;
+    bool retry = h->tries[port].count > 1 || lost;
     if (!h->ss && !retry && !connect_debounced(h, port)) return;
     if (!port_status(d, port, &status, &change)) return;
     bool stuck = link_stuck(h, status);
@@ -443,11 +484,11 @@ static void hub_port(struct hub *h, unsigned port) {
         if (power->at && usb_port_try(power)) usb_port_failed(power, true);
         return;
     }
-    bool connected = status & PS_CONNECTION;
+    bool connected = status & PS_CONNECTION, lost = __atomic_exchange_n(&h->lost[port], false, __ATOMIC_ACQ_REL);
     if (change & CH_CONNECTION) usb_port_free(t); /* what was being tried is not what comes now */
     /* unplugged, replugged between two looks, or disabled by an error (USB 2.0 11.24.2.7.2.2):
-     * the device goes, and one still connected is enumerated afresh */
-    if (h->child[port] && (!connected || (change & CH_CONNECTION) || !(status & PS_ENABLE))) {
+     * the device goes, and one still connected is enumerated afresh. 眠りから戻らなかった装置も */
+    if (h->child[port] && (lost || !connected || (change & CH_CONNECTION) || !(status & PS_ENABLE))) {
         struct usb_device *gone = h->child[port];
         h->child[port] = NULL;
         usb_remove(gone);
@@ -473,7 +514,7 @@ static void hub_port(struct hub *h, unsigned port) {
     bool stuck = link_stuck(h, status);
     if (!connected && !stuck) usb_port_free(t);
     if ((!connected && !stuck) || h->child[port] || removed_hub(h) || !usb_port_try(t)) return;
-    hub_port_attach(h, port);
+    hub_port_attach(h, port, lost);
     if (h->child[port] || removed_hub(h)) {
         usb_port_free(t);
     } else if (port_status(d, port, &status, &change)) {

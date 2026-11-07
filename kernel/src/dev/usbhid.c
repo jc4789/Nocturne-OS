@@ -43,6 +43,7 @@ struct hid {
     struct input_device input;
     char *input_id;
     struct spinlock lock;
+    bool asleep;          /* under lock：suspend から resume まで、来た報告を捨てる */
     uint8_t interface;
     bool ids;             /* reports start with a report ID byte */
     bool keyboard, mouse;
@@ -297,6 +298,10 @@ static void hid_report(struct usb_device *d, void *ctx, const uint8_t *data, uns
     struct hid *h = ctx;
     bool caps = false;
     uint64_t f = spin_lock(&h->lock);
+    if (h->asleep) {
+        spin_unlock(&h->lock, f);
+        return;
+    }
     if (data) {
         memcpy(h->partial + h->partial_len, data, len);
         unsigned have = h->partial_len + len;
@@ -556,6 +561,29 @@ static void boot_keyboard(struct hid *h) {
     h->led_len = 1;
 }
 
+/* 報告を止め（asleep）、押されたキーとボタンを離し、途中の報告と repeat を捨てる。離したことは錠の外で入力の層へ
+   言う。 */
+static void hid_release_all(struct hid *h) {
+    uint32_t down[8];
+    uint64_t f = spin_lock(&h->lock);
+    h->asleep = true;
+    h->repeat_usage = 0; /* or a repeat that is firing sets itself again */
+    h->partial_len = 0;
+    memcpy(down, h->down, sizeof down);
+    memset(h->down, 0, sizeof h->down);
+    bool buttons = h->mouse && h->buttons;
+    h->buttons = 0;
+    spin_unlock(&h->lock, f);
+    alarm_cancel(&h->repeat);
+    uint64_t now = clock_now_ns();
+    for (unsigned u = 0; u < 256; u++)
+        if (is_down(down, u)) send_usage(h, u, false, now);
+    if (buttons) {
+        struct mouse_event e = {.time_ns = now};
+        input_mouse(&h->input, &e);
+    }
+}
+
 /* Its held keys and buttons let go, its input device removed, its state freed. No report comes any more:
    the device was removed (usb_remove), or its reports never started. */
 static void hid_drop(struct hid *h) {
@@ -566,17 +594,7 @@ static void hid_drop(struct hid *h) {
             break;
         }
     spin_unlock(&hids_lock, f);
-    f = spin_lock(&h->lock);
-    h->repeat_usage = 0; /* or a repeat that is firing sets itself again */
-    spin_unlock(&h->lock, f);
-    alarm_cancel(&h->repeat);
-    uint64_t now = clock_now_ns();
-    for (unsigned u = 0; u < 256; u++)
-        if (is_down(h->down, u)) send_usage(h, u, false, now);
-    if (h->mouse && h->buttons) {
-        struct mouse_event e = {.time_ns = now};
-        input_mouse(&h->input, &e);
-    }
+    hid_release_all(h);
     if (h->input_id) input_device_remove(&h->input);
     kfree(h->input_id);
     kfree(h->keys);
@@ -716,6 +734,23 @@ static void hid_work(struct usb_interface *node) {
     kfree(report);
 }
 
+/* 眠りの間はキーもボタンも押されていない：入力の層に押されたままのものを残さず、来た報告は捨てる。中断した装置は
+   protocol、idle、LED の出力を持つ（USB 2.0 9.1.1.6）ので、戻りでは報告を受けるだけ。押されたままのキーは次の報告が
+   押したと言う。電源を失った装置は外れて新しく attach する。 */
+static bool hid_suspend(struct hal_device *hal, enum hal_power_target target) {
+    (void)target;
+    hid_release_all(hal->driver_data);
+    return true;
+}
+
+static bool hid_resume(struct hal_device *hal) {
+    struct hid *h = hal->driver_data;
+    uint64_t f = spin_lock(&h->lock);
+    h->asleep = false;
+    spin_unlock(&h->lock, f);
+    return true;
+}
+
 static const struct n_hal_rule hid_rules[] = {N_USB_INTERFACE_CLASS(3)};
 static const struct hal_driver hid_driver = {
     .name = "usbhid",
@@ -723,5 +758,8 @@ static const struct hal_driver hid_driver = {
     .rule_count = ARRAY_SIZE(hid_rules),
     .attach = hid_attach,
     .detach = hid_detach,
+    .suspend = hid_suspend,
+    .resume = hid_resume,
+    .after_sleep = HAL_AFTER_SLEEP_RESUME,
 };
 HAL_DRIVER(hid_driver);
