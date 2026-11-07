@@ -377,6 +377,11 @@ void hda_codec_power(struct hda_codec *codec, const struct hda_output *outputs, 
         if (o->announces) verb(o->group, o->pin->nid, VERB12(SET_UNSOLICITED, 0x80 | (tag & 0x3F)));
 }
 
+/* PS-Set の D3 は 011b（表 83）。group の widget の実の状態は group の状態より上にならない（7.3.3.10）。 */
+void hda_codec_sleep(struct hda_codec *codec) {
+    for (struct hda_group *g = codec->groups; g; g = g->next) verb(g, g->nid, VERB12(SET_POWER, 3));
+}
+
 /* ---- sensing ---- */
 
 /* ELD (7.3.3.34): the connection type and the monitor's name, when the sink's is valid. */
