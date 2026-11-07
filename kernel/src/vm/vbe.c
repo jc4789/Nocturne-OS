@@ -11,7 +11,7 @@
    それを読むので、フリップはその登録への書込みで、画面は枠の半分を見せない。模倣器には垂直帰線の割り込みが無い：
    画面の拍は EDID の好みのタイミングの拍（枠はそれで進む）で、フリップは登録を書いた時に見えたと数える。
 
-   電源。装置に DMA も割り込みも無い。電源の walk の間（hal/hal.h）、描画の道のうち実装が持つのはフリップの登録の
+   電源。装置に DMA も割り込みも無い。電源の walk の間（io/io.h）、描画の道のうち実装が持つのはフリップの登録の
    書込みだけで、suspend から resume までは書かずに覚え、resume が最後のものを出してから見えたと言う。枠の画素は画面の
    層が表示のメモリーへ直に書く：D3hot の装置は届いた書込みを捨てるだけで、戻りの後に pm が画面を全部描き直す
    （screen_display->repaint）。電源を失った装置は登録を初めの値に戻しているので、resume はモードを設定し直す。 */
@@ -20,7 +20,7 @@
 #include "arch/spin.h"
 #include "dev/fb.h"
 #include "dev/pci.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/heap.h"
 #include "mm/vmalloc.h"
 #include "mm/vmm.h"
@@ -40,7 +40,7 @@ enum { VBE_ID, VBE_XRES, VBE_YRES, VBE_BPP, VBE_ENABLE, VBE_BANK, VBE_VIRT_WIDTH
 /* 錠：vbe_lock は葉。フリップ（窓の合成の thread）と、suspend・resume（電源の walk の thread）の間で、asleep と
    覚えたフリップと shown を守り、ポートの番号とデータの組の書込みを一つにする。 */
 struct vbe {
-    volatile uint8_t *mmio; /* BAR 2（hal_map）。NULL：番号とデータのポート */
+    volatile uint8_t *mmio; /* BAR 2（io_map）。NULL：番号とデータのポート */
     uint8_t *vram;          /* 両方の緩衝。write-combined */
     size_t vram_pages;
     struct screen *screen;
@@ -142,9 +142,9 @@ static bool vbe_mode_set(struct vbe *v) {
 
 /* 一つの画面：その登録、そのモード（firmware が出したものはそのモード、ほかは EDID の好み）、その緩衝、それを見せる
    画面（firmware のものは画面 0）。 */
-static int vbe_attach(struct hal_device *d) {
+static int vbe_attach(struct io_device *d) {
     struct pci_device *pci = pci_device_of(d);
-    const struct n_hal_resource *memory = hal_resource(d, N_HAL_MEMORY, 0);
+    const struct n_hal_resource *memory = io_resource(d, N_HAL_MEMORY, 0);
     if (!memory) return -N_ERR_UNSUPPORTED;
     struct vbe *v = kzalloc(sizeof *v);
     if (!v) return -N_ERR_NO_MEMORY;
@@ -152,9 +152,9 @@ static int vbe_attach(struct hal_device *d) {
     bool legacy_only = pci->vendor == 0x80EE;
     uint64_t vram = memory->base, vram_size = memory->size;
     bool firmware = fb.addr && fb.phys >= vram && fb.phys < vram + vram_size;
-    const struct n_hal_resource *registers = hal_resource(d, N_HAL_MEMORY, 2);
+    const struct n_hal_resource *registers = io_resource(d, N_HAL_MEMORY, 2);
     if (!legacy_only && registers && registers->size >= MMIO_BYTES) {
-        v->mmio = hal_map(d, 2);
+        v->mmio = io_map(d, 2);
         if (!v->mmio) {
             why = -N_ERR_NO_MEMORY;
             goto fail;
@@ -163,7 +163,7 @@ static int vbe_attach(struct hal_device *d) {
     if (!v->mmio && !firmware) goto fail; /* ポートで届くのは出ている一つだけ */
     uint16_t id = vbe_read(v, VBE_ID);
     if (id < 0xB0C0 || id > 0xB0CF) goto fail;
-    hal_enable(d, HAL_ENABLE_MEMORY);
+    io_enable(d, IO_ENABLE_MEMORY);
     struct screen_mode_desc m = {0};
     uint32_t pref_w, pref_h;
     if (firmware) {
@@ -221,7 +221,7 @@ fail:
 }
 
 /* フリップの登録を書かなくなる。止める DMA も割り込みも無い。 */
-static bool vbe_suspend(struct hal_device *d, enum hal_power_target target) {
+static bool vbe_suspend(struct io_device *d, enum io_power_target target) {
     (void)target;
     struct vbe *v = d->driver_data;
     uint64_t f = spin_lock(&v->vbe_lock);
@@ -232,7 +232,7 @@ static bool vbe_suspend(struct hal_device *d, enum hal_power_target target) {
 
 /* モードを設定し直し、眠りの間に頼まれた最後のフリップか、前に見せていた緩衝を出す。電源を保った装置にも同じことを
    する（設定し直しは同じ値を書く）。 */
-static bool vbe_resume(struct hal_device *d) {
+static bool vbe_resume(struct io_device *d) {
     struct vbe *v = d->driver_data;
     bool ok = vbe_mode_set(v);
     uint64_t f = spin_lock(&v->vbe_lock);
@@ -247,18 +247,18 @@ static bool vbe_resume(struct hal_device *d) {
     if (waiting) screen_flipped(v->screen, buffer, serial, clock_now_ns());
     if (ok) return true;
     kprintf("video: emulated display %s did not take its mode again\n", d->location);
-    hal_failed(d, -N_ERR_IO);
+    io_failed(d, -N_ERR_IO);
     return false;
 }
 
 static const struct n_hal_rule vbe_rules[] = {N_PCI_ID_CLASS(0x1234, 0x1111, 0x03, 0x00),
                                               N_PCI_ID_CLASS(0x80EE, 0xBEEF, 0x03, 0x00)};
-const struct hal_driver vbe_driver = {
+const struct io_driver vbe_driver = {
     .name = "vbe",
     .rules = vbe_rules,
     .rule_count = ARRAY_SIZE(vbe_rules),
     .attach = vbe_attach,
     .suspend = vbe_suspend,
     .resume = vbe_resume,
-    .after_sleep = HAL_AFTER_SLEEP_RESUME,
+    .after_sleep = IO_AFTER_SLEEP_RESUME,
 };

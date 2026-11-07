@@ -34,7 +34,7 @@
 | `sys/log.c`・`panic.c`・`stream.c`・`prof.c` | log の ring buffer、panic の報告、console（文字を出し、窓の管理が無い機械のキーの押下を渡す）と system log の stream、profiler。 |
 | `sys/settings.c` | 設定の門。領域と鍵の番号の表で持ち主へ渡す（`SYS_SETTINGS_*`、番号は `common/settings_abi.h`）。カーネルは保存しない。 |
 | `fs/` | C: の store の実行側。mount とパスの操作とパスの権限は `store.c`、開いた文書と私的な領域は `document.c`、block cache は `cache.c`、変更の watch は `watch.c`、起動の記録 `settings.rec` は `bootrecord.c`。書式のエンジンは `common/store/`。 |
-| `hal/` | HAL。`hal.h` が唯一の口。`device.c`（装置の木、性質、台帳の読出し）、`bind.c`（実装の一覧、規則の照合、装置ごとの attach の thread、電源の門）、`resource.c`（資源、割り込み、DMA のメモリー）、`power.c`（電源の walk：段ごとの止めると戻す、装置の D 状態、実装に渡る前の D0）、`claim.c`（プロセスの実装）。形は `docs/hal.md`。 |
+| `io/` | 装置の管理者。`io.h` が唯一の口。`device.c`（装置の木、性質、台帳の読出し）、`bind.c`（実装の一覧、規則の照合、装置ごとの attach の thread、電源の門）、`resource.c`（資源、割り込み）、`dma.c`（DMA の幅、長く使うメモリー、訳の領域の止めと始め）、`power.c`（電源の walk：段ごとの止めると戻す、装置の D 状態、実装に渡る前の D0）、`claim.c`（プロセスの実装）。形は `docs/hal.md`。 |
 | `dev/acpi_devices.c` | ACPI の名前空間の装置を HAL のバスにする（`_HID`、`_CID`、`_CRS`、`_DEP`）。 |
 | `dev/acpi_claim.c` | 持たれた装置の ACPI の記述（`SYS_HAL_ACPI_EVAL`・`SYS_HAL_ACPI_NOTIFY_TAKE`）：装置の節、その子、木で上の装置の節。バスを問わない。 |
 | `dev/acpi_power.c` | ACPI の装置の電源（HAL の firmware の方法）：`_PS0`・`_PS3`・`_PSC` と、`_PR0` の電源資源の参照の数と順。S3 の後の資源の入れ直し。 |
@@ -114,7 +114,7 @@
 ## 境界
 
 - syscall の番号と型は `common/abi.h`。画面と GPU は `display_abi.h` と `gpu_abi.h`。
-- プロセスのドライバーは `SYS_HAL_*`・`SYS_DMA_*` から `hal/claim.c` へ。バスだけの操作は `n_hal_bus_call` から `struct hal_claim_ops`（PCI は `dev/pciuser.c`）へ。claim は `N_CAP_HAL_CLAIM` の能力で行い、持つのはサービスの管理者 `user/apps/services.c` だけ。管理者は台帳を見張り、空いた装置のうち宣言の規則（`struct n_hal_rule`）に合うものごとに claim を取り、装置ごとのサービス（`gpu` の `nvrm` など）を起こして handle `N_SERVICE_HANDLE_DEVICE` で渡す。装置が去れば止める。claim の ACPI の記述は `dev/acpi_claim.c`（`SYS_HAL_ACPI_*`）、画面の保持は `dev/screen_driver.c`（`SYS_SCREEN_HOLD`）。
+- プロセスのドライバーは `SYS_HAL_*`・`SYS_DMA_*` から `io/claim.c` へ。バスだけの操作は `n_hal_bus_call` から `struct io_claim_ops`（PCI は `dev/pciuser.c`）へ。claim は `N_CAP_HAL_CLAIM` の能力で行い、持つのはサービスの管理者 `user/apps/services.c` だけ。管理者は台帳を見張り、空いた装置のうち宣言の規則（`struct n_hal_rule`）に合うものごとに claim を取り、装置ごとのサービス（`gpu` の `nvrm` など）を起こして handle `N_SERVICE_HANDLE_DEVICE` で渡す。装置が去れば止める。claim の ACPI の記述は `dev/acpi_claim.c`（`SYS_HAL_ACPI_*`）、画面の保持は `dev/screen_driver.c`（`SYS_SCREEN_HOLD`）。
 - 特権は能力の handle か身元の級で確かめる（`sys/authority.h`）。境界の検査は `tests/check_boundaries.py`。
 - VM の処理は `kernel/src/vm/vm.h` が唯一の入口。実機では何もせずに戻る。裏に `hyperv.c`、`hv/`（VMBus、storvsc、netvsc）、`rdp.c`、VM の装置（ata、ac97、e1000、tulip、vbe）、`virtio_gpu.c` がある。`vm/` の外は `vm/vm.h` だけを include する。
 - syscall の道：

@@ -9,7 +9,7 @@
  * roots. Paged memory has no pages of its own (mm/pager.c). A program's segments are demand objects
  * read from a document (mm/program.c).
  *
- * Drivers in apps (hal/claim.c): DMA objects are RAM or an owned range whose bus addresses
+ * Drivers in apps (io/claim.c): DMA objects are RAM or an owned range whose bus addresses
  * n_dma_addresses reports. Device memory and DMA objects hold their claim. A device memory object dies with
  * the claim's end (shared_revoke_claim). Where an IOMMU isolates the function, a DMA object's
  * pages are in its domain from creation until release, which returns them once the IOMMU confirmed
@@ -62,7 +62,7 @@
 #include "mm/pmm.h"
 #include "mm/vmalloc.h"
 #include "dev/fb.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "sys/log.h"
 #include "sys/thread.h"
 
@@ -291,7 +291,7 @@ struct shared_pages *shared_leaf(struct shared_pages *p, size_t *index, uint8_t 
     if (p->dma) *cache = __atomic_load_n(&p->cache, __ATOMIC_ACQUIRE);
     return p;
 }
-static bool range_gone(const struct shared_pages *p) { return p->kind == SHARED_RANGE && !p->owned && hal_claim_revoked(p->claim); }
+static bool range_gone(const struct shared_pages *p) { return p->kind == SHARED_RANGE && !p->owned && io_claim_revoked(p->claim); }
 bool shared_device_gone(struct shared_pages *p) {
     struct shared_pages *root = shared_root(p);
     if (root->kind != SHARED_COMPOSITE) return range_gone(root);
@@ -409,13 +409,13 @@ void shared_release(struct object *o) {
         spin_give(&part->lock);
     }
     if (p->claim_link.pprev) {
-        struct shared_claim *c = hal_claim_shared(p->claim);
+        struct shared_claim *c = io_claim_shared(p->claim);
         mutex_lock(&c->lock);
         link_del(&p->claim_link);
         mutex_unlock(&c->lock);
     }
-    bool keep = p->dma && (!hal_claim_dma_unmap(p->claim, p->kind == SHARED_RAM ? p->pages : NULL, p->base, p->count) ||
-                           !hal_claim_dma_reusable(p->claim)); /* the device may still write there */
+    bool keep = p->dma && (!io_claim_dma_unmap(p->claim, p->kind == SHARED_RAM ? p->pages : NULL, p->base, p->count) ||
+                           !io_claim_dma_reusable(p->claim)); /* the device may still write there */
     if (keep) kprintf("[dma] %lu pages stay out of use: their device may still reach them\n", (unsigned long)p->count);
     else if (p->dma && p->cache != N_CACHE_WRITE_BACK)
         vmm_direct_type(p->kind == SHARED_RAM ? p->pages : NULL, p->base, p->count, 0);
@@ -433,7 +433,7 @@ void shared_release(struct object *o) {
     for (size_t i = 0; i < p->part_count; i++) object_unref(p->parts[i].object);
     kfree(p->parts);
     scope_drop(p->scope);
-    hal_claim_drop(p->claim);
+    io_claim_drop(p->claim);
     handle_close(p->source);
     kfree(p);
 }
@@ -525,15 +525,15 @@ int64_t shared_kernel_handle(struct object *o) {
 }
 
 int64_t shared_hal_memory(struct handle *h, uint32_t slot, struct handle **out) {
-    struct hal_claim *claim = hal_claim_hold(h);
+    struct io_claim *claim = io_claim_hold(h);
     if (!claim) return -N_ERR_WRONG_KIND;
     uint64_t address = 0, size = 0;
     bool prefetchable = false;
-    int64_t r = hal_claim_memory(claim, slot, &address, &size, &prefetchable);
+    int64_t r = io_claim_memory(claim, slot, &address, &size, &prefetchable);
     if (r >= 0 && size > SIZE_MAX) r = -N_ERR_TOO_LARGE;
     struct shared_pages *p = r < 0 ? NULL : shared_new(size, SHARED_RANGE, 0);
     if (!p) {
-        hal_claim_drop(claim);
+        io_claim_drop(claim);
         return r < 0 ? r : -N_ERR_NO_MEMORY;
     }
     p->wc_allowed = prefetchable;
@@ -541,22 +541,22 @@ int64_t shared_hal_memory(struct handle *h, uint32_t slot, struct handle **out) 
     p->base = address;
     p->count = size / PAGE_SIZE;
     p->cache = N_CACHE_UNCACHED;
-    struct shared_claim *c = hal_claim_shared(claim);
+    struct shared_claim *c = io_claim_shared(claim);
     mutex_lock(&c->lock);
     link_add(&c->ranges, &p->claim_link, p);
     mutex_unlock(&c->lock);
     return shared_open(p, HANDLE_WRITE, out);
 }
 int64_t shared_dma_create(struct handle *h, size_t bytes, uint32_t flags, struct handle **out) {
-    struct hal_claim *claim = hal_claim_hold(h);
+    struct io_claim *claim = io_claim_hold(h);
     if (!claim) return -N_ERR_WRONG_KIND;
     int64_t r = 0;
-    unsigned dma_bits = hal_claim_dma_bits(claim);
+    unsigned dma_bits = io_claim_dma_bits(claim);
     if (!dma_bits) r = -N_ERR_UNSUPPORTED; /* its bus lets no device reach memory */
     else if (flags & ~(N_DMA_CONTIGUOUS | N_DMA_32BIT) || !bytes || bytes > SIZE_MAX - (PAGE_SIZE - 1)) r = -N_ERR_INVALID;
     else if (ALIGN_UP(bytes, PAGE_SIZE) / PAGE_SIZE > pmm_free_pages()) r = -N_ERR_NO_MEMORY;
     if (r < 0) {
-        hal_claim_drop(claim);
+        io_claim_drop(claim);
         return r;
     }
     bytes = ALIGN_UP(bytes, PAGE_SIZE);
@@ -566,12 +566,12 @@ int64_t shared_dma_create(struct handle *h, size_t bytes, uint32_t flags, struct
     if (flags & N_DMA_CONTIGUOUS) {
         uint64_t base = pmm_alloc_contig(count, bits);
         if (!base) {
-            hal_claim_drop(claim);
+            io_claim_drop(claim);
             return -N_ERR_NO_MEMORY;
         }
         if (!(p = shared_new(bytes, SHARED_RANGE, 0))) {
             pmm_free_contig(base, count);
-            hal_claim_drop(claim);
+            io_claim_drop(claim);
             return -N_ERR_NO_MEMORY;
         }
         p->claim = claim;
@@ -581,7 +581,7 @@ int64_t shared_dma_create(struct handle *h, size_t bytes, uint32_t flags, struct
         p->owned = true;
     } else {
         if (!(p = shared_new(bytes, SHARED_RAM, count))) {
-            hal_claim_drop(claim);
+            io_claim_drop(claim);
             return -N_ERR_NO_MEMORY;
         }
         p->claim = claim;
@@ -596,7 +596,7 @@ int64_t shared_dma_create(struct handle *h, size_t bytes, uint32_t flags, struct
         }
     }
     p->dma = true;
-    if (!hal_claim_dma_map(claim, p->kind == SHARED_RAM ? p->pages : NULL, p->base, p->count)) {
+    if (!io_claim_dma_map(claim, p->kind == SHARED_RAM ? p->pages : NULL, p->base, p->count)) {
         shared_release(&p->object);
         return -N_ERR_NO_MEMORY;
     }
@@ -817,7 +817,7 @@ void shared_withdraw(struct shared_pages *p, uint64_t offset, uint64_t bytes, bo
    mapping and taking one down come here. */
 struct device_pin {
     struct device_pin *next;
-    const struct hal_claim *claim;
+    const struct io_claim *claim;
     uint64_t start, end;
     size_t refs;
     uint8_t cache;
@@ -870,7 +870,7 @@ static size_t device_segments(struct shared_pages *p) {
     }
     return n;
 }
-static bool device_pin(const struct hal_claim *claim, uint64_t start, uint64_t end, uint8_t cache, struct pin_work *w) {
+static bool device_pin(const struct io_claim *claim, uint64_t start, uint64_t end, uint8_t cache, struct pin_work *w) {
     uint64_t screen = ALIGN_DOWN(fb.phys, PAGE_SIZE), screen_end = ALIGN_UP(fb.phys + (uint64_t)fb.pitch * fb.height, PAGE_SIZE);
     uint8_t other = fb.addr && start < screen_end && screen < end && cache != N_CACHE_WRITE_COMBINE ?
                     N_CACHE_WRITE_COMBINE : N_CACHE_DEFAULT;
@@ -902,7 +902,7 @@ static bool device_pin(const struct hal_claim *claim, uint64_t start, uint64_t e
     spin_give(&device_pin_lock);
     return ok;
 }
-static void device_unpin(const struct hal_claim *claim, uint64_t start, uint64_t end, uint8_t cache, struct pin_work *w) {
+static void device_unpin(const struct io_claim *claim, uint64_t start, uint64_t end, uint8_t cache, struct pin_work *w) {
     spin_take(&device_pin_lock);
     for (struct device_pin **link = &device_pins; *link; link = &(*link)->next) {
         struct device_pin *d = *link;
@@ -916,7 +916,7 @@ static void device_unpin(const struct hal_claim *claim, uint64_t start, uint64_t
         return;
     }
     spin_give(&device_pin_lock);
-    ASSERT(hal_claim_revoked(claim)); /* its pins went with the claim */
+    ASSERT(io_claim_revoked(claim)); /* its pins went with the claim */
 }
 /* Pins (add) or unpins the type of the first `limit` device segments p maps. Adding stops at a
    segment whose pages have another type, or without a record for it (w->error); the return is the
@@ -944,7 +944,7 @@ static int64_t shared_device_pin(struct shared_pages *p, struct pin_work *w) {
     return w->error;
 }
 static void shared_device_unpin(struct shared_pages *p, struct pin_work *w) { device_pins_walk(p, false, SIZE_MAX, w); }
-static void device_pins_drop(const struct hal_claim *claim, struct pin_work *w) {
+static void device_pins_drop(const struct io_claim *claim, struct pin_work *w) {
     spin_take(&device_pin_lock);
     for (struct device_pin **link = &device_pins; *link;) {
         struct device_pin *d = *link;
@@ -960,7 +960,7 @@ static void device_pins_drop(const struct hal_claim *claim, struct pin_work *w) 
 /* The screen drawn into a driver's surface (mm/shared.h). It counts as a mapping of the surface:
    its pages keep their type while the screen is there, and a DMA object's type stays fixed. A view
    or root of a BAR or a DMA object: one root. */
-int64_t shared_scanout_open(struct handle *surface, const struct hal_claim *claim, uint64_t offset, uint64_t bytes,
+int64_t shared_scanout_open(struct handle *surface, const struct io_claim *claim, uint64_t offset, uint64_t bytes,
                             struct shared_scanout *out) {
     struct shared_pages *p = shared_of(surface);
     if (!p) return -N_ERR_WRONG_KIND;
@@ -1039,11 +1039,11 @@ static void withdraw_with_derived(struct shared_pages *p) {
         }
     }
 }
-/* The claim ended (hal/claim.c marked it released before): every mapping that reaches its
+/* The claim ended (io/claim.c marked it released before): every mapping that reaches its
    device's ranges loses their pages, one being built fails, and the pins go. A fault there finds
    the claim released and maps gone_device_page. */
-void shared_revoke_claim(struct hal_claim *claim) {
-    struct shared_claim *c = hal_claim_shared(claim);
+void shared_revoke_claim(struct io_claim *claim) {
+    struct shared_claim *c = io_claim_shared(claim);
     mutex_lock(&revoke_mutex);
     for (;;) {
         struct shared_pages *range = NULL;
@@ -1373,7 +1373,7 @@ again:
             if (slept) *slept = true;
             goto again;
         }
-        if (leaf->kind == SHARED_RANGE && !leaf->owned && hal_claim_revoked(leaf->claim)) {
+        if (leaf->kind == SHARED_RANGE && !leaf->owned && io_claim_revoked(leaf->claim)) {
             if (write && !(flags & PTE_W)) break;
             uint64_t stand_in = __atomic_load_n(&gone_device_page, __ATOMIC_ACQUIRE);
             if (!stand_in) {

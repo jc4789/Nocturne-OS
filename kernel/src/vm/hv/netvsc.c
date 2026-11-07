@@ -5,7 +5,7 @@
    which we must complete so it can reuse the space); we copy ones we send into a section of the
    send buffer and tell the host which section (it completes that packet when done with it). */
 #include "kernel.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "abi.h"
 #include "arch/cpu.h"
 #include "vm/hv/vmbus.h"
@@ -109,10 +109,10 @@ struct netvsc {
     struct netif nif; /* first: self is the device */
     struct netvsc *next; /* the adapters that are up (netvsc_ip) */
     struct vmbus_channel *ch;
-    struct hal_device *hal;
+    struct io_device *hal;
     uint32_t nvsp_version;
-    /* host と分ける緩衝。HAL の DMA の口で取り、手放さない：装置が外れた後、バスが host はもう持たないと答えた時に
-       HAL が返す（vmbus.h の vmbus_gpadl_create） */
+    /* host と分ける緩衝。装置の管理者の DMA の口で取り、手放さない：装置が外れた後、バスが host はもう持たないと答えた時に
+       装置の管理者が返す（vmbus.h の vmbus_gpadl_create） */
     uint8_t *recv_buf, *send_buf;
     uint32_t recv_size;
     uint32_t section_size, sections;
@@ -310,7 +310,7 @@ static void netvsc_shutdown(struct netvsc *c) {
     if (c->rx_borrowed) c->rx_completion_cancelled++;
     c->rx_borrowed = c->completion_wait = false;
     vmbus_close(ch);
-    /* 緩衝の一覧はバスの stop が外し、緩衝は HAL が返す（hal_release） */
+    /* 緩衝の一覧はバスの stop が外し、緩衝は装置の管理者が返す（io_release） */
     c->recv_buf = c->send_buf = NULL;
     kfree(c->section_used);
     c->section_used = NULL;
@@ -567,7 +567,7 @@ static bool setup_buffers(struct netvsc *c) {
 
     uint64_t gpa;
     c->recv_size = RECV_BUF_PAGES * PAGE_SIZE;
-    c->recv_buf = hal_dma_alloc(c->hal, c->recv_size, &gpa);
+    c->recv_buf = io_dma_alloc(c->hal, c->recv_size, &gpa);
     if (!c->recv_buf) return false;
     uint32_t g = vmbus_gpadl_create(c->ch, gpa, RECV_BUF_PAGES);
     if (!g) return false;
@@ -578,7 +578,7 @@ static bool setup_buffers(struct netvsc *c) {
         return false;
     }
 
-    c->send_buf = hal_dma_alloc(c->hal, SEND_BUF_PAGES * PAGE_SIZE, &gpa);
+    c->send_buf = io_dma_alloc(c->hal, SEND_BUF_PAGES * PAGE_SIZE, &gpa);
     if (!c->send_buf) return false;
     g = vmbus_gpadl_create(c->ch, gpa, SEND_BUF_PAGES);
     if (!g) return false;
@@ -712,7 +712,7 @@ static void live_remove(struct netvsc *c) {
     spin_unlock(&live_lock, f);
 }
 
-static int netvsc_attach(struct hal_device *d) {
+static int netvsc_attach(struct io_device *d) {
     struct vmbus_channel *ch = vmbus_channel_of(d);
     struct netvsc *c = kzalloc(sizeof *c);
     if (!c) return -N_ERR_NO_MEMORY;
@@ -720,7 +720,7 @@ static int netvsc_attach(struct hal_device *d) {
     c->nif.driver = "netvsc";
     c->ch = ch;
     c->hal = d;
-    hal_dma_bits(d, 64); /* GPADL の頁の番号は 64 bit */
+    io_dma_bits(d, 64); /* GPADL の頁の番号は 64 bit */
     if (vmbus_open(ch, 128 * 1024, 128 * 1024, netvsc_callback, c)) goto failed;
     vmbus_set_rescind(ch, netvsc_rescind);
     if (ch->rescinded) c->detaching = true;
@@ -768,7 +768,7 @@ failed:
 
 /* The host withdrew the channel (or the device is removed): the stack stops calling first, then the
    channel closes. */
-static void netvsc_detach(struct hal_device *d) {
+static void netvsc_detach(struct io_device *d) {
     struct netvsc *c = d->driver_data;
     live_remove(c);
     net_unregister(&c->nif);
@@ -778,7 +778,7 @@ static void netvsc_detach(struct hal_device *d) {
 }
 
 static const struct n_hal_rule netvsc_rules[] = {N_VMBUS_TYPE(net_guid.b)};
-const struct hal_driver netvsc_driver = {
+const struct io_driver netvsc_driver = {
     .name = "netvsc",
     .rules = netvsc_rules,
     .rule_count = ARRAY_SIZE(netvsc_rules),

@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "kernel.h"
-#include "hal/hal.h"
+#include "io/io.h"
 struct pci_reset;
 struct pci_saved;
 struct irq;
@@ -56,14 +56,14 @@ struct pci_device {
     struct iommu_irt *irt;
     uint32_t *irte;
     unsigned irte_room;
-    bool kernel_owned; /* a kernel driver enabled it (pci_enable_busmaster, hal_enable): no app may claim it */
-    /* Its place in the device tree (hal/hal.h): the function is a HAL device of bus N_BUS_PCI, whose
+    bool kernel_owned; /* a kernel driver enabled it (pci_enable_busmaster, io_enable): no app may claim it */
+    /* Its place in the device tree (io/io.h): the function is a device manager device of bus N_BUS_PCI, whose
        implementation reaches it through pci_device_of, below its bridge, or on a root bus below its
        host bridge. The bus operations are pci_bus_ops. */
-    struct hal_device hal;
-    bool published;     /* hal_publish done (pci_init) */
-    struct irq *intx;   /* its INTx line where hal_irq_enable found no message (pci.c) */
-    bool no_messages;   /* hal_irq_enable gives INTx, not a message: set by whoever has the function in a
+    struct io_device hal;
+    bool published;     /* io_publish done (pci_init) */
+    struct irq *intx;   /* its INTx line where io_irq_enable found no message (pci.c) */
+    bool no_messages;   /* io_irq_enable gives INTx, not a message: set by whoever has the function in a
                            claim's domain, whose interrupt table is the claimed function's (dev/iommu.h) */
     /* claim の組の客として動く domain（dev/iommu.c の iommu_guests_start）：DMA のメモリーはそこに写る（pci.c の
        dma_map）。NULL：訳されずに通る */
@@ -85,22 +85,22 @@ struct pci_device {
     /* A Downstream Port: a configuration written back changed the Common Clock Configuration of
        the device below since its link trained, which takes effect once the link retrains (pci.c) */
     bool retrain;
-    /* 電源の状態（pci.c、hal_bus_ops.power）。saved は列挙のときと D3hot の前と眠りの前に取った構成で、D0 の後と
-       眠りの後に戻す。power は HAL が移した状態（HAL_D3COLD は電源を失ったという知らせ）。 */
+    /* 電源の状態（pci.c、io_bus_ops.power）。saved は列挙のときと D3hot の前と眠りの前に取った構成で、D0 の後と
+       眠りの後に戻す。power は装置の管理者が移した状態（IO_D3COLD は電源を失ったという知らせ）。 */
     struct pci_saved *saved;
-    enum hal_power_state power;
+    enum io_power_state power;
 };
-/* The PCI function a HAL device of bus N_BUS_PCI is. */
-static inline struct pci_device *pci_device_of(struct hal_device *d) {
+/* The PCI function a device manager device of bus N_BUS_PCI is. */
+static inline struct pci_device *pci_device_of(struct io_device *d) {
     ASSERT(d->bus == N_BUS_PCI);
     return (struct pci_device *)((char *)d - offsetof(struct pci_device, hal));
 }
 /* The bus operations of a PCI function, and what the process that claims one calls (dev/pciuser.c). */
-extern const struct hal_bus_ops pci_bus_ops;
-extern const struct hal_claim_ops pci_claim_ops;
+extern const struct io_bus_ops pci_bus_ops;
+extern const struct io_claim_ops pci_claim_ops;
 
 void pci_config_init(void); /* the MCFG's windows, before anything may reach another segment (AML) */
-void pci_init(void); /* 列挙して HAL に載せる（hal_publish）。実装は hal_start が結ぶ。hal_init の後に呼ぶ */
+void pci_init(void); /* 列挙して装置の管理者に載せる（io_publish）。実装は io_start が結ぶ。io_init の後に呼ぶ */
 /* Config space access. offsets are 0..4095. Segment 0 below 256: CF8/CFC or ECAM; everything else
    ECAM only (an unreachable register reads as 0xFFFFFFFF and ignores writes). */
 uint32_t pci_read32(struct pci_address a, uint16_t off);
@@ -286,8 +286,8 @@ bool pci_config_firmware_write(struct pci_address a, uint16_t off, uint32_t v, u
    the firmware's accesses. The dword at off & ~3. */
 bool pci_config_read_unless_reset(const struct pci_device *d, uint16_t off, uint32_t *v);
 /* Sleep (dev/pm.c): save every function's configuration before S3, write it back after (CPU 0,
-   every other CPU parked, before the drivers resume). A function the HAL took to D3
-   (hal_bus_ops.power) is left out of both: its configuration was saved before, and the HAL's D0
+   every other CPU parked, before the drivers resume). A function the device manager took to D3
+   (io_bus_ops.power) is left out of both: its configuration was saved before, and the device manager's D0
    writes it back. pci_suspend allocates and so runs with
    interrupts on; it returns NULL, or what could not be saved or why not (a reset under way: the
    sleep is then called off and pci_resume writes nothing).

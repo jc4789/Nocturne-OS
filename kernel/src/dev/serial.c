@@ -26,7 +26,7 @@
 #include "arch/spin.h"
 #include "dev/acpi.h"
 #include "dev/serial.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/vmm.h"
 #include "sys/clock.h"
 #include "sys/log.h"
@@ -334,14 +334,14 @@ void serial_panic_log(void) {
     wait_line(LSR_TEMT);
 }
 
-/* ---- the machine's device that is this file's (hal/hal.h) ----
+/* ---- the machine's device that is this file's (io/io.h) ----
    The port the log leaves by: the 16550-compatible device (PNP0500, PNP0501) whose registers it is. */
-static bool console_mine(struct hal_device *d) {
+static bool console_mine(struct io_device *d) {
     if (!started) return false; /* serial_start came before the drivers bind */
-    return uart.mmio ? hal_resource_holds(d, N_HAL_MEMORY, uart.phys) : hal_resource_holds(d, N_HAL_PORT, uart.port);
+    return uart.mmio ? io_resource_holds(d, N_HAL_MEMORY, uart.phys) : io_resource_holds(d, N_HAL_PORT, uart.port);
 }
 
 static const struct n_hal_rule console_rules[] = {N_ACPI_ID("PNP0500"), N_ACPI_ID("PNP0501")};
-static const struct hal_machine serial_console = {
+static const struct io_machine serial_console = {
     .owner = "serial", .rules = console_rules, .rule_count = ARRAY_SIZE(console_rules), .mine = console_mine};
-HAL_MACHINE(serial_console);
+IO_MACHINE(serial_console);

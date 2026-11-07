@@ -14,19 +14,19 @@
    始まりからの frame の数は回り込まない：輪の一周を見落としても数えすぎても、数のどこに frame があるかが変わるだけで、
    link が輪のどの frame にいるかは変わらない。時計は、とても遅れて来た読みが何周を見落としたかだけを言う。
 
-   DMA（hal/hal.h）。制御器が届く番地の幅は GCAP の 64OK が言う（3.1.3）。CORB、RIRB、descriptor の頁は HAL から取り、
-   出口の輪（音の層の共有 object）は開いている間 HAL を通して渡す。制御器はキャッシュを覗かずに読み書きしてよい（4.4.1.1、
+   DMA（io/io.h）。制御器が届く番地の幅は GCAP の 64OK が言う（3.1.3）。CORB、RIRB、descriptor の頁は装置の管理者から取り、
+   出口の輪（音の層の共有 object）は開いている間装置の管理者を通して渡す。制御器はキャッシュを覗かずに読み書きしてよい（4.4.1.1、
    4.4.2）：CPU が書いた CORB の項、descriptor、輪の 0 埋めは cpu_cache_flush で書き出し、RIRB の項は読む前に捨てる。
    輪にサービスが書くものは、サービスが書き出す（flush_bytes）。graphics card の音の機能は、アプリが動かす画面の機能と
    同じ隔離の組にいることがある（dev/iommu.h の客）。組が持ち主を変える間（dma_pause から dma_restart まで）、出口は
    去り、link は reset に入る。始め直すと link を初めから上げ、codec の設定を戻す。
 
-   電源（hal/hal.h）。suspend は stream を止め（輪の中身は失われ、生成が進む）、codec の function group を D3 にし、
+   電源（io/io.h）。suspend は stream を止め（輪の中身は失われ、生成が進む）、codec の function group を D3 にし、
    link を reset に入れる（4.5.8.2）。resume は link を reset から上げ、thread が codec の設定を初めから戻す（4.5.8.1：
    D3 から D0 に戻った codec の設定は残っていると思わない）。開いている出口の道は次の run が引き直す。
 
    錠の順：claim と IOMMU の mutex（dma_pause と dma_restart を呼ぶ者が持つ）→ state → 音の層の mutex → stream →
-   verb_lock → engine。HAL の DMA の錠（hal_dma_map・hal_dma_unmap、眠る）は state と音の層の mutex の後に取る。
+   verb_lock → engine。装置の管理者の DMA の錠（io_dma_map・io_dma_unmap、眠る）は state と音の層の mutex の後に取る。
    state：制御器の全体（probe、感知）。制御器の thread、dma_pause と dma_restart、suspend と resume が持つ。
    stream：開いている出口と stream。音の層の呼出し（audio_output_ops）、dma_pause と dma_restart、suspend と resume が
    持つ。link を上げ下げするのは state と stream の両方を持つ者だけなので、どちらか一つを持つ者の間は link は変わらない。
@@ -39,7 +39,7 @@
 #include "arch/spin.h"
 #include "dev/hda_codec.h"
 #include "dev/pci.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/heap.h"
 #include "mm/shared.h"
 #include "sys/alarm.h"
@@ -149,11 +149,11 @@ struct hda_sink {
 struct hda {
     struct hda_link link; /* 先頭：命令が制御器へ戻る道 */
     struct pci_device *pci;
-    struct hal_device *hal;
-    volatile uint8_t *regs; /* メモリーの BAR（hal_map） */
+    struct io_device *hal;
+    volatile uint8_t *regs; /* メモリーの BAR（io_map） */
     /* attach が書き、変わらない */
     unsigned address_bits; /* 制御器が届く番地の bit（GCAP の 64OK） */
-    uint64_t dma_bus;      /* 輪と descriptor の頁を制御器へ渡す番地（hal_dma_alloc） */
+    uint64_t dma_bus;      /* 輪と descriptor の頁を制御器へ渡す番地（io_dma_alloc） */
     uint32_t *corb;
     volatile uint64_t *rirb;
     struct bdl_entry *bdl;
@@ -424,18 +424,18 @@ static void hda_tick(struct alarm *a, struct regs *r) {
     tell_open((struct hda *)((char *)a - offsetof(struct hda, tick)));
 }
 
-/* state と stream を持って：割り込みを、バスが渡す形で開く（hal_irq_enable：機能が message を送れるならそれ。claim の
-   組で始め直した機能は送れない、hal.h の dma_restart）。無ければ tick と thread が代わりに見る。 */
+/* state と stream を持って：割り込みを、バスが渡す形で開く（io_irq_enable：機能が message を送れるならそれ。claim の
+   組で始め直した機能は送れない、io.h の dma_restart）。無ければ tick と thread が代わりに見る。 */
 static void irq_on(struct hda *h) {
     ASSERT(mutex_held(&h->state) && mutex_held(&h->stream));
     struct irq_spec spec = {.name = "HD Audio", .handler = hda_irq, .context = h};
-    h->quiet = !hal_irq_enable(h->hal, &spec, 1, NULL);
+    h->quiet = !io_irq_enable(h->hal, &spec, 1, NULL);
 }
 
 /* state と stream を持って。割り込みの元はもう切ってある。 */
 static void irq_off(struct hda *h) {
     ASSERT(mutex_held(&h->state) && mutex_held(&h->stream));
-    if (!h->quiet) hal_irq_disable(h->hal);
+    if (!h->quiet) io_irq_disable(h->hal);
     h->quiet = true;
 }
 
@@ -541,11 +541,11 @@ static int hda_open(struct audio_output *output, const struct n_audio_device_for
     uint64_t bytes = frames * frame_bytes * blocks;
     if (bytes > UINT32_MAX) return -N_ERR_TOO_LARGE; /* 輪の長さの欄（3.3.37） */
     uint64_t pages = ALIGN_UP(bytes, PAGE_SIZE) / PAGE_SIZE;
-    /* 輪は音の層とサービスも持つ共有 object：制御器が届く番地の中に取り、開いている間 HAL を通して渡す */
+    /* 輪は音の層とサービスも持つ共有 object：制御器が届く番地の中に取り、開いている間装置の管理者を通して渡す */
     uint64_t phys, bus;
     struct object *memory = shared_kernel_contig(pages, h->address_bits, &phys);
     if (!memory) return -N_ERR_NO_MEMORY;
-    if (!hal_dma_map(h->hal, phys, pages, &bus)) {
+    if (!io_dma_map(h->hal, phys, pages, &bus)) {
         object_unref(memory);
         return -N_ERR_NO_MEMORY;
     }
@@ -572,7 +572,7 @@ static int hda_open(struct audio_output *output, const struct n_audio_device_for
     }
     mutex_unlock(&h->stream);
     if (r) {
-        hal_dma_unmap(h->hal, phys, pages);
+        io_dma_unmap(h->hal, phys, pages);
         object_unref(memory);
     }
     return r;
@@ -590,7 +590,7 @@ static void hda_close(struct audio_output *output) {
     uint64_t phys = h->ring_phys, pages = h->ring_pages;
     h->ring_object = NULL;
     mutex_unlock(&h->stream);
-    hal_dma_unmap(h->hal, phys, pages); /* stream は止まり、制御器はもう輪を歩かない */
+    io_dma_unmap(h->hal, phys, pages); /* stream は止まり、制御器はもう輪を歩かない */
     object_unref(memory);
 }
 
@@ -696,7 +696,7 @@ static bool sink_add(struct hda *h, struct hda_codec *codec, struct hda_output *
             : out->plugged ? "plugged in"
                            : "nothing plugged in");
     audio_output_add(&o->output);
-    hal_offer(h->hal, N_OFFER_AUDIO, (uint32_t)codec->address << 8 | out->pin->nid, o->label);
+    io_offer(h->hal, N_OFFER_AUDIO, (uint32_t)codec->address << 8 | out->pin->nid, o->label);
     return true;
 }
 
@@ -779,11 +779,11 @@ static void hda_thread(void *arg) {
 
 /* ---- 電源 ---- */
 
-/* hal.h の suspend。止め方は目標によらず同じ：link の reset が DMA と割り込みを止め、resume はどの場合も link の
+/* io.h の suspend。止め方は目標によらず同じ：link の reset が DMA と割り込みを止め、resume はどの場合も link の
    reset から codec を戻す。function group は link の clock を止める前に D3 にする（7.3.3.10：codec は D0 から D3 へ
    移る音の乱れを自分で抑える。clock の止まった codec は完全な reset から始め直し、resume はそうする）。
    止まらなければ false：眠りと休止の取りやめで resume が続き、link を上げ直す。 */
-static bool hda_suspend(struct hal_device *d, enum hal_power_target target) {
+static bool hda_suspend(struct io_device *d, enum io_power_target target) {
     (void)target;
     struct hda *h = d->driver_data;
     mutex_lock(&h->state);
@@ -800,10 +800,10 @@ static bool hda_suspend(struct hal_device *d, enum hal_power_target target) {
     return stopped;
 }
 
-/* hal.h の resume。装置は電源を失っていても（眠りと休止の後）、そのままでも（取りやめと写しの後）よい：stream を
+/* io.h の resume。装置は電源を失っていても（眠りと休止の後）、そのままでも（取りやめと写しの後）よい：stream を
    止めたことにして、link を reset から上げる。codec の設定は thread が初めから戻し（4.5.8.1）、開いた出口は持ち主が
    新しい生成で run し直す。 */
-static bool hda_resume(struct hal_device *d) {
+static bool hda_resume(struct io_device *d) {
     struct hda *h = d->driver_data;
     mutex_lock(&h->state);
     mutex_lock(&h->stream);
@@ -815,18 +815,18 @@ static bool hda_resume(struct hal_device *d) {
     if (!back) {
         kprintf("audio: HD Audio at %04x:%02x:%02x.%x does not come out of reset after sleeping\n",
                 PCI_ADDRESS_ARGS(h->pci->address));
-        hal_failed(d, -N_ERR_IO);
+        io_failed(d, -N_ERR_IO);
     }
     signal(h);
     tell_open(h);
     return back;
 }
 
-/* ---- DMA の道が変わる（hal.h の dma_pause と dma_restart） ---- */
+/* ---- DMA の道が変わる（io.h の dma_pause と dma_restart） ---- */
 
-/* 出口が去り（開いていれば閉じ、輪は HAL から外れる）、続いて link と、それが送る全部が止まり、割り込みを返す。この後
+/* 出口が去り（開いていれば閉じ、輪は装置の管理者から外れる）、続いて link と、それが送る全部が止まり、割り込みを返す。この後
    バスが DMA を止める。 */
-static void hda_dma_pause(struct hal_device *d) {
+static void hda_dma_pause(struct io_device *d) {
     struct hda *h = d->driver_data;
     mutex_lock(&h->state);
     for (struct hda_sink *o = h->sinks; o; o = o->next) audio_output_available(&o->output, false);
@@ -839,11 +839,11 @@ static void hda_dma_pause(struct hal_device *d) {
 }
 
 /* 新しい道で link を初めから上げ（止めた間に電源を失っていてもよい）、出口を戻す。codec の設定は thread が戻す。 */
-static void hda_dma_restart(struct hal_device *d) {
+static void hda_dma_restart(struct io_device *d) {
     struct hda *h = d->driver_data;
     mutex_lock(&h->state);
     mutex_lock(&h->stream);
-    hal_enable(d, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA);
+    io_enable(d, IO_ENABLE_MEMORY | IO_ENABLE_DMA);
     bool up = link_up(h);
     if (up) irq_on(h);
     h->restore = up;
@@ -852,18 +852,18 @@ static void hda_dma_restart(struct hal_device *d) {
     mutex_unlock(&h->state);
     if (!up) {
         kprintf("audio: HD Audio at %04x:%02x:%02x.%x does not come out of reset\n", PCI_ADDRESS_ARGS(h->pci->address));
-        hal_failed(d, -N_ERR_IO);
+        io_failed(d, -N_ERR_IO);
     }
     signal(h);
 }
 
 /* ---- 見つける ---- */
 
-/* link が上がって：制御器が届く番地の幅を HAL に言い（3.1.3、3.3.2）、CORB と RIRB と descriptor の頁を取る。 */
+/* link が上がって：制御器が届く番地の幅を装置の管理者に言い（3.1.3、3.3.2）、CORB と RIRB と descriptor の頁を取る。 */
 static bool dma_take(struct hda *h, uint32_t caps) {
     h->address_bits = caps & GCAP_64OK ? 64 : 32;
-    hal_dma_bits(h->hal, h->address_bits);
-    uint8_t *memory = hal_dma_alloc(h->hal, DMA_PAGES * PAGE_SIZE, &h->dma_bus);
+    io_dma_bits(h->hal, h->address_bits);
+    uint8_t *memory = io_dma_alloc(h->hal, DMA_PAGES * PAGE_SIZE, &h->dma_bus);
     if (!memory) return false;
     cpu_cache_flush(memory, DMA_PAGES * PAGE_SIZE); /* 0 埋め */
     h->corb = (uint32_t *)memory;
@@ -883,7 +883,7 @@ static int controller_start(struct hda *h) {
     uint32_t caps = read16(h, GCAP);
     if (!GCAP_OSS(caps) && !GCAP_BSS(caps)) { /* driver は動かさない：アプリが動かしてよい */
         kprintf("audio: HD Audio at %04x:%02x:%02x.%x has no stream to play on\n", PCI_ADDRESS_ARGS(address));
-        return HAL_DECLINE;
+        return IO_DECLINE;
     }
     if (!dma_take(h, caps)) {
         kprintf("audio: HD Audio at %04x:%02x:%02x.%x found, but no memory for it\n", PCI_ADDRESS_ARGS(address));
@@ -902,11 +902,11 @@ static int controller_start(struct hda *h) {
     return -N_ERR_NO_MEMORY;
 }
 
-static int hda_attach(struct hal_device *hal) {
+static int hda_attach(struct io_device *hal) {
     struct pci_device *d = pci_device_of(hal);
-    if (!hal_resource(hal, N_HAL_MEMORY, 0)) return -N_ERR_NOT_FOUND;
+    if (!io_resource(hal, N_HAL_MEMORY, 0)) return -N_ERR_NOT_FOUND;
     struct hda *h = kzalloc(sizeof *h);
-    volatile uint8_t *regs = h ? hal_map(hal, 0) : NULL;
+    volatile uint8_t *regs = h ? io_map(hal, 0) : NULL;
     if (!regs) {
         kprintf("audio: HD Audio at %04x:%02x:%02x.%x found, but no memory for it\n", PCI_ADDRESS_ARGS(d->address));
         kfree(h);
@@ -919,7 +919,7 @@ static int hda_attach(struct hal_device *hal) {
     h->regs = regs;
     h->frame_bytes = 4; /* 形式が開くまで */
     alarm_init(&h->tick, hda_tick);
-    hal_enable(hal, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA);
+    io_enable(hal, IO_ENABLE_MEMORY | IO_ENABLE_DMA);
     mutex_lock(&h->state);
     mutex_lock(&h->stream);
     int r = controller_start(h);
@@ -935,15 +935,15 @@ static int hda_attach(struct hal_device *hal) {
 
 /* 音の類の PCI の機能の全部：chipset のものも graphics card のものも。 */
 static const struct n_hal_rule hda_rules[] = {N_PCI_CLASS(0x04, 0x03)};
-static const struct hal_driver hda_driver = {
+static const struct io_driver hda_driver = {
     .name = "hda",
     .rules = hda_rules,
     .rule_count = ARRAY_SIZE(hda_rules),
     .attach = hda_attach,
     .suspend = hda_suspend,
     .resume = hda_resume,
-    .after_sleep = HAL_AFTER_SLEEP_RESUME,
+    .after_sleep = IO_AFTER_SLEEP_RESUME,
     .dma_pause = hda_dma_pause,
     .dma_restart = hda_dma_restart,
 };
-HAL_DRIVER(hda_driver);
+IO_DRIVER(hda_driver);

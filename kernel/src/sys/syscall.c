@@ -30,7 +30,7 @@
 #include "dev/audio.h"
 #include "dev/entropy.h"
 #include "dev/pci.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "arch/pat.h"
 #include "gui/wm.h"
 #include "gui/screenmode.h"
@@ -228,7 +228,7 @@ static int64_t new_handle(int64_t r,struct handle *h) {
     return r<0?r:handle_install(h);
 }
 
-/* ---- アプリの中の装置ドライバー（hal/claim.c、画面は dev/screen_driver.c） ----
+/* ---- アプリの中の装置ドライバー（io/claim.c、画面は dev/screen_driver.c） ----
    どの呼出しも claim の handle を引いて、閉じるまで持つ。 */
 
 static int64_t sys_hal_claim(int cap,uint32_t device,const char *udriver) {
@@ -239,13 +239,13 @@ static int64_t sys_hal_claim(int cap,uint32_t device,const char *udriver) {
     struct handle *claim=NULL;
     int64_t r=cap_check(cap,N_CAP_HAL_CLAIM);
     if(r<0)return r;
-    r=hal_claim_open(device,driver,&claim);
+    r=io_claim_open(device,driver,&claim);
     return new_handle(r,claim);
 }
 static int64_t sys_hal_resources(int h,struct n_hal_resource *uout,size_t max) {
     struct handle *claim=handle_get(h);
     if(!claim)return -N_ERR_NO_HANDLE;
-    int64_t r=hal_claim_resources(claim,uout,max);
+    int64_t r=io_claim_resources(claim,uout,max);
     handle_close(claim);
     return r;
 }
@@ -259,26 +259,26 @@ static int64_t sys_hal_map(int h,uint32_t slot) {
 static int64_t sys_hal_interrupts(int h,uint32_t count) {
     struct handle *claim=handle_get(h);
     if(!claim)return -N_ERR_NO_HANDLE;
-    int64_t r=hal_claim_interrupts(claim,count);
+    int64_t r=io_claim_interrupts(claim,count);
     handle_close(claim);
     return r;
 }
 static int64_t sys_hal_interrupt_take(int h,uint64_t deadline,uint64_t *ubits,uint32_t words) {
     struct handle *claim=handle_get(h);
     if(!claim)return -N_ERR_NO_HANDLE;
-    int64_t r=hal_claim_interrupt_take(claim,deadline,ubits,words);
+    int64_t r=io_claim_interrupt_take(claim,deadline,ubits,words);
     handle_close(claim);
     return r;
 }
 /* A bus's own operation of a claimed device (hal_buses.h): its input and its output go through kernel copies
-   of at most HAL_CALL_IN_MAX and HAL_CALL_OUT_MAX bytes. */
-#define HAL_CALL_IN_MAX (128u*1024)
-#define HAL_CALL_OUT_MAX (1024u*1024)
+   of at most IO_CALL_IN_MAX and IO_CALL_OUT_MAX bytes. */
+#define IO_CALL_IN_MAX (128u*1024)
+#define IO_CALL_OUT_MAX (1024u*1024)
 static int64_t sys_hal_bus_call(int h,const struct n_hal_call *ucall) {
     struct n_hal_call call;
     if(copy_from_user(&call,ucall,sizeof call))return -N_ERR_BAD_ADDRESS;
-    if(call.in_size>HAL_CALL_IN_MAX)return -N_ERR_INVALID;
-    size_t room=(size_t)MIN(call.out_size,(uint64_t)HAL_CALL_OUT_MAX);
+    if(call.in_size>IO_CALL_IN_MAX)return -N_ERR_INVALID;
+    size_t room=(size_t)MIN(call.out_size,(uint64_t)IO_CALL_OUT_MAX);
     if(room && !user_ok_w(call.out,room))return -N_ERR_BAD_ADDRESS;
     struct handle *claim=handle_get(h);
     if(!claim)return -N_ERR_NO_HANDLE;
@@ -286,7 +286,7 @@ static int64_t sys_hal_bus_call(int h,const struct n_hal_call *ucall) {
     int64_t r=(call.in_size && !in) || (room && !out)?-N_ERR_NO_MEMORY:0;
     if(!r && call.in_size && copy_from_user(in,call.in,call.in_size))r=-N_ERR_BAD_ADDRESS;
     size_t used=0;
-    if(!r)r=hal_claim_bus_call(claim,call.op,in,call.in_size,out,room,&used);
+    if(!r)r=io_claim_bus_call(claim,call.op,in,call.in_size,out,room,&used);
     if(r>=0 && used && copy_to_user(call.out,out,used))r=-N_ERR_BAD_ADDRESS;
     kfree(in);kfree(out);handle_close(claim);
     return r;
@@ -327,28 +327,28 @@ static int64_t sys_hal_offer(int h,uint32_t kind,uint32_t instance,const char *u
     if(n<0)return n;
     struct handle *claim=handle_get(h);
     if(!claim)return -N_ERR_NO_HANDLE;
-    int64_t r=hal_claim_offer(claim,kind,instance,label);
+    int64_t r=io_claim_offer(claim,kind,instance,label);
     handle_close(claim);
     return r;
 }
 static int64_t sys_hal_offer_withdraw(int h,uint32_t kind,uint32_t instance) {
     struct handle *claim=handle_get(h);
     if(!claim)return -N_ERR_NO_HANDLE;
-    int64_t r=hal_claim_offer_withdraw(claim,kind,instance);
+    int64_t r=io_claim_offer_withdraw(claim,kind,instance);
     handle_close(claim);
     return r;
 }
 static int64_t sys_hal_power_wait(int h,uint64_t deadline) {
     struct handle *claim=handle_get(h);
     if(!claim)return -N_ERR_NO_HANDLE;
-    int64_t r=hal_claim_power_wait(claim,deadline);
+    int64_t r=io_claim_power_wait(claim,deadline);
     handle_close(claim);
     return r;
 }
 static int64_t sys_hal_power_done(int h,bool ok) {
     struct handle *claim=handle_get(h);
     if(!claim)return -N_ERR_NO_HANDLE;
-    int64_t r=hal_claim_power_done(claim,ok);
+    int64_t r=io_claim_power_done(claim,ok);
     handle_close(claim);
     return r;
 }
@@ -1392,8 +1392,8 @@ void syscall_dispatch(struct regs *r) {
         break;
     }
     case SYS_SYSTEM_LOG: ret = identity_at_least(N_CLASS_ADMIN) ? sys_system_log((char *)a, b) : -N_ERR_DENIED; break;
-    case SYS_HAL_LIST: ret = hal_syscall_list((void *)a, b); break;
-    case SYS_HAL_WATCH: ret = hal_syscall_watch(); break;
+    case SYS_HAL_LIST: ret = io_syscall_list((void *)a, b); break;
+    case SYS_HAL_WATCH: ret = io_syscall_watch(); break;
     case SYS_HANDLE_CLOSE: ret = sys_handle_close((int)a); break;
     case SYS_HANDLE_KIND: ret = sys_handle_kind((int)a); break;
     case SYS_DOCUMENT_OPEN: ret = sys_document_open((const char *)a, (int)b); break;

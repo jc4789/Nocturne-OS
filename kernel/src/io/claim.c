@@ -1,19 +1,19 @@
-/* プロセスの実装（hal/hal.h）：アプリの中の装置ドライバーが台帳の装置を持つ口。docs/nocturne-native-abi.md §9。
+/* プロセスの実装（io/io.h）：アプリの中の装置ドライバーが台帳の装置を持つ口。docs/nocturne-native-abi.md §9。
 
    claim は N_KIND_HAL_CLAIM の object で、最後の handle が閉じると終わる。BAR と DMA の object は claim の記録を
    参照で持ち、claim の終わりは記録を消さない：終わった後の写像と DMA は N_ERR_CLOSED と、全部 1 が読める頁になる。
-   ここはバスを知らない。バスの持ち分は struct hal_claim_ops（begin、end、call）にある。
+   ここはバスを知らない。バスの持ち分は struct io_claim_ops（begin、end、call）にある。
 
-   錠の順（先 → 後）：門（hal_busy_begin）→ end_mutex と装置の bind、end_mutex → claims_mutex、end_mutex → バスの錠と mm/shared.c の錠、offers_mutex → hal_lock、
+   錠の順（先 → 後）：門（io_busy_begin）→ end_mutex と装置の bind、end_mutex → claims_mutex、end_mutex → バスの錠と mm/shared.c の錠、offers_mutex → io_lock、
    irq_lock → 待ち行列と事象の錠、power_lock → 待ち行列の錠。ends_lock は葉。
-   終わりは claim ごとに一度だけ走る（end_mutex）。最後の handle の close と hal_remove が同時に来ても、後の者は
-   終わりが済むまで待つ。呼出しは hal_claim_enter で記録を hold するので、hal_remove が戻った後に claim が装置に触ることは
+   終わりは claim ごとに一度だけ走る（end_mutex）。最後の handle の close と io_remove が同時に来ても、後の者は
+   終わりが済むまで待つ。呼出しは io_claim_enter で記録を hold するので、io_remove が戻った後に claim が装置に触ることは
    無い。 */
 #include "kernel.h"
 #include "abi.h"
 #include "arch/irq.h"
 #include "arch/spin.h"
-#include "hal/internal.h"
+#include "io/internal.h"
 #include "mm/heap.h"
 #include "mm/shared.h"
 #include "sys/clock.h"
@@ -34,7 +34,7 @@
    呼び続けない。take が開ける。message では塞ぐものが無い。claim の GSI は誰とも線を分けない（alone）：claim の
    handler はどの割り込みも自分のものとして受けるので、分けた線では他の装置の割り込みを奪う。 */
 struct claim_message {
-    struct hal_claim *claim;
+    struct io_claim *claim;
     unsigned n;
     struct irq *irq; /* irq_lock の下。立てていなければ NULL */
 };
@@ -50,9 +50,9 @@ struct claim_offer {
     uint32_t kind, instance;
 };
 
-struct hal_claim {
-    struct hal_device *d;
-    const struct hal_claim_ops *ops;
+struct io_claim {
+    struct io_device *d;
+    const struct io_claim_ops *ops;
     void *bus; /* バスが begin で置いた記録 */
     struct object object;
     struct shared_claim shared; /* BAR の object */
@@ -62,10 +62,10 @@ struct hal_claim {
     struct mutex end_mutex;     /* 終わりを一度にする */
     bool ended;                 /* end_mutex の下 */
     struct spinlock ends_lock;  /* ends と end_started。葉 */
-    struct hal_claim_end *ends;
+    struct io_claim_end *ends;
     bool end_started;
     bool listed;                /* claims の列にある。claims_mutex の下 */
-    struct hal_claim *next, *prev;
+    struct io_claim *next, *prev;
 
     /* 割り込み。handler は irq_lock の下で印を立て、待ち行列と object を起こす。vectors が 0 になれば、どの
        handler も claim に触れない。 */
@@ -89,23 +89,23 @@ struct hal_claim {
 };
 
 static struct mutex claims_mutex;
-static struct hal_claim *claims;
+static struct io_claim *claims;
 
-const struct hal_claim_ops hal_claim_plain = {0};
+const struct io_claim_ops io_claim_plain = {0};
 
-struct hal_device *hal_claim_device(const struct hal_claim *c) { return c->d; }
-void *hal_claim_bus(const struct hal_claim *c) { return c->bus; }
-struct shared_claim *hal_claim_shared(struct hal_claim *c) { return &c->shared; }
-bool hal_claim_revoked(const struct hal_claim *c) { return c && __atomic_load_n(&c->released, __ATOMIC_SEQ_CST); }
-bool hal_claim_dma_reusable(const struct hal_claim *c) { return !c || !__atomic_load_n(&c->dma_unsafe, __ATOMIC_ACQUIRE); }
-bool hal_claim_sleeps(const struct hal_claim *c) { return __atomic_load_n(&c->sleeps, __ATOMIC_ACQUIRE); }
+struct io_device *io_claim_device(const struct io_claim *c) { return c->d; }
+void *io_claim_bus(const struct io_claim *c) { return c->bus; }
+struct shared_claim *io_claim_shared(struct io_claim *c) { return &c->shared; }
+bool io_claim_revoked(const struct io_claim *c) { return c && __atomic_load_n(&c->released, __ATOMIC_SEQ_CST); }
+bool io_claim_dma_reusable(const struct io_claim *c) { return !c || !__atomic_load_n(&c->dma_unsafe, __ATOMIC_ACQUIRE); }
+bool io_claim_sleeps(const struct io_claim *c) { return __atomic_load_n(&c->sleeps, __ATOMIC_ACQUIRE); }
 
-/* 終わりが始まった claim は入れない。released は hal_lock の下で立つので、入った者の間 c->d は生きている。 */
-struct hal_device *hal_claim_enter(struct hal_claim *c) {
-    uint64_t f = spin_lock(&hal_lock);
+/* 終わりが始まった claim は入れない。released は io_lock の下で立つので、入った者の間 c->d は生きている。 */
+struct io_device *io_claim_enter(struct io_claim *c) {
+    uint64_t f = spin_lock(&io_lock);
     bool in = !__atomic_load_n(&c->released, __ATOMIC_SEQ_CST);
     if (in) c->d->holds++;
-    spin_unlock(&hal_lock, f);
+    spin_unlock(&io_lock, f);
     return in ? c->d : NULL;
 }
 
@@ -116,15 +116,15 @@ static void claim_release(struct object *o);
 static const struct object_ops claim_object_ops = {
     .kind = N_KIND_HAL_CLAIM, .ready = claim_ready, .release = claim_release, .closes_first = true};
 
-struct hal_claim *hal_claim_of(struct handle *h) { return handle_is(h, &claim_object_ops) ? h->object->priv : NULL; }
+struct io_claim *io_claim_of(struct handle *h) { return handle_is(h, &claim_object_ops) ? h->object->priv : NULL; }
 
-struct hal_claim *hal_claim_hold(struct handle *h) {
-    struct hal_claim *c = hal_claim_of(h);
+struct io_claim *io_claim_hold(struct handle *h) {
+    struct io_claim *c = io_claim_of(h);
     if (c) __atomic_fetch_add(&c->refs, 1, __ATOMIC_RELAXED); /* h が一つ持っている */
     return c;
 }
 
-static void claim_drop_to_zero(struct hal_claim *c) {
+static void claim_drop_to_zero(struct io_claim *c) {
     if (c->bus && c->ops->release) c->ops->release(c);
     for (struct claim_vectors *v = c->vec, *older; v; v = older) {
         older = v->older;
@@ -133,7 +133,7 @@ static void claim_drop_to_zero(struct hal_claim *c) {
     kfree(c);
 }
 
-void hal_claim_drop(struct hal_claim *c) {
+void io_claim_drop(struct io_claim *c) {
     if (!c) return;
     unsigned left = __atomic_sub_fetch(&c->refs, 1, __ATOMIC_ACQ_REL);
     ASSERT(left != UINT32_MAX);
@@ -141,11 +141,11 @@ void hal_claim_drop(struct hal_claim *c) {
 }
 
 /* DMA は、バスが dma_bits を持つ claim だけが作れる。 */
-unsigned hal_claim_dma_bits(const struct hal_claim *c) { return c->ops->dma_bits ? c->ops->dma_bits((struct hal_claim *)c) : 0; }
-bool hal_claim_dma_map(struct hal_claim *c, const uint64_t *frames, uint64_t base, size_t count) {
+unsigned io_claim_dma_bits(const struct io_claim *c) { return c->ops->dma_bits ? c->ops->dma_bits((struct io_claim *)c) : 0; }
+bool io_claim_dma_map(struct io_claim *c, const uint64_t *frames, uint64_t base, size_t count) {
     return !c->ops->dma_map || c->ops->dma_map(c, frames, base, count);
 }
-bool hal_claim_dma_unmap(struct hal_claim *c, const uint64_t *frames, uint64_t base, size_t count) {
+bool io_claim_dma_unmap(struct io_claim *c, const uint64_t *frames, uint64_t base, size_t count) {
     return !c->ops->dma_unmap || c->ops->dma_unmap(c, frames, base, count);
 }
 
@@ -154,7 +154,7 @@ bool hal_claim_dma_unmap(struct hal_claim *c, const uint64_t *frames, uint64_t b
 /* claim の message n。irq が向かう CPU で走る。 */
 static enum irq_result claim_isr(void *context) {
     struct claim_message *m = context;
-    struct hal_claim *c = m->claim;
+    struct io_claim *c = m->claim;
     spin_take(&c->irq_lock);
     if (m->n < c->vectors) {
         uint64_t *word = &c->vec->pending[m->n / 64], bit = 1ull << (m->n % 64);
@@ -169,7 +169,7 @@ static enum irq_result claim_isr(void *context) {
     return IRQ_HOLD;
 }
 
-static void interrupts_off(struct hal_claim *c) {
+static void interrupts_off(struct io_claim *c) {
     if (!c->vectors) return;
     uint64_t irq = spin_lock(&c->irq_lock);
     c->vectors = 0;
@@ -178,7 +178,7 @@ static void interrupts_off(struct hal_claim *c) {
     __atomic_store_n(&c->pending, 0, __ATOMIC_RELAXED);
     spin_unlock(&c->irq_lock, irq);
     /* 止まったと確かめられなかった irq は残り、その handler は claim を指し続ける：claim も残る */
-    hal_irq_disable(c->d);
+    io_irq_disable(c->d);
     if (c->d->irqs_on) __atomic_add_fetch(&c->refs, 1, __ATOMIC_ACQ_REL);
     /* 待っている者は、最後の割り込みを切られても眠り続けず NOT_READY を見る */
     wq_wake_all(&c->wq);
@@ -186,16 +186,16 @@ static void interrupts_off(struct hal_claim *c) {
 }
 
 static uint32_t claim_ready(struct handle *h) {
-    struct hal_claim *c = h->object->priv;
+    struct io_claim *c = h->object->priv;
     return __atomic_load_n(&c->pending, __ATOMIC_ACQUIRE) ? N_EVENT_RECEIVABLE : 0;
 }
 
 /* vectors_mutex を持っている。 */
-static int64_t interrupts_on(struct hal_claim *c, uint32_t count) {
-    struct hal_device *d = c->d;
+static int64_t interrupts_on(struct io_claim *c, uint32_t count) {
+    struct io_device *d = c->d;
     interrupts_off(c);
     if (!count) return 0;
-    unsigned most = c->ops->irq_max ? c->ops->irq_max(c) : hal_irq_max(d);
+    unsigned most = c->ops->irq_max ? c->ops->irq_max(c) : io_irq_max(d);
     if (!most) return -N_ERR_UNSUPPORTED;
     count = MIN(MIN(count, most), (uint32_t)VECTORS_MOST);
     struct claim_vectors *v = c->vec;
@@ -223,7 +223,7 @@ static int64_t interrupts_on(struct hal_claim *c, uint32_t count) {
     c->vec = v;
     c->vectors = count;
     spin_unlock(&c->irq_lock, irq);
-    unsigned n = hal_irq_enable(d, specs, count, irqs);
+    unsigned n = io_irq_enable(d, specs, count, irqs);
     kfree(specs);
     irq = spin_lock(&c->irq_lock);
     c->vectors = n;
@@ -238,22 +238,22 @@ static int64_t interrupts_on(struct hal_claim *c, uint32_t count) {
     return n;
 }
 
-int64_t hal_claim_interrupts(struct handle *h, uint32_t count) {
-    struct hal_claim *c = hal_claim_of(h);
+int64_t io_claim_interrupts(struct handle *h, uint32_t count) {
+    struct io_claim *c = io_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
-    if (!hal_claim_enter(c)) return -N_ERR_CLOSED;
-    struct hal_device *d = c->d;
+    if (!io_claim_enter(c)) return -N_ERR_CLOSED;
+    struct io_device *d = c->d;
     mutex_lock(&c->vectors_mutex);
-    int64_t r = hal_claim_revoked(c) ? -N_ERR_CLOSED : interrupts_on(c, count);
+    int64_t r = io_claim_revoked(c) ? -N_ERR_CLOSED : interrupts_on(c, count);
     mutex_unlock(&c->vectors_mutex);
-    hal_put(d);
+    io_put(d);
     return r;
 }
 
 /* 取った message の線を開ける（claim_isr の IRQ_HOLD）。vectors_mutex の下で：irq は interrupts_off（同じ mutex の
    下）が外すまで生きている。外した後なら何もしない。irq_lock は持たない：irq の錠は handler の後の保持で claim の
    錠と並ばずに取られる。 */
-static void taken_unhold(struct hal_claim *c, const uint64_t *got, unsigned words) {
+static void taken_unhold(struct io_claim *c, const uint64_t *got, unsigned words) {
     mutex_lock(&c->vectors_mutex);
     for (unsigned w = 0; w < words; w++)
         for (uint64_t bits = got[w]; bits; bits &= bits - 1) {
@@ -265,7 +265,7 @@ static void taken_unhold(struct hal_claim *c, const uint64_t *got, unsigned word
 }
 
 /* irq_lock を持っている。最初の words 語の印を got へ取り、そこで消す。取った語の数（claim の語数まで）。 */
-static unsigned pending_take(struct hal_claim *c, uint64_t *got, unsigned words) {
+static unsigned pending_take(struct io_claim *c, uint64_t *got, unsigned words) {
     unsigned n = MIN(words, (c->vectors + 63) / 64), taken = 0;
     for (unsigned i = 0; i < n; i++) {
         got[i] = c->vec->pending[i];
@@ -276,8 +276,8 @@ static unsigned pending_take(struct hal_claim *c, uint64_t *got, unsigned words)
     return n;
 }
 
-int64_t hal_claim_interrupt_take(struct handle *h, uint64_t deadline, uint64_t *ubits, uint32_t words) {
-    struct hal_claim *c = hal_claim_of(h);
+int64_t io_claim_interrupt_take(struct handle *h, uint64_t deadline, uint64_t *ubits, uint32_t words) {
+    struct io_claim *c = io_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     if (!words) return -N_ERR_INVALID;
     uint64_t got[VECTORS_MOST / 64];
@@ -304,7 +304,7 @@ int64_t hal_claim_interrupt_take(struct handle *h, uint64_t deadline, uint64_t *
         }
         int64_t r = 0;
         if (thread_current()->killed) r = -N_ERR_STOPPED;
-        else if (hal_claim_revoked(c)) r = -N_ERR_CLOSED;
+        else if (io_claim_revoked(c)) r = -N_ERR_CLOSED;
         else if (!c->vectors) r = -N_ERR_NOT_READY;
         else if (clock_now_ns() >= deadline) r = -N_ERR_TIMEOUT;
         if (r) {
@@ -319,25 +319,25 @@ int64_t hal_claim_interrupt_take(struct handle *h, uint64_t deadline, uint64_t *
 
 /* ---- 資源とメモリー ---- */
 
-int64_t hal_claim_resources(struct handle *h, struct n_hal_resource *uout, size_t max) {
-    struct hal_claim *c = hal_claim_of(h);
+int64_t io_claim_resources(struct handle *h, struct n_hal_resource *uout, size_t max) {
+    struct io_claim *c = io_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
-    if (!hal_claim_enter(c)) return -N_ERR_CLOSED;
-    struct hal_device *d = c->d;
+    if (!io_claim_enter(c)) return -N_ERR_CLOSED;
+    struct io_device *d = c->d;
     uint32_t total = d->resource_count;
     size_t n = MIN(max, (size_t)total);
     int64_t r = n && copy_to_user(uout, d->resources, n * sizeof *uout) ? -N_ERR_BAD_ADDRESS : (int64_t)total;
-    hal_put(d);
+    io_put(d);
     return r;
 }
 
-int64_t hal_claim_memory(struct hal_claim *c, uint32_t slot, uint64_t *address, uint64_t *size, bool *prefetchable) {
-    if (!hal_claim_enter(c)) return -N_ERR_CLOSED;
-    struct hal_device *d = c->d;
-    const struct n_hal_resource *r = hal_resource(d, N_HAL_MEMORY, slot);
+int64_t io_claim_memory(struct io_claim *c, uint32_t slot, uint64_t *address, uint64_t *size, bool *prefetchable) {
+    if (!io_claim_enter(c)) return -N_ERR_CLOSED;
+    struct io_device *d = c->d;
+    const struct n_hal_resource *r = io_resource(d, N_HAL_MEMORY, slot);
     int64_t result = 0;
     if (!r || !r->base || !r->size) {
-        result = hal_resource(d, N_HAL_PORT, slot) ? -N_ERR_UNSUPPORTED : -N_ERR_NOT_FOUND;
+        result = io_resource(d, N_HAL_PORT, slot) ? -N_ERR_UNSUPPORTED : -N_ERR_NOT_FOUND;
     } else if ((r->base | r->size) & (PAGE_SIZE - 1)) { /* 頁より小さい資源は、隣にあるものと頁を分け合う */
         result = -N_ERR_UNSUPPORTED;
     } else {
@@ -345,61 +345,61 @@ int64_t hal_claim_memory(struct hal_claim *c, uint32_t slot, uint64_t *address, 
         *size = r->size;
         *prefetchable = (r->flags & N_HAL_PREFETCHABLE) != 0;
     }
-    hal_put(d);
+    io_put(d);
     return result;
 }
 
 /* ---- バスだけの操作 ---- */
 
-int64_t hal_claim_bus_call(struct handle *h, uint32_t op, const void *in, size_t in_size, void *out, size_t out_size,
+int64_t io_claim_bus_call(struct handle *h, uint32_t op, const void *in, size_t in_size, void *out, size_t out_size,
                            size_t *used) {
-    struct hal_claim *c = hal_claim_of(h);
+    struct io_claim *c = io_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     if (!c->ops->call) return -N_ERR_UNSUPPORTED;
-    if (!hal_claim_enter(c)) return -N_ERR_CLOSED;
-    struct hal_device *d = c->d;
+    if (!io_claim_enter(c)) return -N_ERR_CLOSED;
+    struct io_device *d = c->d;
     *used = 0;
     int64_t r = c->ops->call(c, op, in, in_size, out, out_size, used);
     ASSERT(*used <= out_size);
-    hal_put(d);
+    io_put(d);
     return r;
 }
 
 /* ---- 台帳への提供 ---- */
 
-int64_t hal_claim_offer(struct handle *h, uint32_t kind, uint32_t instance, const char *label) {
-    struct hal_claim *c = hal_claim_of(h);
+int64_t io_claim_offer(struct handle *h, uint32_t kind, uint32_t instance, const char *label) {
+    struct io_claim *c = io_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     struct claim_offer *o = kzalloc(sizeof *o);
     if (!o) return -N_ERR_NO_MEMORY;
     o->kind = kind;
     o->instance = instance;
-    if (!hal_claim_enter(c)) {
+    if (!io_claim_enter(c)) {
         kfree(o);
         return -N_ERR_CLOSED;
     }
-    struct hal_device *d = c->d;
+    struct io_device *d = c->d;
     int64_t r = 0;
     mutex_lock(&c->offers_mutex);
     for (struct claim_offer *e = c->offers; e; e = e->next)
         if (e->kind == kind && e->instance == instance) r = -N_ERR_EXISTS;
-    if (!r && hal_claim_revoked(c)) r = -N_ERR_CLOSED; /* offers_end はこの錠の後に走る */
+    if (!r && io_claim_revoked(c)) r = -N_ERR_CLOSED; /* offers_end はこの錠の後に走る */
     if (!r) {
-        hal_offer(d, kind, instance, label);
+        io_offer(d, kind, instance, label);
         o->next = c->offers;
         c->offers = o;
     }
     mutex_unlock(&c->offers_mutex);
-    hal_put(d);
+    io_put(d);
     if (r) kfree(o);
     return r;
 }
 
-int64_t hal_claim_offer_withdraw(struct handle *h, uint32_t kind, uint32_t instance) {
-    struct hal_claim *c = hal_claim_of(h);
+int64_t io_claim_offer_withdraw(struct handle *h, uint32_t kind, uint32_t instance) {
+    struct io_claim *c = io_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
-    if (!hal_claim_enter(c)) return -N_ERR_CLOSED;
-    struct hal_device *d = c->d;
+    if (!io_claim_enter(c)) return -N_ERR_CLOSED;
+    struct io_device *d = c->d;
     struct claim_offer *found = NULL;
     mutex_lock(&c->offers_mutex);
     for (struct claim_offer **p = &c->offers; *p; p = &(*p)->next)
@@ -408,20 +408,20 @@ int64_t hal_claim_offer_withdraw(struct handle *h, uint32_t kind, uint32_t insta
             *p = found->next;
             break;
         }
-    if (found) hal_offer_withdraw(d, kind, instance);
+    if (found) io_offer_withdraw(d, kind, instance);
     mutex_unlock(&c->offers_mutex);
-    hal_put(d);
+    io_put(d);
     if (!found) return -N_ERR_NOT_FOUND;
     kfree(found);
     return 0;
 }
 
 /* 終わりの中で：出した提供を全部引っ込める。 */
-static void offers_end(struct hal_claim *c) {
+static void offers_end(struct io_claim *c) {
     mutex_lock(&c->offers_mutex);
     for (struct claim_offer *o = c->offers, *next; o; o = next) {
         next = o->next;
-        hal_offer_withdraw(c->d, o->kind, o->instance);
+        io_offer_withdraw(c->d, o->kind, o->instance);
         kfree(o);
     }
     c->offers = NULL;
@@ -430,8 +430,8 @@ static void offers_end(struct hal_claim *c) {
 
 /* ---- 眠り ---- */
 
-int64_t hal_claim_power_wait(struct handle *h, uint64_t deadline) {
-    struct hal_claim *c = hal_claim_of(h);
+int64_t io_claim_power_wait(struct handle *h, uint64_t deadline) {
+    struct io_claim *c = io_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     __atomic_store_n(&c->sleeps, true, __ATOMIC_RELEASE);
     uint64_t irq = spin_lock(&c->power_lock);
@@ -444,7 +444,7 @@ int64_t hal_claim_power_wait(struct handle *h, uint64_t deadline) {
         }
         int64_t r = 0;
         if (thread_current()->killed) r = -N_ERR_STOPPED;
-        else if (hal_claim_revoked(c)) r = -N_ERR_CLOSED;
+        else if (io_claim_revoked(c)) r = -N_ERR_CLOSED;
         else if (clock_now_ns() >= deadline) r = -N_ERR_TIMEOUT;
         if (r) {
             spin_unlock(&c->power_lock, irq);
@@ -456,8 +456,8 @@ int64_t hal_claim_power_wait(struct handle *h, uint64_t deadline) {
     }
 }
 
-int64_t hal_claim_power_done(struct handle *h, bool ok) {
-    struct hal_claim *c = hal_claim_of(h);
+int64_t io_claim_power_done(struct handle *h, bool ok) {
+    struct io_claim *c = io_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     uint64_t irq = spin_lock(&c->power_lock);
     bool awaiting = c->power_awaiting;
@@ -470,8 +470,8 @@ int64_t hal_claim_power_done(struct handle *h, bool ok) {
     return awaiting ? 0 : -N_ERR_INVALID;
 }
 
-bool hal_claim_suspend(struct hal_claim *c) {
-    if (!hal_claim_sleeps(c)) return false;
+bool io_claim_suspend(struct io_claim *c) {
+    if (!io_claim_sleeps(c)) return false;
     uint64_t deadline = clock_after(SLEEP_ANSWER_NS);
     uint64_t irq = spin_lock(&c->power_lock);
     c->power_event = N_HAL_POWER_SUSPEND;
@@ -479,7 +479,7 @@ bool hal_claim_suspend(struct hal_claim *c) {
     c->power_awaiting = true;
     c->power_answer = 0;
     wq_wake_all(&c->power_wq);
-    while (!c->power_answer && !hal_claim_revoked(c) && clock_now_ns() < deadline) {
+    while (!c->power_answer && !io_claim_revoked(c) && clock_now_ns() < deadline) {
         wq_wait_locked_until(&c->power_wq, &c->power_lock, deadline);
         spin_take(&c->power_lock);
     }
@@ -488,7 +488,7 @@ bool hal_claim_suspend(struct hal_claim *c) {
     return ok;
 }
 
-void hal_claim_resume(struct hal_claim *c) {
+void io_claim_resume(struct io_claim *c) {
     uint64_t irq = spin_lock(&c->power_lock);
     if (c->power_told) {
         c->power_told = false;
@@ -502,7 +502,7 @@ void hal_claim_resume(struct hal_claim *c) {
 
 /* ---- 終わり ---- */
 
-bool hal_claim_on_end(struct hal_claim *c, struct hal_claim_end *e) {
+bool io_claim_on_end(struct io_claim *c, struct io_claim_end *e) {
     uint64_t irq = spin_lock(&c->ends_lock);
     bool ok = !c->end_started;
     if (ok) {
@@ -513,7 +513,7 @@ bool hal_claim_on_end(struct hal_claim *c, struct hal_claim_end *e) {
     return ok;
 }
 
-static void claim_wake_power(struct hal_claim *c) {
+static void claim_wake_power(struct io_claim *c) {
     uint64_t irq = spin_lock(&c->power_lock);
     wq_wake_all(&c->power_wq);
     spin_unlock(&c->power_lock, irq);
@@ -521,22 +521,22 @@ static void claim_wake_power(struct hal_claim *c) {
 
 /* 一度だけ走る。写像を外し、割り込みを止め、バスが装置を止め、出した提供を引っ込め、claim の hook を走らせ、装置を
    実装の無い状態へ戻す。 */
-static void claim_end(struct hal_claim *c) {
-    uint64_t f = spin_lock(&hal_lock);
+static void claim_end(struct io_claim *c) {
+    uint64_t f = spin_lock(&io_lock);
     __atomic_store_n(&c->released, true, __ATOMIC_SEQ_CST);
-    spin_unlock(&hal_lock, f);
+    spin_unlock(&io_lock, f);
     wq_wake_all(&c->wq);
     claim_wake_power(c);
     /* 装置に触る終わりは電源の walk と並ばない：walk の SUSPEND の待ちは上の起こしで済み、終わりは walk の後に走る */
-    hal_busy_begin();
+    io_busy_begin();
     mutex_lock(&c->end_mutex);
     if (c->ended) {
         mutex_unlock(&c->end_mutex);
-        hal_busy_end();
+        io_busy_end();
         return;
     }
     c->ended = true;
-    struct hal_device *d = c->d;
+    struct io_device *d = c->d;
     shared_revoke_claim(c); /* どの process も装置の頁に触れなくなる */
     /* 走っている n_hal_interrupts が立てたものも切る */
     mutex_lock(&c->vectors_mutex);
@@ -547,10 +547,10 @@ static void claim_end(struct hal_claim *c) {
     offers_end(c);
     uint64_t irq = spin_lock(&c->ends_lock);
     c->end_started = true;
-    struct hal_claim_end *ends = c->ends;
+    struct io_claim_end *ends = c->ends;
     c->ends = NULL;
     spin_unlock(&c->ends_lock, irq);
-    for (struct hal_claim_end *e = ends, *next; e; e = next) {
+    for (struct io_claim_end *e = ends, *next; e; e = next) {
         next = e->next;
         e->ended(e, c);
     }
@@ -563,52 +563,52 @@ static void claim_end(struct hal_claim *c) {
     mutex_unlock(&claims_mutex);
     kprintf("hal: %s released\n", d->location);
     mutex_unlock(&c->end_mutex);
-    hal_unbind_process(d);
-    hal_busy_end();
+    io_unbind_process(d);
+    io_busy_end();
 }
 
 /* d->claim が見えている間は、object の参照が残っている。 */
-void hal_claim_end_device(struct hal_device *d) {
-    uint64_t f = spin_lock(&hal_lock);
-    struct hal_claim *c = d->claim;
+void io_claim_end_device(struct io_device *d) {
+    uint64_t f = spin_lock(&io_lock);
+    struct io_claim *c = d->claim;
     if (c) __atomic_add_fetch(&c->refs, 1, __ATOMIC_ACQ_REL);
-    spin_unlock(&hal_lock, f);
+    spin_unlock(&io_lock, f);
     if (!c) return;
     claim_end(c);
-    hal_claim_drop(c);
+    io_claim_drop(c);
 }
 
 static void claim_release(struct object *o) {
-    struct hal_claim *c = o->priv;
+    struct io_claim *c = o->priv;
     claim_end(c);
-    hal_claim_drop(c);
+    io_claim_drop(c);
 }
 
-/* d->bind を持っている：hal_remove は始まりが済むまで待つ。 */
-static int64_t claim_begin(struct hal_device *d, struct process *t, const char *driver, struct handle **out) {
-    const struct hal_claim_ops *ops = d->ops ? d->ops->claim : NULL;
+/* d->bind を持っている：io_remove は始まりが済むまで待つ。 */
+static int64_t claim_begin(struct io_device *d, struct process *t, const char *driver, struct handle **out) {
+    const struct io_claim_ops *ops = d->ops ? d->ops->claim : NULL;
     if (!ops) return -N_ERR_UNSUPPORTED;
-    struct hal_claim *c = kzalloc(sizeof *c);
+    struct io_claim *c = kzalloc(sizeof *c);
     if (!c) return -N_ERR_NO_MEMORY;
     object_init(&c->object, &claim_object_ops, c); /* 最後の handle が閉じると終わる */
     c->d = d;
     c->ops = ops;
     c->refs = 1;
-    int r = hal_bind_process(d, c, driver);
+    int r = io_bind_process(d, c, driver);
     if (r < 0) {
         kfree(c);
         return r;
     }
-    r = !hal_power_up(d) ? -N_ERR_IO : ops->begin ? ops->begin(c, &c->bus) : 0;
+    r = !io_power_up(d) ? -N_ERR_IO : ops->begin ? ops->begin(c, &c->bus) : 0;
     if (r < 0) {
-        hal_unbind_process(d);
+        io_unbind_process(d);
         kfree(c);
         return r;
     }
     struct handle *h = handle_open(&c->object, HANDLE_WRITE);
     if (!h) {
         claim_end(c);
-        hal_claim_drop(c);
+        io_claim_drop(c);
         return -N_ERR_NO_MEMORY;
     }
     mutex_lock(&claims_mutex);
@@ -623,16 +623,16 @@ static int64_t claim_begin(struct hal_device *d, struct process *t, const char *
     return 0;
 }
 
-int64_t hal_claim_open(uint32_t device, const char *driver, struct handle **out) {
+int64_t io_claim_open(uint32_t device, const char *driver, struct handle **out) {
     struct process *t = process_current();
     if (!t) return -N_ERR_DENIED;
-    struct hal_device *d = hal_find(device);
+    struct io_device *d = io_find(device);
     if (!d) return -N_ERR_NOT_FOUND;
-    hal_busy_begin(); /* 電源の walk の間は始めない */
+    io_busy_begin(); /* 電源の walk の間は始めない */
     mutex_lock(&d->bind);
-    int64_t r = d == &hal_root ? -N_ERR_NOT_FOUND : claim_begin(d, t, driver, out);
+    int64_t r = d == &io_root ? -N_ERR_NOT_FOUND : claim_begin(d, t, driver, out);
     mutex_unlock(&d->bind);
-    hal_busy_end();
-    hal_put(d);
+    io_busy_end();
+    io_put(d);
     return r;
 }

@@ -8,7 +8,7 @@
 #include "kernel.h"
 #include "dev/audio.h"
 #include "dev/pci.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "arch/cpu.h"
 #include "arch/irq.h"
 #include "arch/spin.h"
@@ -62,7 +62,7 @@ struct bd {
 } PACKED;
 
 /* 一つの codec。
-   錠の順：音の層の mutex → ac97_mutex → engine。HAL の DMA の錠（hal_dma_map・hal_dma_unmap、眠る）は音の層の mutex の
+   錠の順：音の層の mutex → ac97_mutex → engine。装置の管理者の DMA の錠（io_dma_map・io_dma_unmap、眠る）は音の層の mutex の
    後、ac97_mutex の外で取る。
    ac97_mutex：音の層の呼出し（open、close、run、status。層が一つずつ呼ぶ）と、suspend・resume を一つずつにする。
    generation、輪の大きさと場所、played、last_civ、last_at、ring_object はこの下。
@@ -80,13 +80,13 @@ struct ac97 {
     uint32_t bdl_bus;
     bool has_irq;        /* 割り込みの線がある。無ければ alarm が各緩衝の終わりに埋め直す */
     struct alarm refill; /* 鳴っている緩衝の終わり */
-    struct hal_device *hal;
+    struct io_device *hal;
     uint32_t buf_frames; /* 開いたものの */
     uint64_t buf_ns;
     uint64_t played; /* 機関が始めてから終えた緩衝の frame */
     int last_civ;
     uint64_t last_at;
-    struct object *ring_object; /* 開いた輪：音の層の共有 object。HAL を通して機関へ渡してある */
+    struct object *ring_object; /* 開いた輪：音の層の共有 object。装置の管理者を通して機関へ渡してある */
     uint64_t ring_phys, ring_pages;
 };
 
@@ -209,10 +209,10 @@ static int ac97_open(struct audio_output *output, const struct n_audio_device_fo
     (void)format; /* 申告した一つ */
     uint32_t frames = MAX(MIN(ring->block_frames, BUF_MOST), 2u);
     uint64_t pages = ALIGN_UP((uint64_t)frames * FRAME * NBUF, PAGE_SIZE) / PAGE_SIZE, phys, bus;
-    /* 輪は音の層とサービスも持つ共有 object：機関が届く番地の中に取り、開いている間 HAL を通して渡す */
+    /* 輪は音の層とサービスも持つ共有 object：機関が届く番地の中に取り、開いている間装置の管理者を通して渡す */
     struct object *memory = shared_kernel_contig(pages, ADDRESS_BITS, &phys);
     if (!memory) return -N_ERR_NO_MEMORY;
-    if (!hal_dma_map(c->hal, phys, pages, &bus)) {
+    if (!io_dma_map(c->hal, phys, pages, &bus)) {
         object_unref(memory);
         return -N_ERR_NO_MEMORY;
     }
@@ -270,7 +270,7 @@ static void ac97_close(struct audio_output *output) {
     uint64_t phys = c->ring_phys, pages = c->ring_pages;
     c->ring_object = NULL;
     mutex_unlock(&c->ac97_mutex);
-    hal_dma_unmap(c->hal, phys, pages); /* 機関は止まり、もう輪を読まない */
+    io_dma_unmap(c->hal, phys, pages); /* 機関は止まり、もう輪を読まない */
     object_unref(memory);
 }
 
@@ -301,9 +301,9 @@ static const struct audio_output_ops ac97_ops = {
     .open = ac97_open, .close = ac97_close, .run = ac97_run, .status = ac97_status};
 
 /* 混合器の登録はポートの BAR 0、bus master のものはポートの BAR 1。 */
-static int ac97_attach(struct hal_device *d) {
+static int ac97_attach(struct io_device *d) {
     struct pci_device *pci = pci_device_of(d);
-    uint16_t nam = hal_port(d, 0), nabm = hal_port(d, 1);
+    uint16_t nam = io_port(d, 0), nabm = io_port(d, 1);
     if (!nam || !nabm) return -N_ERR_UNSUPPORTED;
     struct ac97 *c = kzalloc(sizeof *c);
     if (!c) return -N_ERR_NO_MEMORY;
@@ -311,12 +311,12 @@ static int ac97_attach(struct hal_device *d) {
     c->nam = nam;
     c->nabm = nabm;
     d->driver_data = c;
-    hal_enable(d, HAL_ENABLE_PORTS | HAL_ENABLE_DMA);
+    io_enable(d, IO_ENABLE_PORTS | IO_ENABLE_DMA);
     int r = -N_ERR_NO_MEMORY;
 
-    hal_dma_bits(d, ADDRESS_BITS);
+    io_dma_bits(d, ADDRESS_BITS);
     uint64_t bus;
-    c->bdl_view = hal_dma_alloc(d, PAGE_SIZE, &bus);
+    c->bdl_view = io_dma_alloc(d, PAGE_SIZE, &bus);
     if (!c->bdl_view) {
         kprintf("audio: AC'97 found, but no memory it reaches for its descriptors\n");
         goto fail;
@@ -324,7 +324,7 @@ static int ac97_attach(struct hal_device *d) {
     c->bdl_bus = (uint32_t)bus;
     alarm_init(&c->refill, ac97_refill);
     c->has_irq =
-        hal_irq_enable(d, &(struct irq_spec){.name = "AC'97", .handler = ac97_irq, .context = c}, 1, NULL) == 1;
+        io_irq_enable(d, &(struct irq_spec){.name = "AC'97", .handler = ac97_irq, .context = c}, 1, NULL) == 1;
     mutex_lock(&c->ac97_mutex);
     bool started = codec_start(c);
     mutex_unlock(&c->ac97_mutex);
@@ -346,12 +346,12 @@ static int ac97_attach(struct hal_device *d) {
     c->output.size_count = 1;
     c->output.channels_low = c->output.channels_high = 2;
     audio_output_add(&c->output);
-    hal_offer(d, N_OFFER_AUDIO, 0, "AC'97");
+    io_offer(d, N_OFFER_AUDIO, 0, "AC'97");
     kprintf("audio: AC'97 (%04x) at ports %#x/%#x, %s, 48 kHz stereo\n", pci->device, nam, nabm,
             c->has_irq ? "interrupt" : "no interrupt (timed refill)");
     return 0;
 fail:
-    hal_irq_disable(d); /* 処理の記憶が去る前に */
+    io_irq_disable(d); /* 処理の記憶が去る前に */
     d->driver_data = NULL;
     kfree(c);
     return r;
@@ -359,7 +359,7 @@ fail:
 
 /* 機関を止め（RPBM を 0、2.2.7）、DMA が休むのを DCH で見る（2.2.4）。輪の位置は失われる：status は新しい世代で
    止まったと言い（dev/audio.h）、サービスは resume の後に始め直す。三つの目標で同じ。 */
-static bool ac97_suspend(struct hal_device *d, enum hal_power_target target) {
+static bool ac97_suspend(struct io_device *d, enum io_power_target target) {
     (void)target;
     struct ac97 *c = d->driver_data;
     mutex_lock(&c->ac97_mutex);
@@ -377,7 +377,7 @@ static bool ac97_suspend(struct hal_device *d, enum hal_power_target target) {
 }
 
 /* 電源を失った制御器も保った制御器も codec_start で整える。サービスに見させ、始め直させる。 */
-static bool ac97_resume(struct hal_device *d) {
+static bool ac97_resume(struct io_device *d) {
     struct ac97 *c = d->driver_data;
     mutex_lock(&c->ac97_mutex);
     bool started = codec_start(c);
@@ -385,7 +385,7 @@ static bool ac97_resume(struct hal_device *d) {
     audio_output_period(&c->output);
     if (started) return true;
     kprintf("audio: AC'97 at %s: the codec is not ready\n", d->location);
-    hal_failed(d, -N_ERR_IO);
+    io_failed(d, -N_ERR_IO);
     return false;
 }
 
@@ -393,12 +393,12 @@ static const struct n_hal_rule ac97_rules[] = {
     N_PCI_ID(0x8086, 0x2415), N_PCI_ID(0x8086, 0x2425), N_PCI_ID(0x8086, 0x2445),
     N_PCI_ID(0x8086, 0x2485), N_PCI_ID(0x8086, 0x24C5), N_PCI_ID(0x8086, 0x24D5),
     N_PCI_ID(0x8086, 0x266E), N_PCI_ID(0x8086, 0x27DE), N_PCI_ID(0x8086, 0x7195)};
-const struct hal_driver ac97_driver = {
+const struct io_driver ac97_driver = {
     .name = "ac97",
     .rules = ac97_rules,
     .rule_count = ARRAY_SIZE(ac97_rules),
     .attach = ac97_attach,
     .suspend = ac97_suspend,
     .resume = ac97_resume,
-    .after_sleep = HAL_AFTER_SLEEP_RESUME,
+    .after_sleep = IO_AFTER_SLEEP_RESUME,
 };

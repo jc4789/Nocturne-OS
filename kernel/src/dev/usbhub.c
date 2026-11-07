@@ -7,7 +7,7 @@
  * which run in the power walk's thread while the worker waits at the gate. */
 #include "kernel.h"
 #include "dev/usb.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/heap.h"
 #include "sys/clock.h"
 #include "sys/wait.h"
@@ -261,15 +261,15 @@ bool usbhub_set_depth(struct usb_device *d) {
 
 /* The hub interface: its device was configured as a hub (usbhub_prepare). A second hub interface of
    the device would share its state, so the first to come takes it. */
-static int hub_attach(struct hal_device *hal) {
+static int hub_attach(struct io_device *hal) {
     struct usb_interface *i = usb_interface_of(hal);
     struct usb_device *d = i->dev;
     struct hub *h = d->hub;
     const uint8_t *extra;
     unsigned extra_len;
     const struct usb_endpoint_desc *ep;
-    if (!h || !usb_interface_interrupt(i, &extra, &extra_len, &ep)) return HAL_DECLINE;
-    if (__atomic_exchange_n(&h->bound, true, __ATOMIC_ACQ_REL)) return HAL_DECLINE;
+    if (!h || !usb_interface_interrupt(i, &extra, &extra_len, &ep)) return IO_DECLINE;
+    if (__atomic_exchange_n(&h->bound, true, __ATOMIC_ACQ_REL)) return IO_DECLINE;
     h->report_ep = ep->address;
     if (hub_status_read(h)) h->hub_held = false; /* whether it has local power, and its ports can have any */
     if (!h->off) power_ports(h);
@@ -280,20 +280,20 @@ static int hub_attach(struct hal_device *hal) {
 }
 
 /* The devices behind the hub go with it (usb_remove), each by its own hub's worker. */
-static void hub_detach(struct hal_device *hal) { usbhub_detach(usb_interface_of(hal)->dev); }
+static void hub_detach(struct io_device *hal) { usbhub_detach(usb_interface_of(hal)->dev); }
 
 /* 眠りと休止に加わる。止めるものも戻すものも無い：hub の仕事は worker の上で門が止め、状態の変化の端点は制御器の
    もの。下の装置の link は xhci.c が木の順に usbhub_link_suspend と usbhub_link_resume で動かす。 */
 static const struct n_hal_rule hub_rules[] = {N_USB_INTERFACE_CLASS(9)};
-static const struct hal_driver hub_driver = {
+static const struct io_driver hub_driver = {
     .name = "usbhub",
     .rules = hub_rules,
     .rule_count = ARRAY_SIZE(hub_rules),
     .attach = hub_attach,
     .detach = hub_detach,
-    .after_sleep = HAL_AFTER_SLEEP_RESUME,
+    .after_sleep = IO_AFTER_SLEEP_RESUME,
 };
-HAL_DRIVER(hub_driver);
+IO_DRIVER(hub_driver);
 
 /* A change is known by the status change endpoint alone (USB 2.0 11.12.1): without it, the ports are asked. */
 void usbhub_reports_lost(struct usb_device *d, uint8_t address) {

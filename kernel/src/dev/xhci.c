@@ -14,11 +14,11 @@
  * interrupt endpoints to a second one and the bulk endpoints to a third, each with its own MSI-X
  * vector, where the controller and the PCI layer give that many; with fewer they share.
  *
- * 電源（hal/hal.h の契約、下の「眠り」の節）。眠りと休止の写しでは装置を残す形で止め（4.15、4.23.2）、状態を保った装置は
+ * 電源（io/io.h の契約、下の「眠り」の節）。眠りと休止の写しでは装置を残す形で止め（4.15、4.23.2）、状態を保った装置は
  * 戻りの後も同じ装置として残る。状態を失った装置は去り、つながっていれば数え直される。
  *
- * DMA（hal/hal.h）。制御器が届く番地の幅は AC64 が言い、attach が HAL に言う。制御器に渡すメモリー（輪、文脈、
- * Scratchpad、転送の緩衝）は全部 hal_dma_alloc で取り、制御器へ書く番地はその bus だけ。呼ぶ側のメモリーは制御器に
+ * DMA（io/io.h）。制御器が届く番地の幅は AC64 が言い、attach が装置の管理者に言う。制御器に渡すメモリー（輪、文脈、
+ * Scratchpad、転送の緩衝）は全部 io_dma_alloc で取り、制御器へ書く番地はその bus だけ。呼ぶ側のメモリーは制御器に
  * 渡さない：usb_control、usb_bulk、usb_send は自分の緩衝へ写し、stream の報告は緩衝の中を指す。 */
 #include "kernel.h"
 #include "arch/cpu.h"
@@ -26,7 +26,7 @@
 #include "arch/spin.h"
 #include "dev/pci.h"
 #include "dev/usb.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/heap.h"
 #include "sys/alarm.h"
 #include "sys/clock.h"
@@ -36,7 +36,7 @@
 #define RING_TRBS 256 /* one page; the last entry links back to the first */
 #define EV_PAGES 4    /* each event ring: one contiguous segment */
 #define EV_TRBS (EV_PAGES * 256)
-/* 構造の大きさ（Table 6-1）。hal_dma_alloc の番地は大きさ以上の 2 の冪の頁に揃う：一頁の構造は頁を、16 頁までの構造は
+/* 構造の大きさ（Table 6-1）。io_dma_alloc の番地は大きさ以上の 2 の冪の頁に揃う：一頁の構造は頁を、16 頁までの構造は
    64 KiB の境を跨がない。PAGESIZE が 4 KiB より大きい制御器でも、頁に揃った一頁は一つの PAGESIZE の中にある。 */
 #define RING_BYTES (RING_TRBS * sizeof(struct trb)) /* 輪の segment：64 KiB の境を跨がない */
 #define EV_BYTES (EV_PAGES * 4096)                  /* 事象の輪の segment：同じ */
@@ -153,7 +153,7 @@ enum ring_kind { RING_CONTROL, RING_PERIODIC, RING_BULK, RING_KINDS };
 
 struct ring {
     struct trb *trb;
-    uint64_t bus; /* 制御器に言う番地（hal_dma_alloc） */
+    uint64_t bus; /* 制御器に言う番地（io_dma_alloc） */
     unsigned enq;
     uint32_t cycle;
 };
@@ -258,7 +258,7 @@ struct interrupter {
 
 struct usb_hc {
     int index;
-    struct hal_device *hal; /* its PCI function */
+    struct io_device *hal; /* its PCI function */
     struct pci_device *pci;
     volatile uint8_t *cap, *op, *rt;
     volatile uint32_t *db;
@@ -388,7 +388,7 @@ static void ring_reset(struct ring *r) {
 }
 
 static bool ring_init(const struct usb_hc *hc, struct ring *r) {
-    if (!(r->trb = hal_dma_alloc(hc->hal, RING_BYTES, &r->bus))) return false;
+    if (!(r->trb = io_dma_alloc(hc->hal, RING_BYTES, &r->bus))) return false;
     ring_reset(r);
     return true;
 }
@@ -983,22 +983,22 @@ static int control(struct xdev *xd, uint8_t type, uint8_t request, uint16_t valu
     return got;
 }
 
-/* 装置の緩衝に入らない data stage は、wLength の全部（USB 2.0 9.3.5）の 64 KiB を自分で持つ。hal_dma_alloc の揃えで
-   64 KiB の境を跨がず、一つの TRB に入る（6.4.1）。制御器がまだ使うかもしれなければ返さない（HAL が detach の後に返す）。 */
+/* 装置の緩衝に入らない data stage は、wLength の全部（USB 2.0 9.3.5）の 64 KiB を自分で持つ。io_dma_alloc の揃えで
+   64 KiB の境を跨がず、一つの TRB に入る（6.4.1）。制御器がまだ使うかもしれなければ返さない（装置の管理者が detach の後に返す）。 */
 #define CONTROL_LONG_BYTES 0x10000
 
 int usb_control(struct usb_device *d, uint8_t type, uint8_t request, uint16_t value, uint16_t index,
                 void *buffer, uint16_t length) {
     struct xdev *xd = (struct xdev *)d;
-    struct hal_device *hal = d->hc->hal;
+    struct io_device *hal = d->hc->hal;
     bool lng = length > XFER_BYTES, over;
     uint64_t bus = xd->xfer_bus;
-    uint8_t *mem = lng ? hal_dma_alloc(hal, CONTROL_LONG_BYTES, &bus) : xd->xfer;
+    uint8_t *mem = lng ? io_dma_alloc(hal, CONTROL_LONG_BYTES, &bus) : xd->xfer;
     if (!mem) return -1;
     mutex_lock(&xd->ctl_mutex);
     int r = control(xd, type, request, value, index, buffer, length, mem, bus, &over);
     mutex_unlock(&xd->ctl_mutex);
-    if (lng && over) hal_dma_free(hal, mem);
+    if (lng && over) io_dma_free(hal, mem);
     return r;
 }
 
@@ -1024,8 +1024,8 @@ static unsigned address_dci(uint8_t address) { return (address & 15) * 2 + ((add
 static void free_endpoint(struct usb_hc *hc, struct endpoint *ep) {
     if (!ep) return;
     if (ep->type == 3) __atomic_fetch_sub(&hc->periodic[ep->interval], 1, __ATOMIC_RELAXED);
-    if (ep->ring.trb) hal_dma_free(hc->hal, ep->ring.trb);
-    if (ep->buf) hal_dma_free(hc->hal, ep->buf);
+    if (ep->ring.trb) io_dma_free(hc->hal, ep->ring.trb);
+    if (ep->buf) io_dma_free(hc->hal, ep->buf);
     kfree(ep);
 }
 
@@ -1035,7 +1035,7 @@ static bool endpoint_buffer(const struct usb_hc *hc, struct endpoint *ep, unsign
     if (ep->buf) return ep->len >= len && ep->count >= count;
     if (!len || !count || count > EP_XFERS) return false;
     unsigned stride = (len + 63) & ~63u;
-    if (!(ep->buf = hal_dma_alloc(hc->hal, (size_t)stride * count, &ep->buf_bus))) return false;
+    if (!(ep->buf = io_dma_alloc(hc->hal, (size_t)stride * count, &ep->buf_bus))) return false;
     ep->len = len;
     ep->stride = stride;
     ep->count = count;
@@ -1047,15 +1047,15 @@ static struct endpoint *find_endpoint(struct usb_device *d, uint8_t address) {
 }
 
 static void free_device(struct xdev *xd) {
-    struct hal_device *hal = xd->dev.hc->hal;
+    struct io_device *hal = xd->dev.hc->hal;
     kfree(xd->dev.product);
     kfree((void *)xd->dev.config);
     kfree(xd->interfaces);
     for (int i = 0; i < 32; i++) free_endpoint(xd->dev.hc, xd->ep[i]);
-    if (xd->out_ctx) hal_dma_free(hal, xd->out_ctx);
-    if (xd->in_ctx) hal_dma_free(hal, xd->in_ctx);
-    if (xd->ep0.trb) hal_dma_free(hal, xd->ep0.trb);
-    if (xd->xfer) hal_dma_free(hal, xd->xfer);
+    if (xd->out_ctx) io_dma_free(hal, xd->out_ctx);
+    if (xd->in_ctx) io_dma_free(hal, xd->in_ctx);
+    if (xd->ep0.trb) io_dma_free(hal, xd->ep0.trb);
+    if (xd->xfer) io_dma_free(hal, xd->xfer);
     kfree(xd);
 }
 
@@ -1081,7 +1081,7 @@ static void slot_quiet(struct usb_hc *hc, unsigned slot, struct xdev *xd) {
  * does, the memory stays allocated rather than handed back while the controller may still use it.
  * No drain looks at the slot once it is cleared here. */
 static void release_slot(struct usb_hc *hc, unsigned slot, struct xdev *xd) {
-    if (xd && xd->published) hal_remove(&xd->dev.hal);
+    if (xd && xd->published) io_remove(&xd->dev.hal);
     __atomic_store_n(&hc->slots[slot], NULL, __ATOMIC_RELEASE);
     sync_drains(hc);
     /* a controller stopped for a restart holds nothing of its old slots any more */
@@ -1455,7 +1455,7 @@ const char *usb_product(struct usb_device *d) {
     if (!d->product_read) {
         d->product_read = true;
         d->product = usb_string(d, d->desc.product_name);
-        if (d->product) hal_name(&d->hal, d->product);
+        if (d->product) io_name(&d->hal, d->product);
     }
     return d->product ? d->product : "";
 }
@@ -1551,7 +1551,7 @@ static bool configure(struct xdev *xd, const uint8_t *cfg, unsigned total) {
     return false;
 }
 
-/* The properties of an interface node (interfaces_publish), as the HAL's rules see them. */
+/* The properties of an interface node (interfaces_publish), as the device manager's rules see them. */
 static void interface_props(const struct usb_device *d, const struct usb_interface_desc *intf, struct n_hal_prop props[5]) {
     props[0] = (struct n_hal_prop){.key = N_HAL_PROP_BUS, .value = N_BUS_USB_INTERFACE};
     props[1] = (struct n_hal_prop){.key = N_PROP_USB_CLASS, .value = N_USB_CLASS_CODE(intf->cls, intf->subcls, intf->protocol)};
@@ -1568,7 +1568,7 @@ static bool configuration_supported(const struct usb_device *d, const uint8_t *c
         if (intf->alternate) continue;
         struct n_hal_prop props[5];
         interface_props(d, intf, props);
-        if (hal_driver_exists(props, ARRAY_SIZE(props), NULL)) return true;
+        if (io_driver_exists(props, ARRAY_SIZE(props), NULL)) return true;
     }
     return false;
 }
@@ -1722,16 +1722,16 @@ static unsigned port_speed_rank(const struct usb_hc *hc, unsigned p, unsigned id
    function, named by where it is plugged in (the controller, the root port, the port of each hub on the way). */
 static void device_publish(struct usb_hc *hc, struct xdev *xd) {
     struct usb_device *d = &xd->dev;
-    hal_device_init(&d->hal, N_BUS_USB, NULL);
-    hal_prop_number(&d->hal, N_PROP_USB_VENDOR, d->desc.vendor);
-    hal_prop_number(&d->hal, N_PROP_USB_PRODUCT, d->desc.product);
-    hal_prop_number(&d->hal, N_PROP_USB_RELEASE, d->desc.release);
-    hal_prop_number(&d->hal, N_PROP_USB_CLASS, N_USB_CLASS_CODE(d->desc.cls, d->desc.subcls, d->desc.protocol));
+    io_device_init(&d->hal, N_BUS_USB, NULL);
+    io_prop_number(&d->hal, N_PROP_USB_VENDOR, d->desc.vendor);
+    io_prop_number(&d->hal, N_PROP_USB_PRODUCT, d->desc.product);
+    io_prop_number(&d->hal, N_PROP_USB_RELEASE, d->desc.release);
+    io_prop_number(&d->hal, N_PROP_USB_CLASS, N_USB_CLASS_CODE(d->desc.cls, d->desc.subcls, d->desc.protocol));
     char where[48];
     if (d->parent) ksnprintf(where, sizeof where, "%s.%u", d->parent->hal.location, d->port);
     else ksnprintf(where, sizeof where, "USB %d-%u", hc->index + 1, d->root_port);
-    hal_location(&d->hal, where);
-    hal_publish(d->parent ? &d->parent->hal : hc->hal, &d->hal);
+    io_location(&d->hal, where);
+    io_publish(d->parent ? &d->parent->hal : hc->hal, &d->hal);
     xd->published = true;
 }
 
@@ -1751,16 +1751,16 @@ static void interfaces_publish(struct xdev *xd) {
         i->dev = d;
         i->desc = intf;
         i->offset = off;
-        hal_device_init(&i->hal, N_BUS_USB_INTERFACE, NULL);
-        hal_prop_number(&i->hal, N_PROP_USB_CLASS, N_USB_CLASS_CODE(intf->cls, intf->subcls, intf->protocol));
-        hal_prop_number(&i->hal, N_PROP_USB_INTERFACE, intf->number);
-        hal_prop_number(&i->hal, N_PROP_USB_VENDOR, d->desc.vendor);
-        hal_prop_number(&i->hal, N_PROP_USB_PRODUCT, d->desc.product);
+        io_device_init(&i->hal, N_BUS_USB_INTERFACE, NULL);
+        io_prop_number(&i->hal, N_PROP_USB_CLASS, N_USB_CLASS_CODE(intf->cls, intf->subcls, intf->protocol));
+        io_prop_number(&i->hal, N_PROP_USB_INTERFACE, intf->number);
+        io_prop_number(&i->hal, N_PROP_USB_VENDOR, d->desc.vendor);
+        io_prop_number(&i->hal, N_PROP_USB_PRODUCT, d->desc.product);
         char where[64];
         ksnprintf(where, sizeof where, "%s:%u", d->hal.location, intf->number);
-        hal_location(&i->hal, where);
+        io_location(&i->hal, where);
         xd->ninterfaces++;
-        hal_publish(&d->hal, &i->hal);
+        io_publish(&d->hal, &i->hal);
     }
 }
 
@@ -1781,9 +1781,9 @@ static struct xdev *device_attach(struct usb_hc *hc, struct usb_device *parent, 
                              .tt_slot = tt_slot, .tt_port = tt_port};
     xd->speed_id = (uint8_t)speed_id;
     xd->ep0_state = EP_RUNNING;
-    if (!(xd->out_ctx = hal_dma_alloc(hc->hal, CTX_BYTES, &xd->out_bus)) ||
-        !(xd->in_ctx = hal_dma_alloc(hc->hal, CTX_BYTES, &xd->in_bus)) || !ring_init(hc, &xd->ep0) ||
-        !(xd->xfer = hal_dma_alloc(hc->hal, XFER_BYTES, &xd->xfer_bus)))
+    if (!(xd->out_ctx = io_dma_alloc(hc->hal, CTX_BYTES, &xd->out_bus)) ||
+        !(xd->in_ctx = io_dma_alloc(hc->hal, CTX_BYTES, &xd->in_bus)) || !ring_init(hc, &xd->ep0) ||
+        !(xd->xfer = io_dma_alloc(hc->hal, XFER_BYTES, &xd->xfer_bus)))
         goto fail;
     hc->dcbaa[slot] = xd->out_bus;
     __atomic_store_n(&hc->slots[slot], xd, __ATOMIC_RELEASE);
@@ -1832,7 +1832,7 @@ static struct xdev *device_attach(struct usb_hc *hc, struct usb_device *parent, 
     }
     if (!cfg) {
         kprintf("usb: slot %u could not be configured\n", slot);
-        hal_failed(&d->hal, -N_ERR_IO);
+        io_failed(&d->hal, -N_ERR_IO);
         return xd; /* stays addressed so a disconnect still frees it */
     }
     /* A hub's descriptor may only be asked of it configured (USB 2.0 11.24.2.5, USB 3.2 10.16.2.3), and
@@ -1879,7 +1879,7 @@ struct usb_device *usb_attach_child(struct usb_device *hub, unsigned port, unsig
 
 /* On its controller's worker. Once marked removed, no drain hands it another completion (they are
    synchronized with), and every transfer waited for on it ends: the class drivers then drop it
-   (hal_remove of each interface, then of the device), and the slot goes. */
+   (io_remove of each interface, then of the device), and the slot goes. */
 void usb_remove(struct usb_device *d) {
     if (removed(d)) return;
     struct xdev *xd = (struct xdev *)d;
@@ -1898,7 +1898,7 @@ void usb_remove(struct usb_device *d) {
     }
     kprintf("usb: slot %u (%04x:%04x) removed\n", d->slot, d->desc.vendor, d->desc.product);
     /* the class drivers, each after its own users are out; the hub's takes its devices with it */
-    for (unsigned i = xd->ninterfaces; i-- > 0;) hal_remove(&xd->interfaces[i].hal);
+    for (unsigned i = xd->ninterfaces; i-- > 0;) io_remove(&xd->interfaces[i].hal);
     xd->ninterfaces = 0;
     usbhub_detach(d); /* a hub that no driver took */
     release_slot(hc, d->slot, xd);
@@ -2171,7 +2171,7 @@ static bool hc_quiesce(struct usb_hc *hc) {
     if (hc_halt(hc)) return true;
     kprintf("usb: controller %d does not halt, turned off\n", hc->index);
     pci_disable_busmaster(hc->pci, NULL);
-    hal_failed(hc->hal, -N_ERR_IO);
+    io_failed(hc->hal, -N_ERR_IO);
     return false;
 }
 
@@ -2200,8 +2200,8 @@ static void hc_take_ownership(struct usb_hc *hc) {
 }
 
 static void interrupter_free(struct interrupter *ir) {
-    if (ir->ev) hal_dma_free(ir->hc->hal, ir->ev);
-    if (ir->erst) hal_dma_free(ir->hc->hal, ir->erst);
+    if (ir->ev) io_dma_free(ir->hc->hal, ir->ev);
+    if (ir->erst) io_dma_free(ir->hc->hal, ir->erst);
 }
 
 /* The interrupters, once: their memory, then as many as the kinds of events, the controller's MaxIntrs
@@ -2220,15 +2220,15 @@ static bool interrupters_init(struct usb_hc *hc) {
         ir->regs = hc->rt + IR_SET(i);
         specs[i] = (struct irq_spec){.name = "xHCI", .handler = xhci_isr, .context = ir};
         /* 事象の輪の一つの segment と、それを指す一項の表（6.5） */
-        if ((ir->ev = hal_dma_alloc(hc->hal, EV_BYTES, &ir->ev_bus)) &&
-            (ir->erst = hal_dma_alloc(hc->hal, 2 * sizeof *ir->erst, &ir->erst_bus)))
+        if ((ir->ev = io_dma_alloc(hc->hal, EV_BYTES, &ir->ev_bus)) &&
+            (ir->erst = io_dma_alloc(hc->hal, 2 * sizeof *ir->erst, &ir->erst_bus)))
             continue;
         for (unsigned j = 0; j <= i; j++) interrupter_free(&intr[j]);
         kfree(intr);
         return false;
     }
     hc->intr = intr;
-    unsigned got = hal_irq_enable(hc->hal, specs, want, irqs);
+    unsigned got = io_irq_enable(hc->hal, specs, want, irqs);
     hc->nintr = got ? got : 1;
     __atomic_store_n(&hc->polled, !got, __ATOMIC_RELEASE);
     for (unsigned i = 0; i < got; i++) intr[i].irq = irqs[i];
@@ -2279,7 +2279,7 @@ static void interrupter_start(struct usb_hc *hc, struct interrupter *ir) {
 }
 
 /* Scratchpad（4.20）：Max Scratchpad Buffers の数（5.3.4）の、PAGESIZE（5.4.3：一番小さい 2^(n+12) バイト）の緩衝と、
-   その番地の配列。緩衝は大きさが 2 の冪の頁なので、hal_dma_alloc の揃えで PAGESIZE の境に乗り、0 で埋まっている。
+   その番地の配列。緩衝は大きさが 2 の冪の頁なので、io_dma_alloc の揃えで PAGESIZE の境に乗り、0 で埋まっている。
    配列は Table 6-1 では 248 バイトで PAGESIZE を跨がないが、項は 1023 まである（5.3.4、6.6）：512 項までは一頁に入り、
    それより多い配列は二つの文が合わず、頁を跨ぐ。制御器は配列と緩衝をキャッシュを覗かずに読み書きする（4.18.2.2）：
    CPU が書いた 0 と番地を書き戻して捨ててから渡す（後で書き戻る CPU の行が制御器の状態を潰さない）。 */
@@ -2288,9 +2288,9 @@ static bool scratchpad_init(struct usb_hc *hc, unsigned count) {
     size_t bytes = (size_t)4096 << (pagesize ? __builtin_ctz(pagesize) : 0);
     void **buffers = kmalloc(count * sizeof *buffers); /* 失敗したとき返すため */
     uint64_t bus = 0;
-    uint64_t *array = buffers ? hal_dma_alloc(hc->hal, count * sizeof *array, &bus) : NULL;
+    uint64_t *array = buffers ? io_dma_alloc(hc->hal, count * sizeof *array, &bus) : NULL;
     unsigned made = 0;
-    while (array && made < count && (buffers[made] = hal_dma_alloc(hc->hal, bytes, &array[made]))) {
+    while (array && made < count && (buffers[made] = io_dma_alloc(hc->hal, bytes, &array[made]))) {
         cpu_cache_flush(buffers[made], bytes);
         made++;
     }
@@ -2299,8 +2299,8 @@ static bool scratchpad_init(struct usb_hc *hc, unsigned count) {
         cpu_cache_flush(array, count * sizeof *array);
         hc->scratch_bus = bus;
     } else {
-        while (made) hal_dma_free(hc->hal, buffers[--made]);
-        if (array) hal_dma_free(hc->hal, array);
+        while (made) io_dma_free(hc->hal, buffers[--made]);
+        if (array) io_dma_free(hc->hal, array);
     }
     kfree(buffers);
     return whole;
@@ -2356,7 +2356,7 @@ static bool hc_start(struct usb_hc *hc) {
     /* a restart after a fatal error reuses the memory: the reset took it back from the controller */
     if (hc->dcbaa)
         memset(hc->dcbaa, 0, DCBAA_BYTES);
-    else if (!(hc->dcbaa = hal_dma_alloc(hc->hal, DCBAA_BYTES, &hc->dcbaa_bus)))
+    else if (!(hc->dcbaa = io_dma_alloc(hc->hal, DCBAA_BYTES, &hc->dcbaa_bus)))
         return false;
     if (hc->cmd.trb) ring_reset(&hc->cmd);
     else if (!ring_init(hc, &hc->cmd)) return false;
@@ -2436,9 +2436,9 @@ static bool hc_start_again(struct usb_hc *hc) {
     bool up = hc_start(hc);
     if (up) {
         hc->failed = false;
-        hal_recovered(hc->hal);
+        io_recovered(hc->hal);
     } else {
-        hal_failed(hc->hal, -N_ERR_IO);
+        io_failed(hc->hal, -N_ERR_IO);
     }
     return up;
 }
@@ -2452,7 +2452,7 @@ static void hc_restart(struct usb_hc *hc, bool after_sleep) {
     }
     if (++hc->restarts > 3) {
         kprintf("usb: controller %d keeps failing, left off\n", hc->index);
-        hal_failed(hc->hal, -N_ERR_IO);
+        io_failed(hc->hal, -N_ERR_IO);
         return;
     }
     kprintf("usb: controller %d restarting (attempt %u)\n", hc->index, hc->restarts);
@@ -2462,7 +2462,7 @@ static void hc_restart(struct usb_hc *hc, bool after_sleep) {
 static void hc_settled(struct usb_hc *hc) {
     if (hc->settled) return;
     hc->settled = true;
-    hal_looking_end(); /* its first look at every port and hub is done */
+    io_looking_end(); /* its first look at every port and hub is done */
 }
 
 /* One round of the worker: restarts, ports, hubs, recoveries and the class drivers' work. */
@@ -2472,8 +2472,8 @@ static void hc_round(struct usb_hc *hc, uint64_t settle_at) {
     if ((sts == 0xFFFFFFFFu) != hc->gone) {
         hc->gone = !hc->gone;
         kprintf("usb: controller %d %s the bus\n", hc->index, hc->gone ? "is gone from" : "is back on");
-        if (hc->gone) hal_failed(hc->hal, -N_ERR_IO);
-        else hal_recovered(hc->hal);
+        if (hc->gone) io_failed(hc->hal, -N_ERR_IO);
+        else io_recovered(hc->hal);
     }
     if ((sts & (STS_HSE | STS_HCE)) && sts != 0xFFFFFFFFu && !hc->failed) { /* all ones: gone from the bus */
         hc->failed = true;
@@ -2494,23 +2494,23 @@ static void hc_round(struct usb_hc *hc, uint64_t settle_at) {
 }
 
 /* A controller's worker: its bring-up, ports, hubs, enumeration, recoveries and restarts. A fair
-   thread: none of this is periodic, and none of it holds a completion up. A round is hal_busy, so a
+   thread: none of this is periodic, and none of it holds a completion up. A round is io_busy, so a
    change of power waits for it and it waits for the change. Detach ends it. */
 static void hc_worker(void *arg) {
     struct usb_hc *hc = arg;
-    hal_busy_begin();
+    io_busy_begin();
     if (!hc_start(hc)) {
         hc->failed = true;
-        hal_failed(hc->hal, -N_ERR_IO);
+        io_failed(hc->hal, -N_ERR_IO);
         hc_settled(hc);
     }
-    hal_busy_end();
+    io_busy_end();
     uint64_t settle_at = clock_after(500 * NS_PER_MS);
     while (!__atomic_load_n(&hc->stopping, __ATOMIC_ACQUIRE)) {
         uint64_t seen = __atomic_load_n(&hc->kicks, __ATOMIC_ACQUIRE);
-        hal_busy_begin();
+        io_busy_begin();
         hc_round(hc, settle_at);
-        hal_busy_end();
+        io_busy_end();
         /* the next look: a recovery retry, settling, else the second after which the controller's
            status is looked at again (a fatal error raises no event) */
         uint64_t now = clock_now_ns();
@@ -2518,15 +2518,15 @@ static void hc_worker(void *arg) {
         if (!hc->settled && now < settle_at) next = MIN(next, settle_at);
         if (next > now) wq_wait_unless(&hc->work_wq, &hc->kicks, seen, next);
     }
-    hal_busy_begin();
+    io_busy_begin();
     if (hc->op) hc_stop(hc);
     hc_settled(hc);
-    hal_busy_end();
+    io_busy_end();
     __atomic_store_n(&hc->ended, true, __ATOMIC_RELEASE);
     hc_kick(hc);
 }
 
-/* ---- 眠り、休止の写し、電源断（hal.h の suspend と resume） ----
+/* ---- 眠り、休止の写し、電源断（io.h の suspend と resume） ----
  *
  * 眠り（S3）と休止の写しでは装置は残る。中断した装置は address と構成を持つ（USB 2.0 9.1.1.6、USB 3.2 9.2.5.2）。
  * 止め方は 4.15 と 4.23.2：各装置の端点を SP つきの Stop Endpoint で止め（4.15.1.1）、link を U3 にし、R/S を落とし、
@@ -2777,20 +2777,20 @@ static bool hc_wake(struct usb_hc *hc) {
     return false;
 }
 
-/* 電源の段（hal.h）。interface の実装はもう止まり、worker は電源の門で待っている。 */
-static bool xhci_suspend(struct hal_device *d, enum hal_power_target target) {
+/* 電源の段（io.h）。interface の実装はもう止まり、worker は電源の門で待っている。 */
+static bool xhci_suspend(struct io_device *d, enum io_power_target target) {
     struct usb_hc *hc = d->driver_data;
     hc->slept = hc->saved = false;
     /* 立ち上がらなかった、立て直しで止まったままの、バスから消えた制御器：止めるものが無い */
     if (!hc->op || !hc_running(hc) || rd32(hc->op, USBSTS) == 0xFFFFFFFFu) return true;
     switch (target) {
-    case HAL_POWER_SLEEP:
-    case HAL_POWER_IMAGE:
+    case IO_POWER_SLEEP:
+    case IO_POWER_IMAGE:
         devices_sleep(hc);
         ports_sleep(hc);
         hc->quiet_at = clock_now_ns();
         break;
-    case HAL_POWER_OFF:
+    case IO_POWER_OFF:
         for (unsigned s = 1; s <= hc->max_slots; s++)
             if (hc->slots[s]) endpoints_close(hc->slots[s]);
         break;
@@ -2801,15 +2801,15 @@ static bool xhci_suspend(struct hal_device *d, enum hal_power_target target) {
     hc_set_running(hc, false);
     if (!halted) return false;
     switch (target) {
-    case HAL_POWER_SLEEP: hc->saved = hc_save(hc); break;
-    case HAL_POWER_IMAGE: break; /* 写しから戻る時、制御器は起動のカーネルのもの：写す状態は無い */
-    case HAL_POWER_OFF: hc_reset(hc); break;
+    case IO_POWER_SLEEP: hc->saved = hc_save(hc); break;
+    case IO_POWER_IMAGE: break; /* 写しから戻る時、制御器は起動のカーネルのもの：写す状態は無い */
+    case IO_POWER_OFF: hc_reset(hc); break;
     }
     return true;
 }
 
-/* 状態を失った制御器も true：worker が立て直す（hc_round の lost）。それも駄目なら worker が hal_failed で言う。 */
-static bool xhci_resume(struct hal_device *d) {
+/* 状態を失った制御器も true：worker が立て直す（hc_round の lost）。それも駄目なら worker が io_failed で言う。 */
+static bool xhci_resume(struct io_device *d) {
     struct usb_hc *hc = d->driver_data;
     if (!hc->slept) return true;
     hc->slept = false;
@@ -2827,8 +2827,8 @@ static bool xhci_resume(struct hal_device *d) {
     return true;
 }
 
-static int xhci_attach(struct hal_device *d) {
-    const struct n_hal_resource *bar = hal_resource(d, N_HAL_MEMORY, 0);
+static int xhci_attach(struct io_device *d) {
+    const struct n_hal_resource *bar = io_resource(d, N_HAL_MEMORY, 0);
     if (!bar || bar->size < 0x1000) {
         kprintf("usb: the controller at %s has no usable register window\n", d->location);
         return -N_ERR_UNSUPPORTED;
@@ -2842,19 +2842,19 @@ static int xhci_attach(struct hal_device *d) {
     hc->hal = d;
     hc->pci = pci_device_of(d);
     hc->bar_size = bar->size;
-    if (!(hc->cap = hal_map(d, 0))) {
+    if (!(hc->cap = io_map(d, 0))) {
         kprintf("usb: controller %d: no memory to map its registers\n", hc->index);
         kfree(hc);
         return -N_ERR_NO_MEMORY;
     }
     /* register の窓に答えさせ、メモリーへ読み書きさせる。届く番地の幅は AC64（HCCPARAMS1 の bit 0、Table 5-13）で、
-       DMA のメモリーを取る前に HAL へ言う */
-    hal_enable(d, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA);
+       DMA のメモリーを取る前に装置の管理者へ言う */
+    io_enable(d, IO_ENABLE_MEMORY | IO_ENABLE_DMA);
     hc->ac64 = rd32(hc->cap, 0x10) & 1;
-    hal_dma_bits(d, hc->ac64 ? 64 : 32);
+    io_dma_bits(d, hc->ac64 ? 64 : 32);
     d->driver_data = hc;
     alarm_init(&hc->poll, poll_fire);
-    hal_looking_begin();
+    io_looking_begin();
     char name[16];
     ksnprintf(name, sizeof name, "usb%d", hc->index);
     if (!(hc->worker = kthread_create(name, hc_worker, hc))) {
@@ -2868,8 +2868,8 @@ static int xhci_attach(struct hal_device *d) {
 }
 
 /* The function leaves, or is given to a program: the worker removes every device, halts the controller and ends.
-   Its structures stay, as the HAL turns its interrupts off only after this returns and a drain may still read them. */
-static void xhci_detach(struct hal_device *d) {
+   Its structures stay, as the device manager turns its interrupts off only after this returns and a drain may still read them. */
+static void xhci_detach(struct io_device *d) {
     struct usb_hc *hc = d->driver_data;
     __atomic_store_n(&hc->stopping, true, __ATOMIC_RELEASE);
     hc_kick(hc);
@@ -2881,7 +2881,7 @@ static void xhci_detach(struct hal_device *d) {
 }
 
 static const struct n_hal_rule xhci_rules[] = {N_PCI_CLASS_PROGIF(0x0C, 0x03, 0x30)};
-static const struct hal_driver xhci_driver = {
+static const struct io_driver xhci_driver = {
     .name = "xhci",
     .rules = xhci_rules,
     .rule_count = ARRAY_SIZE(xhci_rules),
@@ -2889,6 +2889,6 @@ static const struct hal_driver xhci_driver = {
     .detach = xhci_detach,
     .suspend = xhci_suspend,
     .resume = xhci_resume,
-    .after_sleep = HAL_AFTER_SLEEP_RESUME,
+    .after_sleep = IO_AFTER_SLEEP_RESUME,
 };
-HAL_DRIVER(xhci_driver);
+IO_DRIVER(xhci_driver);

@@ -1,4 +1,4 @@
-/* ACPI の装置の電源（hal/hal.h の struct hal_firmware_ops、ACPI 6.5 7.1〜7.3）：装置の D 状態（_PS0、_PS3、_PSC）と、
+/* ACPI の装置の電源（io/io.h の struct io_firmware_ops、ACPI 6.5 7.1〜7.3）：装置の D 状態（_PS0、_PS3、_PSC）と、
    装置が D0 で要る電源資源（_PR0 と、資源の _ON、_OFF、_STA）。
 
    電源資源は機械に一つずつあり、装置の _PR0 が参照する。資源は D0 にある装置の参照を数え、参照が 0 になれば切る
@@ -11,12 +11,12 @@
    無い資源（7.2.5 の受け身の資源）は呼ばない。
    装置の記録は acpi_power_init か、初めて電源を聞かれた時に作り、消さない。_PSx も _PR0 も無い装置の記録は D0 の
    まま何もしない。
-   錠：power_mutex が記録、数、AML の呼出しを一つずつにする（7.3.15 の _IRC も一つずつを求める）。HAL は電源の walk の
+   錠：power_mutex が記録、数、AML の呼出しを一つずつにする（7.3.15 の _IRC も一つずつを求める）。装置の管理者は電源の walk の
    装置ごとの thread と、結ぶ前の thread から並んで呼ぶ。acpi_power_restore だけは錠を取らない：ほかの CPU は止まり、
    walk も結ぶ前の thread も走っていない。 */
 #include "kernel.h"
 #include "dev/acpi.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "lib/avl.h"
 #include "mm/heap.h"
 #include "sys/wait.h"
@@ -214,20 +214,20 @@ static bool device_on(struct power_device *p, bool *cold) {
     return ok;
 }
 
-static bool firmware_power(struct firmware_node *node, enum hal_power_state to, bool *cold) {
+static bool firmware_power(struct firmware_node *node, enum io_power_state to, bool *cold) {
     *cold = false;
     mutex_lock(&power_mutex);
     struct power_device *p = device_get(acpi_namespace_node(node));
     bool ok = p != NULL;
     if (!p) kprintf("acpi: no memory to keep a device's power\n");
-    else if (!managed(p) || p->d0 == (to == HAL_D0)) ok = true;
-    else if (to == HAL_D0) ok = device_on(p, cold);
+    else if (!managed(p) || p->d0 == (to == IO_D0)) ok = true;
+    else if (to == IO_D0) ok = device_on(p, cold);
     else ok = device_off(p, cold);
     mutex_unlock(&power_mutex);
     return ok;
 }
 
-static const struct hal_firmware_ops acpi_power_ops = {.power = firmware_power};
+static const struct io_firmware_ops acpi_power_ops = {.power = firmware_power};
 
 static uacpi_iteration_decision device_found(void *user, uacpi_namespace_node *node, uacpi_u32 depth) {
     (void)user;
@@ -241,7 +241,7 @@ void acpi_power_init(void) {
     uacpi_namespace_for_each_child(uacpi_namespace_root(), device_found, UACPI_NULL, UACPI_OBJECT_DEVICE_BIT,
                                    UACPI_MAX_DEPTH_ANY, UACPI_NULL);
     mutex_unlock(&power_mutex);
-    hal_firmware_set(&acpi_power_ops);
+    io_firmware_set(&acpi_power_ops);
 }
 
 static void resources_walk(struct avl_node *n, uint32_t *next, uint32_t order) {

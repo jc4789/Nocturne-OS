@@ -12,7 +12,7 @@
    may not meet a queued one (SATA 3.3, 13.6): they, and a queued command that failed, which is
    given again alone where a failure is its own, run one at a time on the disk's own thread
    (blk_serial_start). A disk without queuing takes one command at a time on that thread.
-   データは円盤と呼ぶ者のメモリーの間を直に動き、要求の区切りごとに PRD を一つ、その番地は blk.c が HAL で求めた
+   データは円盤と呼ぶ者のメモリーの間を直に動き、要求の区切りごとに PRD を一つ、その番地は blk.c が装置の管理者で求めた
    bus である。adapter の届く番地の幅は CAP.S64A が言い（無ければ 32 bit）、届かないメモリーの要求は blk.c の緩衝を
    通る（dev/blk.h）。
 
@@ -20,7 +20,7 @@
    adapter handles what may wait: a device that came or went (7.3, 6.2.2.3), what an HBA reset left
    to look at, a port that went on through an error with requests in it, and the time of each request.
 
-   眠り、休止、電源断は ahci_suspend と ahci_resume（hal/hal.h）：止める前に円盤を standby にし（10.10.3）、戻りは
+   眠り、休止、電源断は ahci_suspend と ahci_resume（io/io.h）：止める前に円盤を standby にし（10.10.3）、戻りは
    adapter を立ち上げ直して port を見直す。
 
    A failure goes down the steps of 10.4: the command list engine stopped and started again, a
@@ -35,7 +35,7 @@
 #include "arch/topology.h"
 #include "dev/blk.h"
 #include "dev/pci.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/heap.h"
 #include "sys/clock.h"
 #include "sys/thread.h"
@@ -196,7 +196,7 @@ struct port {
     struct disk *disk; /* the last one seen; written with the port to itself */
     struct disk *disks; /* atomic: every one it has seen, newest first */
     uint64_t retry_at, retry_ns; /* a device that did not answer: its next look (the examiner's) */
-    bool looking; /* atomic: it counts in hal_settled until a look has said who is there (port_looked) */
+    bool looking; /* atomic: it counts in io_settled until a look has said who is there (port_looked) */
     unsigned requests; /* atomic: the slots issued that have a request */
 
     /* Under lock, with the interrupt handler: the slots taken (a command being put together or in
@@ -227,7 +227,7 @@ struct port {
 
 struct hba {
     int index;
-    struct hal_device *hal;
+    struct io_device *hal;
     struct pci_device *pci;
     volatile uint8_t *regs;
     bool sncq, sss, ssc, sds, sadm;
@@ -486,7 +486,7 @@ static void port_fail_all(struct port *p) {
    its disks with it. */
 static void hba_kill(struct hba *h) {
     kprintf("ahci%d: the adapter is hung, turned off\n", h->index);
-    hal_failed(h->hal, -N_ERR_IO);
+    io_failed(h->hal, -N_ERR_IO);
     __atomic_store_n(&h->dead, true, __ATOMIC_RELEASE);
     pci_disable_busmaster(h->pci, NULL);
     for (unsigned n = 0; n < PORTS; n++)
@@ -1170,7 +1170,7 @@ static void port_add(struct hba *h, unsigned no) {
     p->no = no;
     p->regs = h->regs + 0x100 + 0x80 * no;
     p->all = 1;
-    if (!(p->mem = hal_dma_alloc(h->hal, TABLES_AT + (size_t)h->nslots * TABLE_BYTES, &p->mem_bus))) {
+    if (!(p->mem = io_dma_alloc(h->hal, TABLES_AT + (size_t)h->nslots * TABLE_BYTES, &p->mem_bus))) {
         kprintf("ahci%d: port %u: no memory for its commands\n", h->index, no);
         kfree(p);
         return;
@@ -1183,7 +1183,7 @@ static bool same_disk(const struct disk *a, const struct disk *b) {
 }
 
 static void port_looked(struct port *p) {
-    if (__atomic_exchange_n(&p->looking, false, __ATOMIC_ACQ_REL)) hal_looking_end();
+    if (__atomic_exchange_n(&p->looking, false, __ATOMIC_ACQ_REL)) io_looking_end();
 }
 
 /* Who is on the port now: reset, and asked. A disk it knew goes on if it is the one there; the one it
@@ -1303,11 +1303,11 @@ static int start(struct hba *h);
    disks, as the adapter's thread does. */
 static void first_look(void *arg) {
     struct port *p = arg;
-    hal_busy_begin();
+    io_busy_begin();
     mutex_lock(&p->examining);
     port_examine(p);
     mutex_unlock(&p->examining);
-    hal_busy_end();
+    io_busy_end();
     /* its retry time is for the adapter's thread to see */
     hba_kick(p->h);
 }
@@ -1319,7 +1319,7 @@ static void first_looks(struct hba *h) {
         char name[24];
         ksnprintf(name, sizeof name, "ahci%d.%u", h->index, n);
         p->looking = true;
-        hal_looking_begin();
+        io_looking_begin();
         if (!kthread_create(name, first_look, p)) {
             port_looked(p);
             hba_note(h, n); /* for the adapter's thread, in its turn */
@@ -1342,7 +1342,7 @@ static void requests_late(struct port *p) {
     if (late || __atomic_load_n(&p->attention, __ATOMIC_ACQUIRE)) halt(p, late ? late : 0xFFFFFFFFu);
 }
 
-/* The adapter's thread. What it does counts as a request of the disks (hal_busy_begin): a power
+/* The adapter's thread. What it does counts as a request of the disks (io_busy_begin): a power
    change waits for it, and it waits for that. It looks again at the ports whose devices did not
    answer, once their time comes. Polled, it reads the completions itself each millisecond while
    requests are out, and looks at the links each second. A port that went on through an error with
@@ -1358,7 +1358,7 @@ static void ahci_worker(void *arg) {
         uint64_t next = !out ? (h->irq ? CLOCK_NEVER : now + NS_PER_S) : now + (h->irq ? TICK_NS : NS_PER_MS);
         uint32_t changed = __atomic_exchange_n(&h->changed, 0, __ATOMIC_ACQ_REL);
         if (__atomic_exchange_n(&h->look_all, false, __ATOMIC_ACQ_REL)) changed = h->implemented;
-        hal_busy_begin();
+        io_busy_begin();
         for (unsigned n = 0; n < PORTS; n++) {
             struct port *p = h->ports[n];
             if (!p) continue;
@@ -1387,14 +1387,14 @@ static void ahci_worker(void *arg) {
                 if (h->ports[pick]) port_changed(h->ports[pick]);
             }
         }
-        hal_busy_end();
+        io_busy_end();
         if (!changed) wq_wait_unless(&h->wq, &h->kicks, seen, next);
     }
 }
 
 static int start(struct hba *h) {
     struct pci_device *pci = h->pci;
-    h->regs = hal_map(h->hal, 5); /* the adapter's registers and those of every port */
+    h->regs = io_map(h->hal, 5); /* the adapter's registers and those of every port */
     if (!h->regs) {
         kprintf("ahci%d: no register window\n", h->index);
         return -N_ERR_NOT_FOUND;
@@ -1404,7 +1404,7 @@ static int start(struct hba *h) {
     h->implemented = hba_rd(h, PI);
     /* 装置が届く番地：CAP.S64A なら一覧、受ける FIS、命令の表、PRD の上の 32 bit を読み、無ければそれを 0 と見なす
        （3.1.1、3.3.2、3.3.4、4.2.2、4.2.3） */
-    hal_dma_bits(h->hal, cap & CAP_S64A ? 64 : 32);
+    io_dma_bits(h->hal, cap & CAP_S64A ? 64 : 32);
     h->sncq = cap & CAP_SNCQ;
     h->sss = cap & CAP_SSS;
     h->ssc = cap & CAP_SSC;
@@ -1413,7 +1413,7 @@ static int start(struct hba *h) {
     h->nslots = (cap >> 8 & 0x1F) + 1;
     for (uint32_t m = h->implemented; m; m &= m - 1) port_add(h, (unsigned)__builtin_ctz(m));
     hba_wr(h, GHC, hba_rd(h, GHC) & ~GHC_IE); /* until PxIS and IS are clear */
-    hal_irq_enable(h->hal, &(struct irq_spec){.name = "AHCI", .handler = ahci_isr, .context = h}, 1,
+    io_irq_enable(h->hal, &(struct irq_spec){.name = "AHCI", .handler = ahci_isr, .context = h}, 1,
                    &h->irq);
     kprintf("ahci%d: %04x:%04x, version %x, ports %x, %u slots%s, %s\n", h->index, pci->vendor, pci->device,
             hba_rd(h, VS), h->implemented, h->nslots, h->sncq ? ", queued commands" : "", h->irq ? "interrupts" : "polled");
@@ -1447,9 +1447,9 @@ static void port_to_listen(struct port *p) {
     wr(p, PxCMD, rd(p, PxCMD) & ~CMD_SUD);
 }
 
-/* ---- 眠り、休止、電源断（hal/hal.h の suspend と resume）----
+/* ---- 眠り、休止、電源断（io/io.h の suspend と resume）----
    どちらも電源の walk の thread で、割り込みは開き、ほかの CPU も thread も動いている。adapter の thread と最初の見る者
-   は門（hal_busy_begin）で待つので、要求の時間を見るのも、割り込みの無い adapter の完了を読むのもここの仕事。データの
+   は門（io_busy_begin）で待つので、要求の時間を見るのも、割り込みの無い adapter の完了を読むのもここの仕事。データの
    道は port ごとの asleep で閉じる。錠の順は examining → h->reset（port_changed と同じ）。 */
 
 /* 眠りの印の後、port の中の命令が全部終わり、port を誰も持たなくなるまで。入った者（enter）の命令は自分の時間で終わる
@@ -1529,14 +1529,14 @@ static bool port_suspend(struct port *p, bool power_goes) {
 /* 全部の port を止め（port_suspend）、adapter の割り込みを閉じる。電源が去る SLEEP と OFF では円盤を standby と listen
    にする（10.10.3）。IMAGE では電源も PCI の状態も変わらず、engine の止まった adapter は何も動かさない。死んだ adapter
    は bus mastering が切れていて何も動かさない。 */
-static bool ahci_suspend(struct hal_device *d, enum hal_power_target target) {
+static bool ahci_suspend(struct io_device *d, enum io_power_target target) {
     struct hba *h = d->driver_data;
     if (__atomic_load_n(&h->dead, __ATOMIC_ACQUIRE)) return true;
     bool power_goes = false;
     switch (target) {
-    case HAL_POWER_SLEEP:
-    case HAL_POWER_OFF: power_goes = true; break;
-    case HAL_POWER_IMAGE: break;
+    case IO_POWER_SLEEP:
+    case IO_POWER_OFF: power_goes = true; break;
+    case IO_POWER_IMAGE: break;
     }
     bool kept = true;
     for (unsigned n = 0; n < PORTS; n++)
@@ -1553,7 +1553,7 @@ static bool ahci_suspend(struct hal_device *d, enum hal_power_target target) {
    円盤を持っていた、見る前だった）を見直す：眠りの間に円盤が替わり、去り、来たかもしれない。見直す間、ほかの者は
    その答えを待つ。答えない装置は adapter の thread が後で見直す（retry_at）。true なら adapter は動いていて、居ると
    分かった円盤は命令を受ける。 */
-static bool ahci_resume(struct hal_device *d) {
+static bool ahci_resume(struct io_device *d) {
     struct hba *h = d->driver_data;
     if (__atomic_load_n(&h->dead, __ATOMIC_ACQUIRE)) return true; /* 眠る前から使わない（hba_kill で言ってある） */
     mutex_lock(&h->reset);
@@ -1580,7 +1580,7 @@ static bool ahci_resume(struct hal_device *d) {
     return up;
 }
 
-static int ahci_attach(struct hal_device *d) {
+static int ahci_attach(struct io_device *d) {
     struct hba *h = kzalloc(sizeof *h);
     if (!h) {
         kprintf("ahci: no memory for the adapter at %s\n", d->location);
@@ -1596,11 +1596,11 @@ static int ahci_attach(struct hal_device *d) {
         kprintf("ahci%d: no thread for it\n", h->index);
         return -N_ERR_NO_MEMORY;
     }
-    hal_enable(d, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA);
+    io_enable(d, IO_ENABLE_MEMORY | IO_ENABLE_DMA);
     /* the firmware's handover and a staggered spin-up can take seconds: this thread is the device's own */
-    hal_busy_begin();
+    io_busy_begin();
     int r = start(h);
-    hal_busy_end();
+    io_busy_end();
     if (r < 0) {
         __atomic_store_n(&h->stopping, true, __ATOMIC_RELEASE);
         hba_kick(h);
@@ -1613,7 +1613,7 @@ static int ahci_attach(struct hal_device *d) {
 /* The adapter leaves, or is given to a program: its ports stopped, so nothing moves any more, and
    every command in them failed. The disks stay listed, gone; their threads stay, and fail what
    still reaches them. */
-static void ahci_detach(struct hal_device *d) {
+static void ahci_detach(struct io_device *d) {
     struct hba *h = d->driver_data;
     __atomic_store_n(&h->dead, true, __ATOMIC_RELEASE);
     __atomic_store_n(&h->stopping, true, __ATOMIC_RELEASE);
@@ -1629,7 +1629,7 @@ static void ahci_detach(struct hal_device *d) {
 }
 
 static const struct n_hal_rule ahci_rules[] = {N_PCI_CLASS_PROGIF(0x01, 0x06, 0x01)};
-static const struct hal_driver ahci_driver = {
+static const struct io_driver ahci_driver = {
     .name = "ahci",
     .rules = ahci_rules,
     .rule_count = ARRAY_SIZE(ahci_rules),
@@ -1637,6 +1637,6 @@ static const struct hal_driver ahci_driver = {
     .detach = ahci_detach,
     .suspend = ahci_suspend,
     .resume = ahci_resume,
-    .after_sleep = HAL_AFTER_SLEEP_RESUME,
+    .after_sleep = IO_AFTER_SLEEP_RESUME,
 };
-HAL_DRIVER(ahci_driver);
+IO_DRIVER(ahci_driver);

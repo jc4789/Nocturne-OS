@@ -2,16 +2,16 @@
 /* USB devices as the host controller driver (xhci.c) hands them to the class drivers
  * (usbhid.c, usbhub.c, usbmsc.c, usbnet.c).
  *
- * Nodes. A device is a HAL node of bus N_BUS_USB, the child of its hub's node (of the controller's
+ * Nodes. A device is a device manager node of bus N_BUS_USB, the child of its hub's node (of the controller's
  * PCI function on a root port). Each interface of alternate 0 of its configuration is a child of the
  * device, a node of bus N_BUS_USB_INTERFACE with the class code, the interface number and the
- * device's vendor and product among its properties. A class driver is a struct hal_driver whose rules
- * name the interface classes it takes (N_USB_INTERFACE_CLASS, N_USB_INTERFACE_SUBCLASS); the HAL binds
+ * device's vendor and product among its properties. A class driver is a struct io_driver whose rules
+ * name the interface classes it takes (N_USB_INTERFACE_CLASS, N_USB_INTERFACE_SUBCLASS); the device manager binds
  * it to each interface node that matches.
  *
  * Contexts. Each controller has a worker thread: it enumerates, runs hub work and the work functions
  * the class drivers register (usb_work_set), and removes devices: a class driver's detach runs
- * there, in hal_remove, after the device's last report. A class driver's attach runs in a thread
+ * there, in io_remove, after the device's last report. A class driver's attach runs in a thread
  * of its own for that interface, one per interface, and may sleep for seconds. A report function
  * (usb_report_fn) runs in the drain of the event ring that took the completion:
  * an interrupt, or a polled controller's alarm, with interrupts off. It never sleeps, takes no
@@ -19,13 +19,13 @@
  * usb_bulk and usb_clear_halt sleep until their transfer completes and run in any thread, on a
  * device that is not removed meanwhile (its class driver's detach waits for its users).
  *
- * 電源（hal.h）。interface の実装は制御器より先に suspend し、後に resume する。suspend では自分のデータの道を自分の
+ * 電源（io.h）。interface の実装は制御器より先に suspend し、後に resume する。suspend では自分のデータの道を自分の
  * 錠で閉じる。眠り（S3）と休止の写しの間、装置は残り（xhci.c が木を辿って端点を止め、link を中断する）、usb_control、
  * usb_bulk、usb_send、usb_clear_halt は -1 を返し、報告は来ない。眠りの間に電源を失った・抜かれた装置と、状態を失った
  * 制御器の装置は、門が開いた後に worker が外して（detach）数え直す（新しい装置として attach）。 */
 #include <stdint.h>
 #include <stdbool.h>
-#include "hal/hal.h"
+#include "io/io.h"
 #include "sys/clock.h"
 
 /* A port whose device does not come up, or that stays stuck, is tried one reset at a time, with the
@@ -109,7 +109,7 @@ struct usb_endpoint_desc {
 } __attribute__((packed));
 
 struct usb_device {
-    struct hal_device hal; /* first: N_BUS_USB, published once the device descriptor is read */
+    struct io_device hal; /* first: N_BUS_USB, published once the device descriptor is read */
     struct usb_hc *hc;
     struct usb_device *parent; /* hub, or NULL on a root port */
     uint8_t slot, speed, port, root_port, depth;
@@ -131,13 +131,13 @@ struct usb_device {
 
 /* An interface of alternate 0: the node a class driver binds to. The device's child; removed before it. */
 struct usb_interface {
-    struct hal_device hal; /* first: N_BUS_USB_INTERFACE */
+    struct io_device hal; /* first: N_BUS_USB_INTERFACE */
     struct usb_device *dev;
     const struct usb_interface_desc *desc; /* in dev->config */
     unsigned offset;                       /* of desc in dev->config */
     void (*work)(struct usb_interface *);  /* usb_work_set (atomic) */
 };
-static inline struct usb_interface *usb_interface_of(struct hal_device *d) {
+static inline struct usb_interface *usb_interface_of(struct io_device *d) {
     ASSERT(d->bus == N_BUS_USB_INTERFACE);
     return (struct usb_interface *)d;
 }

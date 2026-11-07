@@ -9,7 +9,7 @@
 #include "vm/hv/vmbus.h"
 #include "vm/ata.h"
 #include "vm/rdp.h"
-#include "hal/hal.h"
+#include "io/io.h"
 
 extern volatile struct limine_rsdp_request rsdp_req;
 
@@ -59,8 +59,8 @@ enum vm_machine vm_machine(void) { return machine; }
 
 /* The drivers of the devices only a virtual machine has. Each binds to a device by its rule like any
    other driver; here they are added only where such devices can be. */
-extern const struct hal_driver e1000_driver, tulip_driver, ac97_driver, vbe_driver, virtio_gpu_driver;
-extern const struct hal_driver netvsc_driver, hv_keyboard_driver, hv_mouse_driver, hv_util_driver;
+extern const struct io_driver e1000_driver, tulip_driver, ac97_driver, vbe_driver, virtio_gpu_driver;
+extern const struct io_driver netvsc_driver, hv_keyboard_driver, hv_mouse_driver, hv_util_driver;
 
 /* The legacy IDE ports, which no bus announces: a Generation 1 Hyper-V machine and QEMU's "pc" have
    them at the places the PC architecture fixes (vm/ata.c is the driver). */
@@ -68,34 +68,34 @@ extern const struct hal_driver netvsc_driver, hv_keyboard_driver, hv_mouse_drive
 #define IDE_PRIMARY_CONTROL 0x3F6
 #define IDE_SECONDARY 0x170
 #define IDE_SECONDARY_CONTROL 0x376
-static struct hal_device ide_ports;
+static struct io_device ide_ports;
 
 static void publish_ide_ports(void) {
-    hal_device_init(&ide_ports, N_BUS_FIXED, NULL);
-    hal_prop_text(&ide_ports, N_PROP_FIXED_NAME, "ide-ports");
-    hal_resource_add(&ide_ports, N_HAL_PORT, 0, 0, IDE_PRIMARY, 8);
-    hal_resource_add(&ide_ports, N_HAL_PORT, 1, 0, IDE_PRIMARY_CONTROL, 1);
-    hal_resource_add(&ide_ports, N_HAL_PORT, 2, 0, IDE_SECONDARY, 8);
-    hal_resource_add(&ide_ports, N_HAL_PORT, 3, 0, IDE_SECONDARY_CONTROL, 1);
-    hal_location(&ide_ports, "IDE ports");
-    hal_publish(NULL, &ide_ports);
+    io_device_init(&ide_ports, N_BUS_FIXED, NULL);
+    io_prop_text(&ide_ports, N_PROP_FIXED_NAME, "ide-ports");
+    io_resource_add(&ide_ports, N_HAL_PORT, 0, 0, IDE_PRIMARY, 8);
+    io_resource_add(&ide_ports, N_HAL_PORT, 1, 0, IDE_PRIMARY_CONTROL, 1);
+    io_resource_add(&ide_ports, N_HAL_PORT, 2, 0, IDE_SECONDARY, 8);
+    io_resource_add(&ide_ports, N_HAL_PORT, 3, 0, IDE_SECONDARY_CONTROL, 1);
+    io_location(&ide_ports, "IDE ports");
+    io_publish(NULL, &ide_ports);
 }
 
 void vm_init(void) {
     if (machine != VM_NONE) {
-        hal_driver_add(&vbe_driver);
-        hal_driver_add(&virtio_gpu_driver);
-        hal_driver_add(&e1000_driver);
-        hal_driver_add(&tulip_driver);
-        hal_driver_add(&ac97_driver);
-        hal_driver_add(&ata_driver);
+        io_driver_add(&vbe_driver);
+        io_driver_add(&virtio_gpu_driver);
+        io_driver_add(&e1000_driver);
+        io_driver_add(&tulip_driver);
+        io_driver_add(&ac97_driver);
+        io_driver_add(&ata_driver);
         publish_ide_ports();
     }
     if (!hv.present) return;
-    hal_driver_add(&netvsc_driver);
-    hal_driver_add(&hv_keyboard_driver);
-    hal_driver_add(&hv_mouse_driver);
-    hal_driver_add(&hv_util_driver);
+    io_driver_add(&netvsc_driver);
+    io_driver_add(&hv_keyboard_driver);
+    io_driver_add(&hv_mouse_driver);
+    io_driver_add(&hv_util_driver);
     if (vmbus_init()) hvsock_init(); /* the storage driver (storvsc) is in the ledger's list like any other */
 }
 

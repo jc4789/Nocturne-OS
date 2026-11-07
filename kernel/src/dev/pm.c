@@ -6,7 +6,7 @@
 #include "arch/apic.h"
 #include "arch/spin.h"
 #include "dev/pm.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "sys/syscall.h"
 #include "sys/watch.h"
 #include "dev/acpi.h"
@@ -169,9 +169,9 @@ static bool flush_disks(void) {
 }
 
 /* 電源断と再起動（dev/pm.h）。ボリュームの保存は先にディスクにある（pm_thread、休止の写しの書き終わり）。装置は
-   HAL_POWER_OFF の walk で止まり（止まらない装置があっても進む）、その後に電源が切れる。 */
+   IO_POWER_OFF の walk で止まり（止まらない装置があっても進む）、その後に電源が切れる。 */
 static NORETURN void finish(enum pm_action action) {
-    hal_power_begin();
+    io_power_begin();
     if (action == PM_POWER_OFF) {
         acpi_sleep_transition(5); /* _TTS(5)：装置に知らせる前（ACPI 6.5 7.4.4） */
         acpi_sleep_prepare(5);    /* _PTS(5)：先に（16.1.7 の 1） */
@@ -179,7 +179,7 @@ static NORETURN void finish(enum pm_action action) {
     blk_hold();
     flush_disks(); /* 失敗したディスクはログに書かれる：電源は同じく切れる */
     kprintf("pm: stopping the devices\n");
-    const char *stuck = hal_power_suspend(HAL_POWER_OFF);
+    const char *stuck = io_power_suspend(IO_POWER_OFF);
     if (stuck) kprintf("pm: %s did not stop; the power goes off all the same\n", stuck);
     cli();
     serial_flush();
@@ -224,26 +224,26 @@ static enum n_power_reason machine_blocker(bool hibernate, const char **detail) 
     return N_POWER_REASON_NONE;
 }
 
-/* 装置の部分：hal_power_begin の間に。 */
+/* 装置の部分：io_power_begin の間に。 */
 static enum n_power_reason devices_blocker(bool hibernate, const char **detail) {
-    enum hal_refusal refusal;
-    const char *who = hal_power_refused(hibernate, &refusal);
+    enum io_refusal refusal;
+    const char *who = io_power_refused(hibernate, &refusal);
     if (who) *detail = who;
     switch (refusal) {
-    case HAL_REFUSAL_NONE: return N_POWER_REASON_NONE;
-    case HAL_REFUSAL_CANNOT: return N_POWER_REASON_DEVICE;
-    case HAL_REFUSAL_BUSY: return N_POWER_REASON_DEVICE_BUSY;
-    case HAL_REFUSAL_PROCESS: return N_POWER_REASON_APP_DRIVER;
+    case IO_REFUSAL_NONE: return N_POWER_REASON_NONE;
+    case IO_REFUSAL_CANNOT: return N_POWER_REASON_DEVICE;
+    case IO_REFUSAL_BUSY: return N_POWER_REASON_DEVICE_BUSY;
+    case IO_REFUSAL_PROCESS: return N_POWER_REASON_APP_DRIVER;
     }
     return N_POWER_REASON_DEVICE;
 }
 
 /* 機械の部分は pm_sleep_check が起動で一度決める（開始メニューは描くたびに聞く）。装置の部分は結んでいる実装の
-   after_sleep で、実装が来て去るたびに変わるので、聞かれるたびに見る（hal_power_cannot）。 */
+   after_sleep で、実装が来て去るたびに変わるので、聞かれるたびに見る（io_power_cannot）。 */
 static bool can_sleep, can_hibernate;
 
-bool pm_can_sleep(void) { return can_sleep && !hal_power_cannot(false); }
-bool pm_can_hibernate(void) { return can_hibernate && !hal_power_cannot(true); }
+bool pm_can_sleep(void) { return can_sleep && !io_power_cannot(false); }
+bool pm_can_hibernate(void) { return can_hibernate && !io_power_cannot(true); }
 
 static void blocker_log(const char *what, enum n_power_reason why, const char *detail) {
     if (why) kprintf("pm: %s unavailable (%s%s%s)\n", what, reason_text(why), detail ? ": " : "", detail ? detail : "");
@@ -264,7 +264,7 @@ void pm_sleep_check(void) {
 
 static void enter_s3(void) { acpi_sleep_enter(3); }
 
-/* 割り込みの制御器と CPU を止め、enter() を呼び、全部を戻す（ACPI 6.5 7.5 の 5 から 8）。装置はもう HAL の walk で
+/* 割り込みの制御器と CPU を止め、enter() を呼び、全部を戻す（ACPI 6.5 7.5 の 5 から 8）。装置はもう装置の管理者の walk で
    止まっている。機械が眠った（S3 から起きた、休止の写しが戻った）なら true。enter() が戻ったか、PCI の構成を取れ
    なかったなら false（後者は *why と *detail が言い、enter() は呼ばない）。CPU 0 で、ほかの CPU を止めてから
    （smp_suspend）CPU を戻す（smp_resume）まで、ほかの thread は走らない。保存して戻す割り込みは CPU 0 のもの。ほかの
@@ -321,10 +321,10 @@ static bool machine_sleep(void (*enter)(void), unsigned state, enum pm_action ac
     return slept;
 }
 
-/* 眠りの順（ACPI 6.5 7.5、16.1.6）：拒みの確かめ、_TTS(3)、保存と書き出し、HAL_POWER_SLEEP の walk、_PTS(3)、CPU、
+/* 眠りの順（ACPI 6.5 7.5、16.1.6）：拒みの確かめ、_TTS(3)、保存と書き出し、IO_POWER_SLEEP の walk、_PTS(3)、CPU、
    enter。戻りは machine_sleep の戻し、_WAK(3)、walk の戻し、_TTS(0)。_TTS(0) は取りやめでも、_WAK は _PTS の後の
    取りやめでも呼ぶ（7.4.1、7.4.4）。
-   休止：拒みの確かめ、保存と書き出し、HAL_POWER_IMAGE の walk、CPU、写し、戻し、walk の戻し、写しを書いて電源断。
+   休止：拒みの確かめ、保存と書き出し、IO_POWER_IMAGE の walk、CPU、写し、戻し、walk の戻し、写しを書いて電源断。
    写しを書く間、門は開く（ディスクの実装の thread が動く）が、ディスクは電源断まで holder のもの（写しの後に C: へ
    届くのは写しだけ）。写しから戻った機械は、写しを取った所から machine_sleep の戻しへ進む（_WAK(4)）。 */
 static void sleep_now(bool hibernate) {
@@ -332,14 +332,14 @@ static void sleep_now(bool hibernate) {
     unsigned state = hibernate ? 4 : 3;
     const char *detail;
     enum n_power_reason why = machine_blocker(hibernate, &detail);
-    hal_power_begin(); /* ここから hal_power_end まで、実装は来も去りもせず、途中のものも無い */
+    io_power_begin(); /* ここから io_power_end まで、実装は来も去りもせず、途中のものも無い */
     if (!why) why = devices_blocker(hibernate, &detail);
     if (!why && hibernate) why = hibernate_prepare();
     if (why) {
         kprintf("pm: not %s: %s%s%s\n", hibernate ? "hibernating" : "sleeping", reason_text(why), detail ? ": " : "",
                 detail ? detail : "");
         say(N_POWER_REFUSED, action, why, detail, false);
-        hal_power_end();
+        io_power_end();
         return;
     }
     kprintf("pm: going to %s\n", hibernate ? "hibernate" : "sleep");
@@ -351,7 +351,7 @@ static void sleep_now(bool hibernate) {
     if (!flush_disks()) why = N_POWER_REASON_DISK_FLUSH; /* 眠りか写しの中で失われうる */
     if (!why) {
         walked = true;
-        const char *stuck = hal_power_suspend(hibernate ? HAL_POWER_IMAGE : HAL_POWER_SLEEP);
+        const char *stuck = io_power_suspend(hibernate ? IO_POWER_IMAGE : IO_POWER_SLEEP);
         if (stuck) {
             why = N_POWER_REASON_DEVICE_STUCK;
             detail = stuck;
@@ -372,9 +372,9 @@ static void sleep_now(bool hibernate) {
         }
     }
     if (prepared || (hibernate && slept)) acpi_wake(state);
-    const char *lost = walked ? hal_power_resume(slept) : NULL;
+    const char *lost = walked ? io_power_resume(slept) : NULL;
     if (!hibernate) acpi_sleep_transition(0);
-    hal_power_end();
+    io_power_end();
     if (snapshot) {
         /* 写し：ここからの機械は戻って来ない */
         say(N_POWER_SAVING, action, N_POWER_REASON_NONE, NULL, false);

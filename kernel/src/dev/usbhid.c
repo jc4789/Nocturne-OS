@@ -7,7 +7,7 @@
 #include "arch/spin.h"
 #include "dev/input.h"
 #include "dev/usb.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/heap.h"
 #include "sys/alarm.h"
 #include "sys/clock.h"
@@ -39,7 +39,7 @@ struct keyfield {
 struct hid {
     struct hid *next;     /* in hids */
     struct usb_device *dev;
-    struct usb_interface *node; /* the HAL node it is bound to */
+    struct usb_interface *node; /* the device manager node it is bound to */
     struct input_device input;
     char *input_id;
     struct spinlock lock;
@@ -603,7 +603,7 @@ static void hid_drop(struct hid *h) {
 }
 
 /* On the worker, after the device's last report (usb_remove). */
-static void hid_detach(struct hal_device *hal) {
+static void hid_detach(struct io_device *hal) {
     usb_work_set(usb_interface_of(hal), NULL);
     hid_drop(hal->driver_data);
     hal->driver_data = NULL;
@@ -637,14 +637,14 @@ static void input_identify(struct hid *h) {
 static void hid_work(struct usb_interface *node);
 
 /* A HID interface that has an interrupt IN endpoint and a keyboard or pointer in its reports. */
-static int hid_attach(struct hal_device *hal) {
+static int hid_attach(struct io_device *hal) {
     struct usb_interface *node = usb_interface_of(hal);
     struct usb_device *d = node->dev;
     const struct usb_interface_desc *intf = node->desc;
     const uint8_t *extra;
     unsigned extra_len;
     const struct usb_endpoint_desc *ep;
-    if (!usb_interface_interrupt(node, &extra, &extra_len, &ep)) return HAL_DECLINE;
+    if (!usb_interface_interrupt(node, &extra, &extra_len, &ep)) return IO_DECLINE;
     struct hid *h = kzalloc(sizeof *h);
     if (!h) return -N_ERR_NO_MEMORY;
     h->dev = d;
@@ -689,7 +689,7 @@ static int hid_attach(struct hal_device *hal) {
     if (!h->keyboard && !h->mouse) {
         kfree(h->keys);
         kfree(h);
-        return HAL_DECLINE;
+        return IO_DECLINE;
     }
     usb_control(d, 0x21, HID_SET_IDLE, 0, h->interface, NULL, 0); /* report changes only */
     h->leds_seen = __atomic_load_n(&leds_gen, __ATOMIC_ACQUIRE) - 1; /* its lights set on the worker's next look */
@@ -712,7 +712,7 @@ static int hid_attach(struct hal_device *hal) {
         hal->driver_data = NULL;
         return why;
     }
-    if (h->input_id) hal_offer(hal, N_OFFER_INPUT, 0, h->input.name);
+    if (h->input_id) io_offer(hal, N_OFFER_INPUT, 0, h->input.name);
     usb_work_set(node, hid_work);
     if (h->keyboard) usb_note_work(d);
     return 0;
@@ -737,13 +737,13 @@ static void hid_work(struct usb_interface *node) {
 /* 眠りの間はキーもボタンも押されていない：入力の層に押されたままのものを残さず、来た報告は捨てる。中断した装置は
    protocol、idle、LED の出力を持つ（USB 2.0 9.1.1.6）ので、戻りでは報告を受けるだけ。押されたままのキーは次の報告が
    押したと言う。電源を失った装置は外れて新しく attach する。 */
-static bool hid_suspend(struct hal_device *hal, enum hal_power_target target) {
+static bool hid_suspend(struct io_device *hal, enum io_power_target target) {
     (void)target;
     hid_release_all(hal->driver_data);
     return true;
 }
 
-static bool hid_resume(struct hal_device *hal) {
+static bool hid_resume(struct io_device *hal) {
     struct hid *h = hal->driver_data;
     uint64_t f = spin_lock(&h->lock);
     h->asleep = false;
@@ -752,7 +752,7 @@ static bool hid_resume(struct hal_device *hal) {
 }
 
 static const struct n_hal_rule hid_rules[] = {N_USB_INTERFACE_CLASS(3)};
-static const struct hal_driver hid_driver = {
+static const struct io_driver hid_driver = {
     .name = "usbhid",
     .rules = hid_rules,
     .rule_count = ARRAY_SIZE(hid_rules),
@@ -760,6 +760,6 @@ static const struct hal_driver hid_driver = {
     .detach = hid_detach,
     .suspend = hid_suspend,
     .resume = hid_resume,
-    .after_sleep = HAL_AFTER_SLEEP_RESUME,
+    .after_sleep = IO_AFTER_SLEEP_RESUME,
 };
-HAL_DRIVER(hid_driver);
+IO_DRIVER(hid_driver);

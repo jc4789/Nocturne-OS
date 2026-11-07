@@ -1,6 +1,6 @@
-/* ACPI の名前空間の装置を HAL のバスにする（ACPI 6.5 6.1、6.2、6.5.1）。
+/* ACPI の名前空間の装置を装置の管理者のバスにする（ACPI 6.5 6.1、6.2、6.5.1）。
 
-   _HID か _CID を持つ Device を全部 hal_publish する。身元は字の性質、資源は _CRS の中身、firmware の節は名前空間の
+   _HID か _CID を持つ Device を全部 io_publish する。身元は字の性質、資源は _CRS の中身、firmware の節は名前空間の
    節である。親は名前空間で一番近い、木に載った祖先：ACPI の装置か、_ADR で記述された PCI の機能（dev/pci.c が出す）。
    CPU（ACPI0007）は arch/topology.c の台帳に載っている。
 
@@ -12,7 +12,7 @@
 #include "arch/irq.h"
 #include "arch/topology.h"
 #include "dev/acpi.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/heap.h"
 #include <uacpi/namespace.h>
 #include <uacpi/resources.h>
@@ -24,29 +24,29 @@
 #define STA_FUNCTIONING 8u
 
 struct acpi_device {
-    struct hal_device hal;
+    struct io_device hal;
     struct acpi_device *next; /* 出した順の全部 */
     struct irq **irqs;
     unsigned irq_count;
     uint32_t memory_slots, port_slots, gsi_slots;
 };
 
-extern const struct hal_claim_ops hal_claim_plain;
+extern const struct io_claim_ops io_claim_plain;
 
-static struct acpi_device *of(struct hal_device *d) { return (struct acpi_device *)d; }
+static struct acpi_device *of(struct io_device *d) { return (struct acpi_device *)d; }
 
 static uacpi_namespace_node *node_of(const struct acpi_device *a) { return acpi_namespace_node(a->hal.firmware); }
 
 /* _CRS の GSI を順に count まで。信号は _CRS のとおり（MADT が書いた pin は MADT のとおり、arch/ioapic.h）。
    Exclusive の GSI（ACPI 6.5 6.4.2.1、6.4.3.6）は誰とも線を分けない。一つでも立たなければ、そこで止める。 */
-static unsigned acpi_irq_enable(struct hal_device *d, const struct irq_spec *specs, unsigned count, struct irq **irqs) {
+static unsigned acpi_irq_enable(struct io_device *d, const struct irq_spec *specs, unsigned count, struct irq **irqs) {
     struct acpi_device *a = of(d);
     unsigned most = MIN(count, a->gsi_slots);
     if (!most || a->irqs) return 0;
     if (!(a->irqs = kzalloc(most * sizeof *a->irqs))) return 0;
     unsigned got = 0;
     for (; got < most; got++) {
-        const struct n_hal_resource *r = hal_resource(d, N_HAL_GSI, got);
+        const struct n_hal_resource *r = io_resource(d, N_HAL_GSI, got);
         struct gsi_signal signal = {.level = r->flags & N_HAL_GSI_LEVEL, .active_low = r->flags & N_HAL_GSI_ACTIVE_LOW,
                                     .shared = r->flags & N_HAL_GSI_SHARED};
         struct irq *irq = irq_request_gsi(&specs[got], (unsigned)r->base, signal);
@@ -62,7 +62,7 @@ static unsigned acpi_irq_enable(struct hal_device *d, const struct irq_spec *spe
     return got;
 }
 
-static bool acpi_irq_disable(struct hal_device *d) {
+static bool acpi_irq_disable(struct io_device *d) {
     struct acpi_device *a = of(d);
     for (unsigned i = 0; i < a->irq_count; i++) irq_free(a->irqs[i]);
     kfree(a->irqs);
@@ -71,24 +71,24 @@ static bool acpi_irq_disable(struct hal_device *d) {
     return true;
 }
 
-static unsigned acpi_irq_max(struct hal_device *d) { return of(d)->gsi_slots; }
+static unsigned acpi_irq_max(struct io_device *d) { return of(d)->gsi_slots; }
 
-static const struct hal_bus_ops acpi_bus_ops = {
-    .irq_enable = acpi_irq_enable, .irq_disable = acpi_irq_disable, .irq_max = acpi_irq_max, .claim = &hal_claim_plain};
+static const struct io_bus_ops acpi_bus_ops = {
+    .irq_enable = acpi_irq_enable, .irq_disable = acpi_irq_disable, .irq_max = acpi_irq_max, .claim = &io_claim_plain};
 
 static void add_memory(struct acpi_device *a, uint64_t base, uint64_t size, uint32_t flags) {
-    if (size) hal_resource_add(&a->hal, N_HAL_MEMORY, a->memory_slots++, flags, base, size);
+    if (size) io_resource_add(&a->hal, N_HAL_MEMORY, a->memory_slots++, flags, base, size);
 }
 
 static void add_ports(struct acpi_device *a, uint64_t base, uint64_t size) {
-    if (size) hal_resource_add(&a->hal, N_HAL_PORT, a->port_slots++, 0, base, size);
+    if (size) io_resource_add(&a->hal, N_HAL_PORT, a->port_slots++, 0, base, size);
 }
 
 static void add_gsi(struct acpi_device *a, uint32_t gsi, uint8_t triggering, uint8_t polarity, uint8_t sharing) {
     uint32_t flags = (triggering == UACPI_TRIGGERING_LEVEL ? N_HAL_GSI_LEVEL : 0) |
                      (polarity == UACPI_POLARITY_ACTIVE_LOW ? N_HAL_GSI_ACTIVE_LOW : 0) |
                      (sharing == UACPI_SHARED ? N_HAL_GSI_SHARED : 0);
-    hal_resource_add(&a->hal, N_HAL_GSI, a->gsi_slots++, flags, gsi, 1);
+    io_resource_add(&a->hal, N_HAL_GSI, a->gsi_slots++, flags, gsi, 1);
 }
 
 static void add_address(struct acpi_device *a, const uacpi_resource_address_common *c, uint64_t base, uint64_t size,
@@ -139,19 +139,19 @@ static bool add_identity(struct acpi_device *a) {
     bool any = false;
     uacpi_id_string *hid = NULL;
     if (uacpi_eval_hid(node, &hid) == UACPI_STATUS_OK) {
-        hal_prop_text(&a->hal, N_PROP_ACPI_ID, hid->value);
+        io_prop_text(&a->hal, N_PROP_ACPI_ID, hid->value);
         any = true;
         uacpi_free_id_string(hid);
     }
     uacpi_pnp_id_list *cids = NULL;
     if (uacpi_eval_cid(node, &cids) == UACPI_STATUS_OK) {
-        for (uint32_t i = 0; i < cids->num_ids; i++) hal_prop_text(&a->hal, N_PROP_ACPI_ID, cids->ids[i].value);
+        for (uint32_t i = 0; i < cids->num_ids; i++) io_prop_text(&a->hal, N_PROP_ACPI_ID, cids->ids[i].value);
         any = any || cids->num_ids;
         uacpi_free_pnp_id_list(cids);
     }
     uacpi_id_string *uid = NULL;
     if (uacpi_eval_uid(node, &uid) == UACPI_STATUS_OK) {
-        hal_prop_text(&a->hal, N_PROP_ACPI_UID, uid->value);
+        io_prop_text(&a->hal, N_PROP_ACPI_UID, uid->value);
         uacpi_free_id_string(uid);
     }
     return any;
@@ -167,11 +167,11 @@ static bool is_pci_host(uacpi_namespace_node *node) {
     return uacpi_device_matches_pnp_id(node, ids);
 }
 
-/* 巡りの途中の、名前空間の節から木の装置への道。一番上が、次に出す装置の親である。hold は hal_find_firmware で
+/* 巡りの途中の、名前空間の節から木の装置への道。一番上が、次に出す装置の親である。hold は io_find_firmware で
    見つけた装置（巡りの間 hold する）。 */
 struct frame {
     uacpi_namespace_node *node;
-    struct hal_device *hal;
+    struct io_device *hal;
     bool hold;
 };
 
@@ -185,14 +185,14 @@ static struct acpi_device *published;
 static struct acpi_device **hosts; /* 出したホストブリッジ。acpi_devices_publish_below がその内を巡る */
 static unsigned host_count;
 
-static void frame_push(struct walk *w, uacpi_namespace_node *node, struct hal_device *hal, bool hold) {
+static void frame_push(struct walk *w, uacpi_namespace_node *node, struct io_device *hal, bool hold) {
     if (w->depth == w->room) {
         unsigned room = w->room ? w->room * 2 : 8;
         struct frame *grown = krealloc(w->frames, room * sizeof *grown);
         if (!grown) {
             /* 下の装置は、この節を飛ばして一つ上の装置の下に載る */
             kprintf("acpi: no memory to walk below %.4s\n", uacpi_namespace_node_name(node).text);
-            if (hold) hal_put(hal);
+            if (hold) io_put(hal);
             return;
         }
         w->frames = grown;
@@ -201,7 +201,7 @@ static void frame_push(struct walk *w, uacpi_namespace_node *node, struct hal_de
     w->frames[w->depth++] = (struct frame){node, hal, hold};
 }
 
-static struct hal_device *frame_parent(const struct walk *w) { return w->depth ? w->frames[w->depth - 1].hal : NULL; }
+static struct io_device *frame_parent(const struct walk *w) { return w->depth ? w->frames[w->depth - 1].hal : NULL; }
 
 static void host_remember(struct acpi_device *a) {
     struct acpi_device **grown = krealloc(hosts, (host_count + 1) * sizeof *grown);
@@ -220,24 +220,24 @@ static bool device_publish(struct walk *w, uacpi_namespace_node *node) {
         kprintf("acpi: no memory for a device\n");
         return false;
     }
-    hal_device_init(&a->hal, N_BUS_ACPI, &acpi_bus_ops);
+    io_device_init(&a->hal, N_BUS_ACPI, &acpi_bus_ops);
     a->hal.firmware = acpi_firmware(node);
     if (!add_identity(a)) {
-        hal_device_discard(&a->hal);
+        io_device_discard(&a->hal);
         kfree(a);
         return false;
     }
     uacpi_for_each_device_resource(node, "_CRS", found_resource, a);
     const char *path = uacpi_namespace_node_generate_absolute_path(node);
     if (path) {
-        hal_location(&a->hal, path);
+        io_location(&a->hal, path);
         uacpi_free_absolute_path(path);
     }
     uint32_t domain;
     if (topology.nodes > 1 && acpi_proximity(a->hal.firmware, &domain)) a->hal.node = topology_node_of_domain(domain);
     a->next = published;
     published = a;
-    hal_publish(frame_parent(w), &a->hal);
+    io_publish(frame_parent(w), &a->hal);
     frame_push(w, node, &a->hal, false);
     return true;
 }
@@ -256,7 +256,7 @@ static uacpi_iteration_decision walk_down(void *user, uacpi_namespace_node *node
         return UACPI_ITERATION_DECISION_NEXT_PEER; /* 内は PCI の機能が載ってから */
     }
     /* 身元の無い節：_ADR で記述された PCI の機能なら、下の装置はその機能の下に載る */
-    struct hal_device *h = w->below ? hal_find_firmware(acpi_firmware(node)) : NULL;
+    struct io_device *h = w->below ? io_find_firmware(acpi_firmware(node)) : NULL;
     if (h) frame_push(w, node, h, true);
     return UACPI_ITERATION_DECISION_CONTINUE;
 }
@@ -266,7 +266,7 @@ static uacpi_iteration_decision walk_up(void *user, uacpi_namespace_node *node, 
     struct walk *w = user;
     if (!w->depth || w->frames[w->depth - 1].node != node) return UACPI_ITERATION_DECISION_CONTINUE;
     struct frame *f = &w->frames[--w->depth];
-    if (f->hold) hal_put(f->hal);
+    if (f->hold) io_put(f->hal);
     return UACPI_ITERATION_DECISION_CONTINUE;
 }
 
@@ -279,10 +279,10 @@ static void add_depends(struct acpi_device *a) {
         for (uacpi_size i = 0; i < list.count; i++) {
             uacpi_namespace_node *on = NULL;
             if (uacpi_object_resolve_as_aml_namepath(list.objects[i], node_of(a), &on) != UACPI_STATUS_OK) continue;
-            struct hal_device *o = hal_find_firmware(acpi_firmware(on));
+            struct io_device *o = io_find_firmware(acpi_firmware(on));
             if (!o) continue;
-            if (o != &a->hal) hal_depends(&a->hal, o);
-            hal_put(o);
+            if (o != &a->hal) io_depends(&a->hal, o);
+            io_put(o);
         }
     uacpi_object_unref(result);
 }

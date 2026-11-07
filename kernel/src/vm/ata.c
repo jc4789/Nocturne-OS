@@ -7,12 +7,12 @@
 
    電源。DMA も割り込みも無いので、止めるのは要求の道だけ：suspend から resume まで、来た要求は channel の錠の下で
    待つ。ディスクの揮発の cache の書き戻しは機械の段取り（dev/pm.c の flush_disks、blk_persist）が walk の前に行い、
-   その後は blk_hold が要求を止めている。resume は drive が電源を失ったかを知らない（hal/hal.h）：各 drive を
+   その後は blk_hold が要求を止めている。resume は drive が電源を失ったかを知らない（io/io.h）：各 drive を
    IDENTIFY で見直し（nIEN も立て直す）、同じ drive でなければ要求を失敗させ、揮発の cache を失ったかもしれないと
    block の層に言う（blk_cache_lost）。 */
 #include "kernel.h"
 #include "dev/blk.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "arch/cpu.h"
 #include "mm/vmm.h"
 #include "sys/wait.h"
@@ -57,9 +57,9 @@ static int ndisks;
 static struct ata_channel *channel_of(const struct ata_disk *d) { return &channels[d->channel]; }
 
 /* 節の channel c のポート。命令の block と制御の block のどちらかの資源が無ければ false。 */
-static bool channel_ports(const struct hal_device *d, unsigned c, uint16_t *io, uint16_t *ctl) {
-    const struct n_hal_resource *command = hal_resource(d, N_HAL_PORT, 2 * c);
-    const struct n_hal_resource *control = hal_resource(d, N_HAL_PORT, 2 * c + 1);
+static bool channel_ports(const struct io_device *d, unsigned c, uint16_t *io, uint16_t *ctl) {
+    const struct n_hal_resource *command = io_resource(d, N_HAL_PORT, 2 * c);
+    const struct n_hal_resource *control = io_resource(d, N_HAL_PORT, 2 * c + 1);
     if (!command || command->size < 8 || !control || !control->size) return false;
     *io = (uint16_t)command->base;
     *ctl = (uint16_t)control->base;
@@ -147,7 +147,7 @@ static void probe(unsigned channel, uint16_t io, uint16_t ctl, bool slave) {
 
 static int transfer(struct blkdev *b, const struct blk_request *r);
 
-static void disk_register(struct hal_device *hal, int i) {
+static void disk_register(struct io_device *hal, int i) {
     struct blkdev *b = &disks[i].blk;
     ksnprintf(b->name, sizeof b->name, "ata%d", i);
     strlcpy(b->model, disks[i].model, sizeof b->model);
@@ -159,22 +159,22 @@ static void disk_register(struct hal_device *hal, int i) {
     blk_register(hal, b);
 }
 
-static int ata_attach(struct hal_device *d) {
+static int ata_attach(struct io_device *d) {
     if (ndisks) return -N_ERR_EXISTS;
     for (unsigned c = 0; c < ARRAY_SIZE(channels); c++) {
         uint16_t io, ctl;
         if (!channel_ports(d, c, &io, &ctl)) continue;
-        hal_enable(d, HAL_ENABLE_PORTS);
+        io_enable(d, IO_ENABLE_PORTS);
         probe(c, io, ctl, false);
         probe(c, io, ctl, true);
     }
-    if (!ndisks) return HAL_DECLINE;
+    if (!ndisks) return IO_DECLINE;
     for (int i = 0; i < ndisks; i++) disk_register(d, i);
     return 0;
 }
 
 /* 進行中の命令の終わりを待ち、その後の要求を resume まで待たせる。三つの目標で同じ。 */
-static bool ata_suspend(struct hal_device *d, enum hal_power_target target) {
+static bool ata_suspend(struct io_device *d, enum io_power_target target) {
     (void)d;
     (void)target;
     for (unsigned c = 0; c < ARRAY_SIZE(channels); c++) {
@@ -192,7 +192,7 @@ static bool same_drive(const struct ata_disk *disk) {
            now.lba48 == disk->lba48 && !strcmp(now.model, disk->model);
 }
 
-static bool ata_resume(struct hal_device *d) {
+static bool ata_resume(struct io_device *d) {
     bool all = true;
     for (unsigned c = 0; c < ARRAY_SIZE(channels); c++) {
         mutex_lock(&channels[c].lock);
@@ -210,19 +210,19 @@ static bool ata_resume(struct hal_device *d) {
         mutex_unlock(&channels[c].lock);
         wq_wake_all(&channels[c].woken);
     }
-    if (!all) hal_failed(d, -N_ERR_IO);
+    if (!all) io_failed(d, -N_ERR_IO);
     return all;
 }
 
 static const struct n_hal_rule ata_rules[] = {N_FIXED("ide-ports")};
-const struct hal_driver ata_driver = {
+const struct io_driver ata_driver = {
     .name = "ata",
     .rules = ata_rules,
     .rule_count = ARRAY_SIZE(ata_rules),
     .attach = ata_attach,
     .suspend = ata_suspend,
     .resume = ata_resume,
-    .after_sleep = HAL_AFTER_SLEEP_RESUME,
+    .after_sleep = IO_AFTER_SLEEP_RESUME,
 };
 
 static int setup(struct ata_disk *d, uint64_t lba, uint32_t count, bool write) {

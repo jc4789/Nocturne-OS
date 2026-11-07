@@ -2,7 +2,7 @@
    番地）、一度に一つのことをする装置の thread。 */
 #include "kernel.h"
 #include "dev/blk.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
@@ -20,7 +20,7 @@ static struct mutex devs_lock;
 static struct blkdev **devs;
 static int ndevs, room;
 
-void blk_register(struct hal_device *hal, struct blkdev *d) {
+void blk_register(struct io_device *hal, struct blkdev *d) {
     ASSERT(d->ops && d->sectors);
     if (!d->block) d->block = 512;
     if (!d->segment_align) d->segment_align = 512;
@@ -45,7 +45,7 @@ void blk_register(struct hal_device *hal, struct blkdev *d) {
     mutex_unlock(&devs_lock);
     kprintf("blk: %s: %s, %lu MiB, %u-byte blocks%s\n", d->name, d->model, d->sectors / 2048, d->block,
             d->has_cache ? "" : ", no write cache");
-    hal_offer(hal, N_OFFER_DISK, (uint32_t)d->index, d->name);
+    io_offer(hal, N_OFFER_DISK, (uint32_t)d->index, d->name);
 }
 
 int blk_count(void) { return __atomic_load_n(&ndevs, __ATOMIC_ACQUIRE); }
@@ -184,12 +184,12 @@ static uint32_t request_bytes(const struct blk_request *r) {
 /* 区切りの装置が見る番地：DMA の装置には bus、ほかは phys。揃えと境はこれで見る。 */
 static uint64_t seen(const struct blkdev *d, const struct blk_segment *s) { return d->dma ? s->bus : s->phys; }
 
-/* DMA の装置へ渡す番地を区切りごとに HAL に問う。届かない区切りが一つでもあれば false：要求は緩衝を通る。dma の
+/* DMA の装置へ渡す番地を区切りごとに装置の管理者に問う。届かない区切りが一つでもあれば false：要求は緩衝を通る。dma の
    無い装置は物理番地で受ける。 */
 static bool reach(const struct blkdev *d, struct blk_segment *segs, uint32_t count) {
     if (!d->dma) return true;
     for (uint32_t i = 0; i < count; i++)
-        if (!hal_dma_reach(d->dma, segs[i].phys, segs[i].bytes, &segs[i].bus)) return false;
+        if (!io_dma_reach(d->dma, segs[i].phys, segs[i].bytes, &segs[i].bus)) return false;
     return true;
 }
 
@@ -317,7 +317,7 @@ static bool split(const struct blkdev *d, struct blk_request *r, struct blk_requ
 }
 
 /* ---- 整わない要求：block の一部、揃わない区切り、装置の届かない区切り ---- */
-/* 緩衝：装置が届くメモリー。DMA の装置には HAL が装置の幅の中に取り（訳の領域にいる装置にはそこへ写る）、ほかの
+/* 緩衝：装置が届くメモリー。DMA の装置には装置の管理者が装置の幅の中に取り（訳の領域にいる装置にはそこへ写る）、ほかの
    装置には近い node の頁を。 */
 struct bounce {
     uint8_t *memory;
@@ -327,7 +327,7 @@ struct bounce {
 static bool bounce_take(struct blkdev *d, uint32_t bytes, struct bounce *b) {
     if (d->dma) {
         uint64_t bus;
-        void *memory = hal_dma_alloc(d->dma, bytes, &bus);
+        void *memory = io_dma_alloc(d->dma, bytes, &bus);
         if (!memory) return false;
         *b = (struct bounce){memory, {vmm_kernel_translate((uint64_t)memory), bus, bytes}};
         return true;
@@ -339,7 +339,7 @@ static bool bounce_take(struct blkdev *d, uint32_t bytes, struct bounce *b) {
 }
 
 static void bounce_give(struct blkdev *d, struct bounce *b) {
-    if (d->dma) hal_dma_free(d->dma, b->memory);
+    if (d->dma) io_dma_free(d->dma, b->memory);
     else pmm_free_contig(b->segment.phys, b->segment.bytes / PAGE_SIZE);
 }
 

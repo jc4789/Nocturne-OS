@@ -12,7 +12,7 @@
 #include <stdint.h>
 #include "sys/wait.h"
 
-struct hal_device;
+struct io_device;
 struct blk_serial;
 
 struct blkdev {
@@ -45,9 +45,9 @@ struct blkdev {
     /* 一つの区切りが終わり次が始まる所は、どちらもこの倍数（NVMe の PRP：頁の大きさ）。0：どこでも */
     uint32_t segment_boundary;
     bool has_cache; /* 装置は揮発の cache を持ちうる：BLK_PERSIST がそれに届く */
-    /* データを DMA で動かす装置（HAL の装置）。blk.c は区切りごとに装置へ渡す番地を HAL に問い（hal_dma_reach）、
+    /* データを DMA で動かす装置（装置の管理者の装置）。blk.c は区切りごとに装置へ渡す番地を装置の管理者に問い（io_dma_reach）、
        届かない区切りを持つ要求は装置の届くメモリーの緩衝を通す。NULL：CPU がデータを写す実装（物理番地を読む） */
-    struct hal_device *dma;
+    struct io_device *dma;
     const struct blk_ops *ops;
     void *priv;
     int node; /* 近い NUMA node、-1：知らない（blk_register） */
@@ -66,7 +66,7 @@ struct blkdev {
 enum blk_op { BLK_READ, BLK_WRITE, BLK_PERSIST };
 struct blk_segment {
     uint64_t phys; /* 物理番地：blkdev.dma の無い実装が読む */
-    uint64_t bus;  /* 装置へ渡す番地：blkdev.dma のある実装が読む。blk.c が HAL で求める */
+    uint64_t bus;  /* 装置へ渡す番地：blkdev.dma のある実装が読む。blk.c が装置の管理者で求める */
     uint32_t bytes;
 };
 struct blk_request {
@@ -104,8 +104,8 @@ void blk_serial_start(struct blkdev *d, blk_transfer_fn transfer);
 /* 装置が去った（blkdev.gone を立てた）：thread は持っているものを失敗させて終わる。 */
 void blk_serial_stop(struct blkdev *d);
 
-/* ディスクを一覧に載せ、それを持つ装置の上に出す（N_OFFER_DISK、hal_offer）：眠ってよい thread から。 */
-void blk_register(struct hal_device *hal, struct blkdev *d);
+/* ディスクを一覧に載せ、それを持つ装置の上に出す（N_OFFER_DISK、io_offer）：眠ってよい thread から。 */
+void blk_register(struct io_device *hal, struct blkdev *d);
 int blk_count(void);
 struct blkdev *blk_get(int i);
 /* buf は核のメモリー。眠ってよい thread から、電源の門を blk_hold で待つ。 */

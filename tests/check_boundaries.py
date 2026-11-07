@@ -6,7 +6,7 @@
   4. VM の処理は vm/vm.h の後ろ：kernel/src/vm の外から vm/vm.h 以外の vm/ を include しない。
   5. カーネルの gui/ に利用者への言葉を置かない：kprintf の外の文字列と、シェルの部品の語を拒む。
   6. プログラムは入口の像の溝からカーネルへ入る：user・tests・ports のコードの SYSCALL 命令を拒む。
-  7. 実装の DMA は HAL の口を通る：struct hal_driver を定めるファイルの、頁の確保（pmm_）、物理番地の引き
+  7. 実装の DMA は HAL の口を通る：struct io_driver を定めるファイルの、頁の確保（pmm_）、物理番地の引き
      （hhdm_virt_to_phys、virt_to_phys、vmm_kernel_translate）、IOMMU（iommu_）、MMIO の写し（vmm_map_mmio）を拒む。
 
   python -X utf8 tests/check_boundaries.py

@@ -8,7 +8,7 @@
 #include "arch/irq.h"
 #include "arch/spin.h"
 #include "dev/pci.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/heap.h"
 
 #define REG_CTRL  0x0000
@@ -312,16 +312,16 @@ static bool e1000_start(struct e1000 *c) {
     return true;
 }
 
-static int e1000_attach(struct hal_device *d) {
+static int e1000_attach(struct io_device *d) {
     struct pci_device *pci = pci_device_of(d);
-    if (!hal_resource(d, N_HAL_MEMORY, 0)) return -N_ERR_UNSUPPORTED;
+    if (!io_resource(d, N_HAL_MEMORY, 0)) return -N_ERR_UNSUPPORTED;
     struct e1000 *c = kzalloc(sizeof *c);
     if (!c) return -N_ERR_NO_MEMORY;
     d->driver_data = c;
     int r = -N_ERR_NO_MEMORY;
     c->new_eerd = pci->device == 0x10D3;
-    if (!(c->mmio = hal_map(d, 0))) goto fail;
-    hal_enable(d, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA);
+    if (!(c->mmio = io_map(d, 0))) goto fail;
+    io_enable(d, IO_ENABLE_MEMORY | IO_ENABLE_DMA);
     if (!hw_reset(c)) { /* firmware が動かしたままのものを止める */
         kprintf("net: e1000 does not come out of reset\n");
         r = -N_ERR_IO;
@@ -344,10 +344,10 @@ static int e1000_attach(struct hal_device *d) {
 
     /* 制御器が出す番地は全部 64 bit（2.4。手引きの機種で 64 bit の番地を持たないのは 82547GI/EI だけで、規則に無い）。
        輪と、それが指す緩衝：一つずつの塊で、緩衝は続けて */
-    hal_dma_bits(d, 64);
+    io_dma_bits(d, 64);
     uint64_t ring_bus, buffer_bus;
-    uint8_t *rings = hal_dma_alloc(d, 2 * PAGE_SIZE, &ring_bus);
-    uint8_t *buffers = hal_dma_alloc(d, (NRX + NTX) * BUFSZ, &buffer_bus);
+    uint8_t *rings = io_dma_alloc(d, 2 * PAGE_SIZE, &ring_bus);
+    uint8_t *buffers = io_dma_alloc(d, (NRX + NTX) * BUFSZ, &buffer_bus);
     if (!rings || !buffers) {
         kprintf("net: e1000 DMA allocation failed\n");
         goto fail;
@@ -369,7 +369,7 @@ static int e1000_attach(struct hal_device *d) {
         kprintf("net: e1000 ITR %u x %u ns (e1000-itr-us=0 disables)\n", c->itr_ticks, ITR_TICK_NS);
     }
 
-    if (!hal_irq_enable(d, &(struct irq_spec){.name = "e1000", .handler = e1000_irq, .context = c}, 1, NULL)) {
+    if (!io_irq_enable(d, &(struct irq_spec){.name = "e1000", .handler = e1000_irq, .context = c}, 1, NULL)) {
         kprintf("net: e1000 has no interrupt route\n");
         r = -N_ERR_UNSUPPORTED;
         goto fail;
@@ -393,7 +393,7 @@ static int e1000_attach(struct hal_device *d) {
             mac[4], mac[5]);
     return 0;
 fail:
-    hal_irq_disable(d); /* 処理の記憶が去る前に */
+    io_irq_disable(d); /* 処理の記憶が去る前に */
     d->driver_data = NULL;
     kfree(c);
     return r;
@@ -402,7 +402,7 @@ fail:
 /* 6.3.1.4：D3 の前に、送受信を止め、進行中のバスの取引を終わらせる。受信と送信を止め（13.4.22、13.4.33）、reset で
    全部の状態機械を初めに戻す（13.4.1：PCI の reset と同じ、構成の空間を除く）。輪に残った送るフレームはここで落ちる
    （TCP が送り直す）。三つの目標で同じ。 */
-static bool e1000_suspend(struct hal_device *d, enum hal_power_target target) {
+static bool e1000_suspend(struct io_device *d, enum io_power_target target) {
     (void)target;
     struct e1000 *c = d->driver_data;
     mutex_lock(&c->e1000_mutex);
@@ -420,7 +420,7 @@ static bool e1000_suspend(struct hal_device *d, enum hal_power_target target) {
 }
 
 /* 電源を失った装置も保った装置も、reset から始め直す。網の層が持っていたフレームを渡し直させる。 */
-static bool e1000_resume(struct hal_device *d) {
+static bool e1000_resume(struct io_device *d) {
     struct e1000 *c = d->driver_data;
     mutex_lock(&c->e1000_mutex);
     bool started = e1000_start(c);
@@ -433,19 +433,19 @@ static bool e1000_resume(struct hal_device *d) {
     net_rx_notify();
     if (started) return true;
     kprintf("net: e1000 at %s does not come out of reset\n", d->location);
-    hal_failed(d, -N_ERR_IO);
+    io_failed(d, -N_ERR_IO);
     return false;
 }
 
 static const struct n_hal_rule e1000_rules[] = {N_PCI_ID(0x8086, 0x100E), N_PCI_ID(0x8086, 0x100F),
                                                 N_PCI_ID(0x8086, 0x1004), N_PCI_ID(0x8086, 0x100C),
                                                 N_PCI_ID(0x8086, 0x1015), N_PCI_ID(0x8086, 0x10D3)};
-const struct hal_driver e1000_driver = {
+const struct io_driver e1000_driver = {
     .name = "e1000",
     .rules = e1000_rules,
     .rule_count = ARRAY_SIZE(e1000_rules),
     .attach = e1000_attach,
     .suspend = e1000_suspend,
     .resume = e1000_resume,
-    .after_sleep = HAL_AFTER_SLEEP_RESUME,
+    .after_sleep = IO_AFTER_SLEEP_RESUME,
 };

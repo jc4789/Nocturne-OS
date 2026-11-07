@@ -5,7 +5,7 @@
 #include <stdbool.h>
 struct n_netstats;
 struct net_adapter;
-struct hal_device;
+struct io_device;
 
 /* What the adapter does for the stack itself (struct netif.offloads). The stack reads them and
    saves its own work where they are declared; an adapter declares what its hardware does for
@@ -63,14 +63,14 @@ struct netif {
     bool (*rx_pending)(struct netif *self, unsigned queue);
     void (*get_stats)(struct netif *self, struct n_netstats *stats);
     struct net_adapter *adapter; /* the stack's, from net_register */
-    struct hal_device *hal;      /* the device it is of, from net_register */
+    struct io_device *hal;      /* the device it is of, from net_register */
 };
 
 /* An adapter is there (from its attach, or a USB arrival later), the offer of the device hal. The
    stack calls it from now on and says so to the service "network", which gives it its address;
    the ledger shows the device offering a network adapter (N_OFFER_NET). A task that may sleep,
    no driver lock held. The same MAC address coming back is the same adapter to the system. */
-void net_register(struct hal_device *hal, struct netif *dev);
+void net_register(struct io_device *hal, struct netif *dev);
 /* It is gone: the stack never calls it again after this returns, its connections end, the frames
    it still held for it are dropped. A task that may sleep, no driver lock held. */
 void net_unregister(struct netif *dev);

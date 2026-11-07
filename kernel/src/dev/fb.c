@@ -1,6 +1,6 @@
 #include "kernel.h"
 #include "dev/fb.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "limine.h"
 #include "arch/smp.h"
 #include "arch/cpu.h"
@@ -628,36 +628,36 @@ void fb_present_last(const uint32_t *src, int src_pitch, int w, int h) {
 }
 
 /* ---- the firmware's screen as a device ---- */
-static struct hal_device boot_screen;
+static struct io_device boot_screen;
 static bool boot_screen_listed;
 
-static int boot_screen_attach(struct hal_device *d) {
-    hal_offer(d, N_OFFER_SCREEN, 0, "firmware");
+static int boot_screen_attach(struct io_device *d) {
+    io_offer(d, N_OFFER_SCREEN, 0, "firmware");
     return 0;
 }
 
-static void boot_screen_detach(struct hal_device *d) { hal_offer_withdraw(d, N_OFFER_SCREEN, 0); }
+static void boot_screen_detach(struct io_device *d) { io_offer_withdraw(d, N_OFFER_SCREEN, 0); }
 
 static const struct n_hal_rule boot_screen_rules[] = {N_FIXED("boot-screen")};
-static const struct hal_driver boot_screen_driver = {.name = "firmware-screen", .rules = boot_screen_rules,
+static const struct io_driver boot_screen_driver = {.name = "firmware-screen", .rules = boot_screen_rules,
                                                      .rule_count = ARRAY_SIZE(boot_screen_rules),
                                                      .attach = boot_screen_attach, .detach = boot_screen_detach,
                                                      /* firmware の画面は S3 の後に戻らない（S3 の戻りは画面の firmware を
                                                         走らせない）。休止の後は次の起動の firmware が元どおりにする */
-                                                     .after_sleep = HAL_AFTER_SLEEP_BOOT};
-HAL_DRIVER(boot_screen_driver);
+                                                     .after_sleep = IO_AFTER_SLEEP_BOOT};
+IO_DRIVER(boot_screen_driver);
 
 void fb_publish(void) {
     if (!fb.addr) return;
-    hal_device_init(&boot_screen, N_BUS_FIXED, NULL);
-    hal_prop_text(&boot_screen, N_PROP_FIXED_NAME, "boot-screen");
-    hal_resource_add(&boot_screen, N_HAL_MEMORY, 0, N_HAL_PREFETCHABLE, fb.phys, (uint64_t)fb.pitch * fb.height);
-    hal_location(&boot_screen, "firmware");
-    hal_publish(NULL, &boot_screen);
+    io_device_init(&boot_screen, N_BUS_FIXED, NULL);
+    io_prop_text(&boot_screen, N_PROP_FIXED_NAME, "boot-screen");
+    io_resource_add(&boot_screen, N_HAL_MEMORY, 0, N_HAL_PREFETCHABLE, fb.phys, (uint64_t)fb.pitch * fb.height);
+    io_location(&boot_screen, "firmware");
+    io_publish(NULL, &boot_screen);
     boot_screen_listed = true;
 }
 
 void fb_boot_release(void) {
     if (!__atomic_exchange_n(&boot_screen_listed, false, __ATOMIC_ACQ_REL)) return;
-    hal_remove(&boot_screen);
+    io_remove(&boot_screen);
 }

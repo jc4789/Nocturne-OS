@@ -10,7 +10,7 @@
 struct handle;
 struct object;
 struct process;
-struct hal_claim;
+struct io_claim;
 struct n_pager_fault;
 struct n_pager_supply;
 
@@ -38,7 +38,7 @@ int64_t shared_revoke(struct handle *h);
 /* bytes of h's object (its whole size, rounded up; not 0) into the calling app's reservation
    region, N_MEMORY_READ or N_MEMORY_READ_WRITE: the address. */
 int64_t shared_map(struct handle *h, size_t bytes, int access);
-/* A claimed device's memory resource slot (hal_claim_memory): device memory, uncached unless a view
+/* A claimed device's memory resource slot (io_claim_memory): device memory, uncached unless a view
    says otherwise, write-combining only where the resource allows it. */
 int64_t shared_hal_memory(struct handle *claim, uint32_t slot, struct handle **out);
 /* Zeroed RAM a claimed device may reach by DMA, within the device's and its bus's address width
@@ -74,22 +74,22 @@ struct shared_scanout {
     size_t pages, first_byte;
     uint64_t type;
 };
-int64_t shared_scanout_open(struct handle *surface, const struct hal_claim *claim, uint64_t offset, uint64_t bytes,
+int64_t shared_scanout_open(struct handle *surface, const struct io_claim *claim, uint64_t offset, uint64_t bytes,
                             struct shared_scanout *out);
 void shared_scanout_close(struct shared_scanout *s);
 
-/* What a claim keeps for the device memory made through it (in struct hal_claim, reached by
-   hal_claim_shared): its memory objects, which its end withdraws. Zeroed memory is an empty one. */
+/* What a claim keeps for the device memory made through it (in struct io_claim, reached by
+   io_claim_shared): its memory objects, which its end withdraws. Zeroed memory is an empty one. */
 struct shared_link;
 struct shared_claim {
     struct mutex lock;
     struct shared_link *ranges, *ended;
 };
-/* A claim ended (hal/claim.c, which marked it released first): every process
+/* A claim ended (io/claim.c, which marked it released first): every process
    loses the device pages of its BAR objects' mappings, shot down before this returns, and a
    mapping still being made fails. The address ranges stay reserved; a touch there reads all-ones,
    as a function gone from the bus does, and writes go nowhere. */
-void shared_revoke_claim(struct hal_claim *c);
+void shared_revoke_claim(struct io_claim *c);
 
 /* ---- touches ---- */
 

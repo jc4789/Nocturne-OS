@@ -1,7 +1,7 @@
 /* 画面を出すドライバー（docs/nocturne-native-abi.md §9）：claim を持つアプリのドライバーが、出力（モニター）ごとの
    buffer を画面（dev/fb.h の struct screen）へ渡し、画面が求める flip を受け、垂直帰線を知らせる。どのバスの claim
-   でも使える（hal/hal.h）：画面の持ち主は装置の id と出力の番号である。
-   claim の記録（struct screen_claim）は最初の呼出しで作り、claim の終わりの hook（hal_claim_on_end）が片づける。
+   でも使える（io/io.h）：画面の持ち主は装置の id と出力の番号である。
+   claim の記録（struct screen_claim）は最初の呼出しで作り、claim の終わりの hook（io_claim_on_end）が片づける。
    hook はバスが装置を止めた後に走るので、ドライバーが装置へ届く間は、画面は描き戻されない。
    錠の順：claim の終わりの mutex → screen_lock → mm/shared.c の錠。flip_lock は screen_lock の下で取り、葉である。
    画面は一度できたら消えない。ドライバーが去った画面は、buffer をもらうまで消えている。 */
@@ -12,7 +12,7 @@
 #include "arch/spin.h"
 #include "dev/fb.h"
 #include "dev/fbcon.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/heap.h"
 #include "mm/shared.h"
 #include "sys/clock.h"
@@ -24,7 +24,7 @@
 #include "sys/wait.h"
 
 /* ファームウェアの画面の画素が置かれたメモリーの資源の slot。無ければ -1。 */
-int screen_driver_boot_slot(const struct hal_device *d) {
+int screen_driver_boot_slot(const struct io_device *d) {
     if (!fb.addr) return -1;
     for (uint32_t i = 0; i < d->resource_count; i++) {
         const struct n_hal_resource *r = &d->resources[i];
@@ -46,9 +46,9 @@ struct screen_output {
 
 /* 一つの claim が持つ画面の物。screen_lock の下で変わる（flips と flip_lock の分は別）。 */
 struct screen_claim {
-    struct hal_claim_end end; /* 先頭でなくてよい：claim_of_end が引く */
+    struct io_claim_end end; /* 先頭でなくてよい：claim_of_end が引く */
     struct screen_claim *next; /* screen_claims */
-    struct hal_claim *claim;
+    struct io_claim *claim;
     unsigned holds; /* screen_driver_hold の入れ子。claim が終わると全部返す */
     unsigned users; /* flips を待っている thread。終わった記録は最後の一人が返す */
     bool ended;
@@ -89,8 +89,8 @@ static struct screen_image *screen_images;
 static int64_t screen_image_last;
 
 static void screen_say(const struct screen_claim *sc, uint32_t output, const char *what) {
-    const struct hal_device *d = hal_claim_device(sc->claim);
-    kprintf("screen: device %u (%s): output %u: %s\n", hal_id(d), d->location, output, what);
+    const struct io_device *d = io_claim_device(sc->claim);
+    kprintf("screen: device %u (%s): output %u: %s\n", io_id(d), d->location, output, what);
 }
 
 /* ---- 画面を持つドライバー（SYS_SCREEN_HOLD、dev/fb.c） ----
@@ -167,14 +167,14 @@ int64_t screen_hold_setting_get(uint32_t key, void *out, size_t cap) {
 
 /* screen_lock held. */
 static void screen_hold_begin(struct screen_claim *sc) {
-    const struct hal_device *d = hal_claim_device(sc->claim);
+    const struct io_device *d = io_claim_device(sc->claim);
     int app = process_current()->pid;
     /* 画面がまだ映っている間に言う：次に画面が止まれば、その理由になる。 */
-    kprintf("screen: device %u (%s): app %d holds the screen while its driver starts or stops the device\n", hal_id(d),
+    kprintf("screen: device %u (%s): app %d holds the screen while its driver starts or stops the device\n", io_id(d),
             d->location, app);
     uint64_t irq = spin_lock(&screen_hold_lock);
     screen_holder = sc;
-    ksnprintf(screen_holder_who, sizeof screen_holder_who, "device %u (%s)", hal_id(d), d->location);
+    ksnprintf(screen_holder_who, sizeof screen_holder_who, "device %u (%s)", io_id(d), d->location);
     screen_holder_app = app;
     screen_held_since = clock_now_ns();
     screen_holder_stopped = false;
@@ -232,17 +232,17 @@ static void screen_images_end(struct screen_output *o) {
 
 /* 装置 d の出力 output の画面：ファームウェアの画面がある装置の出力 0 は画面 0、ほかは前にあったもの、無ければ新しい
    画面。screen_lock の下。メモリーが無ければ NULL。 */
-static struct screen *output_screen_of(const struct hal_device *d, uint32_t output) {
+static struct screen *output_screen_of(const struct io_device *d, uint32_t output) {
     if (output == 0 && screen_driver_boot_slot(d) >= 0) return screen_get(0);
     for (size_t i = 0; i < noutput_screens; i++) {
         struct output_screen *e = &output_screens[i];
-        if (e->device == hal_id(d) && e->output == output) return e->screen;
+        if (e->device == io_id(d) && e->output == output) return e->screen;
     }
     struct screen *s = screen_new();
     if (!s) return NULL;
     struct output_screen *e = kappend(&output_screens, &noutput_screens, &output_screens_room, sizeof *e);
     if (!e) return NULL; /* 画面は残る。消えている */
-    *e = (struct output_screen){hal_id(d), output, s};
+    *e = (struct output_screen){io_id(d), output, s};
     return s;
 }
 
@@ -251,7 +251,7 @@ static struct screen_output *output_of(struct screen_claim *sc, uint32_t output,
     for (size_t i = 0; i < sc->noutputs; i++)
         if (sc->outputs[i]->output == output) return sc->outputs[i];
     if (!make) return NULL;
-    struct screen *s = output_screen_of(hal_claim_device(sc->claim), output);
+    struct screen *s = output_screen_of(io_claim_device(sc->claim), output);
     struct screen_output *o = s ? kzalloc(sizeof *o) : NULL;
     if (!o) return NULL;
     struct screen_output **at = kappend(&sc->outputs, &sc->noutputs, &sc->outputs_room, sizeof *at);
@@ -369,9 +369,9 @@ static bool outputs_end(struct screen_claim *sc) {
     return shown;
 }
 
-/* claim が終わった（hal/claim.c：装置は止まり、写像は外れている）。保持を返し、出力を返す。flips を待つ者がいれば
+/* claim が終わった（io/claim.c：装置は止まり、写像は外れている）。保持を返し、出力を返す。flips を待つ者がいれば
    記録はその最後の一人が返す。 */
-static void claim_ended(struct hal_claim_end *e, struct hal_claim *c) {
+static void claim_ended(struct io_claim_end *e, struct io_claim *c) {
     (void)c;
     struct screen_claim *sc = CLAIM_OF_END(e);
     mutex_lock(&screen_lock);
@@ -395,11 +395,11 @@ static void claim_ended(struct hal_claim_end *e, struct hal_claim *c) {
 
 /* claim の記録。make なら無ければ作る。NULL は claim が終わった（-N_ERR_CLOSED）か、メモリーが無い（*error）。
    screen_lock の下。 */
-static struct screen_claim *screen_claim_of(struct hal_claim *c, bool make, int64_t *error) {
+static struct screen_claim *screen_claim_of(struct io_claim *c, bool make, int64_t *error) {
     for (struct screen_claim *sc = screen_claims; sc; sc = sc->next)
         if (sc->claim == c) return sc;
-    if (hal_claim_revoked(c) || !make) {
-        *error = hal_claim_revoked(c) ? -N_ERR_CLOSED : -N_ERR_DENIED;
+    if (io_claim_revoked(c) || !make) {
+        *error = io_claim_revoked(c) ? -N_ERR_CLOSED : -N_ERR_DENIED;
         return NULL;
     }
     struct screen_claim *sc = kzalloc(sizeof *sc);
@@ -409,7 +409,7 @@ static struct screen_claim *screen_claim_of(struct hal_claim *c, bool make, int6
     }
     sc->claim = c;
     sc->end.ended = claim_ended;
-    if (!hal_claim_on_end(c, &sc->end)) {
+    if (!io_claim_on_end(c, &sc->end)) {
         kfree(sc);
         *error = -N_ERR_CLOSED;
         return NULL;
@@ -427,7 +427,7 @@ static const char *format_name(uint32_t format) {
 /* ---- 呼出し：h は呼ぶ側が持つ claim の handle ---- */
 
 int64_t screen_driver_give(struct handle *h, uint32_t output, const struct n_screen_buffers *b) {
-    struct hal_claim *c = hal_claim_of(h);
+    struct io_claim *c = io_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     if (b && (!b->count || b->count > SCREEN_BUFFERS_MAX)) return -N_ERR_INVALID;
     uint64_t bytes = 0;
@@ -482,7 +482,7 @@ int64_t screen_driver_give(struct handle *h, uint32_t output, const struct n_scr
 }
 
 int64_t screen_driver_flips(struct handle *h, struct n_screen_flip *out, size_t max, uint64_t deadline) {
-    struct hal_claim *c = hal_claim_of(h);
+    struct io_claim *c = io_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     if (!max) return -N_ERR_INVALID;
     int64_t r = 0;
@@ -519,7 +519,7 @@ int64_t screen_driver_flips(struct handle *h, struct n_screen_flip *out, size_t 
 }
 
 int64_t screen_driver_vblank(struct handle *h, const struct n_screen_vblank *v) {
-    struct hal_claim *c = hal_claim_of(h);
+    struct io_claim *c = io_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     if (v->buffer >= SCREEN_BUFFERS_MAX) return -N_ERR_INVALID;
     int64_t error = 0;
@@ -538,7 +538,7 @@ int64_t screen_driver_vblank(struct handle *h, const struct n_screen_vblank *v) 
 
 int64_t screen_driver_state(struct handle *h, uint32_t output, uint64_t seen, struct n_screen_state *out,
                             uint64_t deadline) {
-    struct hal_claim *c = hal_claim_of(h);
+    struct io_claim *c = io_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     int64_t error = 0;
     mutex_lock(&screen_lock);
@@ -551,7 +551,7 @@ int64_t screen_driver_state(struct handle *h, uint32_t output, uint64_t seen, st
 }
 
 int64_t screen_driver_modes(struct handle *h, uint32_t output, const struct n_screen_modes *m) {
-    struct hal_claim *c = hal_claim_of(h);
+    struct io_claim *c = io_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     if (m->count > N_SCREEN_MODES_MAX) return -N_ERR_INVALID;
     for (uint32_t i = 0; i < m->count; i++)
@@ -574,7 +574,7 @@ int64_t screen_driver_modes(struct handle *h, uint32_t output, const struct n_sc
 }
 
 int64_t screen_driver_image(struct handle *h, uint32_t output, struct handle *surface, const struct n_scanout *desc) {
-    struct hal_claim *c = hal_claim_of(h);
+    struct io_claim *c = io_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     uint64_t bytes = 0;
     int64_t r = desc->format & N_SCANOUT_DIRECT
@@ -607,7 +607,7 @@ int64_t screen_driver_image(struct handle *h, uint32_t output, struct handle *su
 }
 
 int64_t screen_driver_image_end(struct handle *h, int64_t number) {
-    struct hal_claim *c = hal_claim_of(h);
+    struct io_claim *c = io_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     int64_t r = -N_ERR_INVALID;
     mutex_lock(&screen_lock);
@@ -626,14 +626,14 @@ int64_t screen_driver_image_end(struct handle *h, int64_t number) {
 /* claim の thread を screen_lock の下で一度に一つ：数と、それが始め、終える保持が一緒に変わる。最後の保持の後の
    描き直しは、その後に来る。 */
 int64_t screen_driver_hold(struct handle *h, bool hold) {
-    struct hal_claim *c = hal_claim_of(h);
+    struct io_claim *c = io_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     int64_t r = 0;
     mutex_lock(&screen_lock);
     struct screen_claim *sc = screen_claim_of(c, hold, &r);
     if (!sc) {
         if (!hold && r == -N_ERR_DENIED) r = -N_ERR_INVALID; /* 返す保持が無い */
-    } else if (screen_driver_boot_slot(hal_claim_device(c)) < 0 && !claim_shows(sc)) {
+    } else if (screen_driver_boot_slot(io_claim_device(c)) < 0 && !claim_shows(sc)) {
         r = -N_ERR_NOT_FOUND;
     } else if (hold) {
         if (sc->holds == UINT32_MAX) r = -N_ERR_BUSY;

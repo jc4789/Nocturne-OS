@@ -1,6 +1,6 @@
 /* 持たれた装置の ACPI の記述（SYS_HAL_ACPI_EVAL、SYS_HAL_ACPI_NOTIFY_TAKE、docs/nocturne-native-abi.md §9）。
-   どのバスの claim でも同じ：届くのは装置の firmware の節（hal_device の firmware）、その節の子、木で上の装置の節
-   （hal_parent_firmware）だけ。名前は節の直下で引き（uacpi_eval は上へ探さない）、一区画の名前は節を出られない
+   どのバスの claim でも同じ：届くのは装置の firmware の節（io_device の firmware）、その節の子、木で上の装置の節
+   （io_parent_firmware）だけ。名前は節の直下で引き（uacpi_eval は上へ探さない）、一区画の名前は節を出られない
    （"^" と "\" は名前の字ではない）。
    Notify の記録（struct acpi_claim）は最初の n_hal_acpi_notify_take で作り、claim の終わりの hook が片づける。
    錠の順：claim の終わりの mutex → claims_mutex。notes_lock は葉で、ACPI の thread の Notify もこれだけを取る。 */
@@ -8,7 +8,7 @@
 #include "abi.h"
 #include "arch/spin.h"
 #include "dev/acpi.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/heap.h"
 #include "sys/clock.h"
 #include "sys/thread.h"
@@ -17,7 +17,7 @@
 /* システムが装置と機械を動かすのに使う predefined の method。カーネルが自分の config の bit を自分で動かすように、
    これらはシステムが動かす：電源とリセット、取り外しとドッキング、資源、firmware とシステムのどちらが何を制御する
    かの交渉、起こし、初期化と handler（operation region、GPIO の事象）、システムの眠り。ドライバーが評価すると、
-   カーネルが追っている状態（dev/pm.c、dev/pci.c、hal/power.c）が裏で変わり、上の装置ならその下の全部の装置が変わる。
+   カーネルが追っている状態（dev/pm.c、dev/pci.c、io/power.c）が裏で変わり、上の装置ならその下の全部の装置が変わる。
    ドライバーと firmware の間の約束（_DSM、_ROM、_DOD、_DDC、_ADR、firmware 自身の名前）はここに無い。 */
 static const char system_methods[][5] = {
     "_PS0", "_PS1", "_PS2", "_PS3", "_ON_", "_OFF", "_RST", /* 電源、リセット（ACPI 6.5 7.2、7.3） */
@@ -41,20 +41,20 @@ static bool name_allowed(uint32_t which, const char *name) {
 
 int64_t acpi_claim_eval(struct handle *h, uint32_t which, const char *name, const struct n_acpi_value *args,
                         uint32_t nargs, const uint8_t *data, size_t data_size, uint8_t *out, size_t out_size) {
-    struct hal_claim *c = hal_claim_of(h);
+    struct io_claim *c = io_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     if (!acpi_name_segment(name)) return -N_ERR_INVALID;
     if (!name_allowed(which, name)) return -N_ERR_DENIED;
     if (!acpi_aml_ready()) return -N_ERR_UNSUPPORTED;
-    struct hal_device *d = hal_claim_enter(c);
+    struct io_device *d = io_claim_enter(c);
     if (!d) return -N_ERR_CLOSED;
     int64_t r = 0;
     struct firmware_node *node;
     if (which == N_ACPI_SELF) node = d->firmware;
-    else if (which == N_ACPI_PARENT) node = hal_parent_firmware(d);
+    else if (which == N_ACPI_PARENT) node = io_parent_firmware(d);
     else if (!d->firmware || !(node = acpi_node_child(d->firmware, which))) r = -N_ERR_INVALID; /* 最後の子より先 */
     if (!r) r = node ? acpi_node_eval(node, name, args, nargs, data, data_size, out, out_size) : -N_ERR_NOT_FOUND;
-    hal_put(d);
+    io_put(d);
     return r;
 }
 
@@ -64,8 +64,8 @@ int64_t acpi_claim_eval(struct handle *h, uint32_t which, const char *name, cons
 
 struct acpi_claim {
     struct acpi_claim *next;
-    struct hal_claim *claim;
-    struct hal_claim_end end;
+    struct io_claim *claim;
+    struct io_claim_end end;
     struct acpi_watch *watch;
     unsigned users; /* claims_mutex：待っている呼出しの数 */
     bool unlinked;  /* claims_mutex：終わりの hook が一覧から外した */
@@ -95,7 +95,7 @@ static void noted(void *context, uint64_t value) {
 }
 
 /* claim の終わり：Notify を止め、待つ者を起こし、誰も使っていなければ記録を返す。 */
-static void claim_ended(struct hal_claim_end *e, struct hal_claim *c) {
+static void claim_ended(struct io_claim_end *e, struct io_claim *c) {
     (void)c;
     struct acpi_claim *a = ACPI_CLAIM_OF_END(e);
     acpi_node_unwatch(a->watch); /* 戻った後、noted はもう走らない */
@@ -116,7 +116,7 @@ static void claim_ended(struct hal_claim_end *e, struct hal_claim *c) {
 }
 
 /* c の記録。無ければ node を見張って作る。claims_mutex の下。NULL なら *error。 */
-static struct acpi_claim *claim_record(struct hal_claim *c, struct firmware_node *node, int64_t *error) {
+static struct acpi_claim *claim_record(struct io_claim *c, struct firmware_node *node, int64_t *error) {
     for (struct acpi_claim *a = claims; a; a = a->next)
         if (a->claim == c) return a;
     struct acpi_claim *a = kzalloc(sizeof *a);
@@ -132,7 +132,7 @@ static struct acpi_claim *claim_record(struct hal_claim *c, struct firmware_node
         *error = -N_ERR_NO_MEMORY;
         return NULL;
     }
-    if (!hal_claim_on_end(c, &a->end)) {
+    if (!io_claim_on_end(c, &a->end)) {
         acpi_node_unwatch(a->watch);
         kfree(a);
         *error = -N_ERR_CLOSED;
@@ -168,10 +168,10 @@ static int64_t note_take(struct acpi_claim *a, uint64_t deadline) {
 }
 
 int64_t acpi_claim_notify_take(struct handle *h, uint64_t deadline) {
-    struct hal_claim *c = hal_claim_of(h);
+    struct io_claim *c = io_claim_of(h);
     if (!c) return -N_ERR_WRONG_KIND;
     if (!acpi_aml_ready()) return -N_ERR_UNSUPPORTED;
-    struct hal_device *d = hal_claim_enter(c);
+    struct io_device *d = io_claim_enter(c);
     if (!d) return -N_ERR_CLOSED;
     struct firmware_node *node = d->firmware;
     int64_t r = node ? 0 : -N_ERR_NOT_FOUND;
@@ -182,7 +182,7 @@ int64_t acpi_claim_notify_take(struct handle *h, uint64_t deadline) {
         if (a) a->users++;
         mutex_unlock(&claims_mutex);
     }
-    hal_put(d);
+    io_put(d);
     if (!a) return r;
     r = note_take(a, deadline);
     mutex_lock(&claims_mutex);

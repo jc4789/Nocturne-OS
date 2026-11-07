@@ -70,7 +70,7 @@ struct shared_pages {
     struct shared_link derived_link; /* a view's, in its parent's derived */
     struct shared_link claim_link;   /* a device range's, in its claim's ranges */
     struct shared_scope *scope;
-    struct hal_claim *claim;  /* a device memory or DMA root: the claim it was made through */
+    struct io_claim *claim;  /* a device memory or DMA root: the claim it was made through */
     uint64_t base;            /* a range's first frame */
     struct object *parent;    /* a view's object, a root or a composite; never another view */
     size_t first;             /* a view's first page of it */

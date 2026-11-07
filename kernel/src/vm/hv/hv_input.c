@@ -4,7 +4,7 @@
    its report descriptor to find the buttons, X, Y and wheel. */
 #include "kernel.h"
 #include "dev/input.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/heap.h"
 #include "sys/clock.h"
 #include "vm/hv/vmbus.h"
@@ -70,7 +70,7 @@ static void kbd_callback(struct vmbus_channel *ch) {
     }
 }
 
-static int kbd_attach(struct hal_device *d) {
+static int kbd_attach(struct io_device *d) {
     struct vmbus_channel *ch = vmbus_channel_of(d);
     struct hv_keyboard *kbd = kzalloc(sizeof *kbd);
     if (!kbd) return -N_ERR_NO_MEMORY;
@@ -88,7 +88,7 @@ static int kbd_attach(struct hal_device *d) {
         goto failed;
     }
     input_device_add(&kbd->input);
-    hal_offer(d, N_OFFER_INPUT, 0, kbd->input.id);
+    io_offer(d, N_OFFER_INPUT, 0, kbd->input.id);
     kprintf("hv-input: synthetic keyboard ready\n");
     return 0;
 failed:
@@ -97,7 +97,7 @@ failed:
     return -N_ERR_IO;
 }
 
-static void kbd_detach(struct hal_device *d) {
+static void kbd_detach(struct io_device *d) {
     struct hv_keyboard *kbd = d->driver_data;
     vmbus_close(kbd->ch); /* no callback runs after this */
     input_device_remove(&kbd->input);
@@ -106,7 +106,7 @@ static void kbd_detach(struct hal_device *d) {
 }
 
 static const struct n_hal_rule kbd_rules[] = {N_VMBUS_TYPE(kbd_guid.b)};
-const struct hal_driver hv_keyboard_driver = {
+const struct io_driver hv_keyboard_driver = {
     .name = "hv_keyboard",
     .rules = kbd_rules,
     .rule_count = ARRAY_SIZE(kbd_rules),
@@ -307,7 +307,7 @@ static void mouse_callback(struct vmbus_channel *ch) {
     }
 }
 
-static int mouse_attach(struct hal_device *d) {
+static int mouse_attach(struct io_device *d) {
     struct vmbus_channel *ch = vmbus_channel_of(d);
     struct hv_mouse *ms = kzalloc(sizeof *ms);
     if (!ms) return -N_ERR_NO_MEMORY;
@@ -330,7 +330,7 @@ static int mouse_attach(struct hal_device *d) {
         goto closed;
     }
     input_device_add(&ms->input);
-    hal_offer(d, N_OFFER_INPUT, 0, ms->input.id);
+    io_offer(d, N_OFFER_INPUT, 0, ms->input.id);
     kprintf("hv-input: synthetic mouse ready%s%s\n", !ms->x.relative ? " (absolute)" : "",
             ms->wheel.present ? " (wheel)" : "");
     return 0;
@@ -342,7 +342,7 @@ failed:
     return -N_ERR_IO;
 }
 
-static void mouse_detach(struct hal_device *d) {
+static void mouse_detach(struct io_device *d) {
     struct hv_mouse *ms = d->driver_data;
     vmbus_close(ms->ch); /* no callback runs after this */
     input_device_remove(&ms->input);
@@ -351,7 +351,7 @@ static void mouse_detach(struct hal_device *d) {
 }
 
 static const struct n_hal_rule mouse_rules[] = {N_VMBUS_TYPE(mouse_guid.b)};
-const struct hal_driver hv_mouse_driver = {
+const struct io_driver hv_mouse_driver = {
     .name = "hv_mouse",
     .rules = mouse_rules,
     .rule_count = ARRAY_SIZE(mouse_rules),

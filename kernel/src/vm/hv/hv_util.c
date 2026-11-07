@@ -10,7 +10,7 @@
 #include "dev/pm.h"
 #include "gui/wm.h"
 #include "sys/clock.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/heap.h"
 #include "vm/hv/vmbus.h"
 #include "net/net.h"
@@ -318,7 +318,7 @@ static void util_callback(struct vmbus_channel *ch) {
 }
 
 /* The channel's own copy of its service's description: the versions it negotiated are its. */
-static int util_attach(struct hal_device *d) {
+static int util_attach(struct io_device *d) {
     struct vmbus_channel *ch = vmbus_channel_of(d);
     const struct service *spec = NULL;
     for (size_t i = 0; i < ARRAY_SIZE(services); i++)
@@ -338,7 +338,7 @@ static int util_attach(struct hal_device *d) {
     return 0;
 }
 
-static void util_detach(struct hal_device *d) {
+static void util_detach(struct io_device *d) {
     struct vmbus_channel *ch = vmbus_channel_of(d);
     vmbus_close(ch); /* no callback runs after this */
     kfree(d->driver_data);
@@ -349,7 +349,7 @@ static const struct n_hal_rule util_rules[] = {
     N_VMBUS_TYPE(services[0].type.b), N_VMBUS_TYPE(services[1].type.b),
     N_VMBUS_TYPE(services[2].type.b), N_VMBUS_TYPE(services[3].type.b),
 };
-const struct hal_driver hv_util_driver = {
+const struct io_driver hv_util_driver = {
     .name = "hv_util",
     .rules = util_rules,
     .rule_count = ARRAY_SIZE(util_rules),

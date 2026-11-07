@@ -11,7 +11,7 @@
 #include "dev/acpi.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/bootmem.h"
 #include "mm/vmm.h"
 #include "mm/heap.h"
@@ -884,34 +884,34 @@ void acpi_aml_init(void) {
             button_count, lid_node ? "yes" : "no");
 }
 
-/* ---- the machine's devices that are this file's (hal/hal.h) ---- */
+/* ---- the machine's devices that are this file's (io/io.h) ---- */
 
-static bool button_mine(struct hal_device *d) {
+static bool button_mine(struct io_device *d) {
     for (unsigned i = 0; i < button_count; i++)
         if (d->firmware == acpi_firmware(buttons[i])) return true;
     return false;
 }
 
-static bool lid_mine(struct hal_device *d) { return lid_node && d->firmware == acpi_firmware(lid_node); }
+static bool lid_mine(struct io_device *d) { return lid_node && d->firmware == acpi_firmware(lid_node); }
 
-static bool link_mine(struct hal_device *d) {
+static bool link_mine(struct io_device *d) {
     for (struct link *l = __atomic_load_n(&links, __ATOMIC_ACQUIRE); l; l = l->next)
         if (d->firmware == acpi_firmware(l->node)) return true;
     return false;
 }
 
 static const struct n_hal_rule button_rules[] = {N_ACPI_ID("PNP0C0C")};
-static const struct hal_machine acpi_buttons = {
+static const struct io_machine acpi_buttons = {
     .owner = "acpi", .rules = button_rules, .rule_count = ARRAY_SIZE(button_rules), .mine = button_mine};
-HAL_MACHINE(acpi_buttons);
+IO_MACHINE(acpi_buttons);
 static const struct n_hal_rule lid_rules[] = {N_ACPI_ID("PNP0C0D")};
-static const struct hal_machine acpi_lid = {
+static const struct io_machine acpi_lid = {
     .owner = "acpi", .rules = lid_rules, .rule_count = ARRAY_SIZE(lid_rules), .mine = lid_mine};
-HAL_MACHINE(acpi_lid);
+IO_MACHINE(acpi_lid);
 static const struct n_hal_rule link_rules[] = {N_ACPI_ID("PNP0C0F")};
-static const struct hal_machine acpi_links = {
+static const struct io_machine acpi_links = {
     .owner = "acpi", .rules = link_rules, .rule_count = ARRAY_SIZE(link_rules), .mine = link_mine};
-HAL_MACHINE(acpi_links);
+IO_MACHINE(acpi_links);
 
 bool acpi_aml_ready(void) { return aml_ready; }
 

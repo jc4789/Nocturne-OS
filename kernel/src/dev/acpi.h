@@ -201,7 +201,7 @@ void acpi_wake_prepare(unsigned state);
 void acpi_wake(unsigned state);
 void acpi_links_restore(void);
 /* 装置の電源（dev/acpi_power.c）。init は AML の初期化の後に一度：名前空間の装置の D 状態と電源資源の参照を数え、
-   HAL の firmware の方法になる（hal_firmware_set）。restore は firmware が走った眠りの後（S3、休止の写しの戻り）、
+   装置の管理者の firmware の方法になる（io_firmware_set）。restore は firmware が走った眠りの後（S3、休止の写しの戻り）、
    割り込みを切り凍らせた中で、PCI の機能の構成を戻す前に：参照のある資源を入れ直す（7.2.3：_ON は繰り返してよい）。 */
 void acpi_power_init(void);
 void acpi_power_restore(void);
@@ -211,7 +211,7 @@ void acpi_power_restore(void);
 void acpi_freeze(bool on);
 bool acpi_reset(void);
 
-/* ---- 装置の firmware の節（hal/hal.h の struct firmware_node） ----
+/* ---- 装置の firmware の節（io/io.h の struct firmware_node） ----
    節は uACPI の名前空間の Device で、中身を知るのはここ（dev/acpi.c）と ACPI のバス（dev/acpi_devices.c）だけである。
    AML が無ければ、どの口も NULL か false を返す。 */
 struct firmware_node;

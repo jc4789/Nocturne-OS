@@ -21,7 +21,7 @@
 #include "dev/iommu.h"
 #include "fs/bootrecord.h"
 #include "dev/pci.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "sys/clock.h"
@@ -769,7 +769,7 @@ static void cannot_isolate(const struct pci_device *d, const struct pci_device *
    the kernel drives, every ID seen by a unit and none the platform's own; an error then with
    *fixed set, as no later attempt finds it otherwise. Then the members' claims: -N_ERR_BUSY
    while one is claimed or still in a domain. */
-static bool guest(const struct pci_device *m) { return m->kernel_owned && hal_dma_pausable(&m->hal); }
+static bool guest(const struct pci_device *m) { return m->kernel_owned && io_dma_pausable(&m->hal); }
 
 static int group_check(const struct pci_device *d, const struct fns *g, struct ids *ids, bool *fixed) {
     *fixed = true;
@@ -975,7 +975,7 @@ static int unisolated(const struct pci_device *d, const struct fns *g, int r) {
 void iommu_guests_stop(const struct iommu_domain *dom) {
     for (unsigned i = 0; i < dom->nmembers; i++) {
         struct pci_device *m = dom->members[i];
-        if (guest(m)) hal_dma_pause(&m->hal);
+        if (guest(m)) io_dma_pause(&m->hal);
         m->claim_domain = NULL;
     }
 }
@@ -986,7 +986,7 @@ void iommu_guests_start(struct iommu_domain *dom, bool formed) {
         if (!guest(m)) continue;
         m->no_messages = formed;
         m->claim_domain = formed ? dom : NULL;
-        if (!hal_dma_restart(&m->hal, formed)) m->claim_domain = NULL;
+        if (!io_dma_restart(&m->hal, formed)) m->claim_domain = NULL;
     }
 }
 
@@ -1157,15 +1157,15 @@ bool iommu_shutdown(void) {
     return !restore_failed;
 }
 
-/* ---- the machine's devices that are this file's (hal/hal.h) ----
+/* ---- the machine's devices that are this file's (io/io.h) ----
    The PCI functions the units are (class 08h, subclass 06h): iommu_init took their registers and
    interrupt from the firmware's tables before any driver binds, and they come back from a sleep
    in iommu_resume. */
-static bool unit_mine(struct hal_device *d) {
+static bool unit_mine(struct io_device *d) {
     return hw && hw->unit_function && d->bus == N_BUS_PCI && hw->unit_function(pci_device_of(d));
 }
 
 static const struct n_hal_rule unit_rules[] = {N_PCI_CLASS(0x08, 0x06)};
-static const struct hal_machine iommu_units = {
+static const struct io_machine iommu_units = {
     .owner = "iommu", .rules = unit_rules, .rule_count = ARRAY_SIZE(unit_rules), .mine = unit_mine};
-HAL_MACHINE(iommu_units);
+IO_MACHINE(iommu_units);

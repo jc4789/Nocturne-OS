@@ -33,7 +33,7 @@
 #include "arch/spin.h"
 #include "dev/acpi.h"
 #include "dev/refclock.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/vmm.h"
 #include "sys/alarm.h"
 #include "sys/clock.h"
@@ -381,25 +381,25 @@ int rtc_write(int64_t unix_seconds) {
     return 0;
 }
 
-/* ---- the machine's devices that are this file's (hal/hal.h) ----
+/* ---- the machine's devices that are this file's (io/io.h) ----
    The HPET while it is the rate reference: the PNP0103 device whose memory holds its block. The RTC
    while the platform has one: the device of ports 70h and 71h (PNP0B00, and the PIIX4's and the
    DS1585's, PNP0B01 and PNP0B02). */
 
-static bool hpet_mine(struct hal_device *d) {
+static bool hpet_mine(struct io_device *d) {
     uint64_t at = __atomic_load_n(&hpet_phys, __ATOMIC_ACQUIRE);
-    return at && hal_resource_holds(d, N_HAL_MEMORY, at);
+    return at && io_resource_holds(d, N_HAL_MEMORY, at);
 }
 
-static bool rtc_mine(struct hal_device *d) {
-    return rtc_here() && hal_resource_holds(d, N_HAL_PORT, 0x70) && hal_resource_holds(d, N_HAL_PORT, 0x71);
+static bool rtc_mine(struct io_device *d) {
+    return rtc_here() && io_resource_holds(d, N_HAL_PORT, 0x70) && io_resource_holds(d, N_HAL_PORT, 0x71);
 }
 
 static const struct n_hal_rule hpet_rules[] = {N_ACPI_ID("PNP0103")};
-static const struct hal_machine refclock_hpet = {
+static const struct io_machine refclock_hpet = {
     .owner = "refclock", .rules = hpet_rules, .rule_count = ARRAY_SIZE(hpet_rules), .mine = hpet_mine};
-HAL_MACHINE(refclock_hpet);
+IO_MACHINE(refclock_hpet);
 static const struct n_hal_rule rtc_rules[] = {N_ACPI_ID("PNP0B00"), N_ACPI_ID("PNP0B01"), N_ACPI_ID("PNP0B02")};
-static const struct hal_machine refclock_rtc = {
+static const struct io_machine refclock_rtc = {
     .owner = "refclock", .rules = rtc_rules, .rule_count = ARRAY_SIZE(rtc_rules), .mine = rtc_mine};
-HAL_MACHINE(refclock_rtc);
+IO_MACHINE(refclock_rtc);

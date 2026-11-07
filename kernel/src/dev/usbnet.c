@@ -4,7 +4,7 @@
  * is unplugged. */
 #include "kernel.h"
 #include "dev/usb.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/heap.h"
 #include "net/net.h"
 #include "sys/wait.h"
@@ -222,7 +222,7 @@ static bool ncm_setup(struct usbnet *n) {
 }
 
 /* The communications interface of an ECM or NCM function; it takes the data interface for itself. */
-static int usbnet_attach(struct hal_device *hal) {
+static int usbnet_attach(struct io_device *hal) {
     struct usb_interface *node = usb_interface_of(hal);
     struct usb_device *d = node->dev;
     const uint8_t *cfg = d->config;
@@ -331,7 +331,7 @@ fail:
     return -N_ERR_IO;
 }
 
-static void usbnet_detach(struct hal_device *hal) {
+static void usbnet_detach(struct io_device *hal) {
     struct usbnet *n = hal->driver_data;
     net_unregister(&n->nif);
     kprintf("usbnet: adapter unplugged\n");
@@ -343,7 +343,7 @@ static void usbnet_detach(struct hal_device *hal) {
 /* 送ることを閉じる。受けた frame は制御器が止まるまで届いてよい。中断した装置は選んだ alternate と packet filter を
    持つ（USB 2.0 9.1.1.6）ので、戻りでは送ることを開け、待たせた frame を網の層に送らせる。電源を失った装置は外れ、
    新しく attach して同じ MAC の adapter として戻る（net_register）。 */
-static bool usbnet_suspend(struct hal_device *hal, enum hal_power_target target) {
+static bool usbnet_suspend(struct io_device *hal, enum io_power_target target) {
     (void)target;
     struct usbnet *n = hal->driver_data;
     mutex_lock(&n->lock);
@@ -352,7 +352,7 @@ static bool usbnet_suspend(struct hal_device *hal, enum hal_power_target target)
     return true;
 }
 
-static bool usbnet_resume(struct hal_device *hal) {
+static bool usbnet_resume(struct io_device *hal) {
     struct usbnet *n = hal->driver_data;
     mutex_lock(&n->lock);
     n->asleep = false;
@@ -362,7 +362,7 @@ static bool usbnet_resume(struct hal_device *hal) {
 }
 
 static const struct n_hal_rule usbnet_rules[] = {N_USB_INTERFACE_SUBCLASS(2, CDC_ECM), N_USB_INTERFACE_SUBCLASS(2, CDC_NCM)};
-static const struct hal_driver usbnet_driver = {
+static const struct io_driver usbnet_driver = {
     .name = "usbnet",
     .rules = usbnet_rules,
     .rule_count = ARRAY_SIZE(usbnet_rules),
@@ -370,6 +370,6 @@ static const struct hal_driver usbnet_driver = {
     .detach = usbnet_detach,
     .suspend = usbnet_suspend,
     .resume = usbnet_resume,
-    .after_sleep = HAL_AFTER_SLEEP_RESUME,
+    .after_sleep = IO_AFTER_SLEEP_RESUME,
 };
-HAL_DRIVER(usbnet_driver);
+IO_DRIVER(usbnet_driver);

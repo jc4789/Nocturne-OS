@@ -35,7 +35,7 @@ bool fb_dither_able(void);
    (the boot console and the panic screen draw there; the desktop draws through frames, below).
    It runs on the boot CPU alone before the scheduler, and in threads after. */
 void fb_present(const uint32_t *src, int src_pitch, int x, int y, int w, int h);
-/* The firmware's screen as a device of the machine (hal/hal.h). It has no way back from a sleep:
+/* The firmware's screen as a device of the machine (io/io.h). It has no way back from a sleep:
    the firmware set its mode, and nothing sets it again; it is as it was after the next boot. A driver
    that can show it again and has its own resume takes it over with fb_boot_release. */
 void fb_publish(void);
@@ -173,7 +173,7 @@ struct screen_times {
 void screen_times(struct screen *s, struct screen_times *out);
 
 /* ---- a display driver in an app (dev/screen_driver.c, docs/nocturne-native-abi.md §9) ----
-   Every call takes the handle of a claim (hal/hal.h) the caller holds, in a thread that may sleep,
+   Every call takes the handle of a claim (io/io.h) the caller holds, in a thread that may sleep,
    holding no spinlock; b, v, m, out are kernel copies.
    screen_driver_give: the output's buffers (NULL: given back) become what its screen is drawn into;
    returns the serial of the output's last flip before them.
@@ -189,8 +189,8 @@ void screen_times(struct screen *s, struct screen_times *out);
    through, or one whose buffers a screen is drawn into; given back when the claim ends.
    screen_driver_boot_slot: the memory resource (slot) of d the boot screen is drawn through, or -1. */
 struct handle;
-struct hal_claim;
-struct hal_device;
+struct io_claim;
+struct io_device;
 struct n_scanout;
 struct n_screen_buffers;
 struct n_screen_flip;
@@ -204,4 +204,4 @@ int64_t screen_driver_modes(struct handle *h, uint32_t output, const struct n_sc
 int64_t screen_driver_image(struct handle *h, uint32_t output, struct handle *surface, const struct n_scanout *desc);
 int64_t screen_driver_image_end(struct handle *h, int64_t number);
 int64_t screen_driver_hold(struct handle *h, bool hold);
-int screen_driver_boot_slot(const struct hal_device *d);
+int screen_driver_boot_slot(const struct io_device *d);

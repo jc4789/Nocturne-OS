@@ -6,7 +6,7 @@
 #include "fs/watch.h"
 #include "store/space.h"
 #include "dev/blk.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "sys/clock.h"
 #include "lib/idtable.h"
 #include "limine.h"
@@ -292,7 +292,7 @@ static void device_find(void) {
     uint32_t looked = 0; /* the disks whose GPT was read; one that could not be is tried again */
     bool boot = false, said = false;
     for (;;) {
-        bool looking = !hal_settled(); /* before the disks: one registered after this is read next time */
+        bool looking = !io_settled(); /* before the disks: one registered after this is read next time */
         for (int i = 0; i < blk_count() && !boot; i++) {
             struct blkdev *d = blk_get(i);
             uint8_t guid[16];

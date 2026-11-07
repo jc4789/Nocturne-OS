@@ -19,7 +19,7 @@
    Every active namespace with plain blocks of any size a command can move (no metadata, no
    protection information) becomes a block device "nvmeC.N".
 
-   眠り、休止、電源断は nvme_suspend と nvme_resume（hal/hal.h）：I/O の queue を消し、電源が去るなら正常の shutdown を
+   眠り、休止、電源断は nvme_suspend と nvme_resume（io/io.h）：I/O の queue を消し、電源が去るなら正常の shutdown を
    知らせ（3.6.1）、戻りは Controller Reset から立ち上げ直す。 */
 #include "kernel.h"
 #include "arch/cpu.h"
@@ -29,7 +29,7 @@
 #include "arch/topology.h"
 #include "dev/blk.h"
 #include "dev/pci.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/heap.h"
 #include "sys/clock.h"
 #include "sys/thread.h"
@@ -147,7 +147,7 @@ struct vector {
 
 struct nvme {
     int index;
-    struct hal_device *hal;
+    struct io_device *hal;
     struct pci_device *pci;
     volatile uint8_t *regs;
     uint64_t cap;
@@ -423,10 +423,10 @@ static bool queue_alloc(struct queue *q, struct nvme *c, uint16_t qid, uint16_t 
     q->qid = qid;
     q->size = entries;
     q->depth = (uint16_t)(entries - 1);
-    if (!(q->sq = hal_dma_alloc(c->hal, PAGE_SIZE, &q->sq_bus)) ||
-        !(q->cq = hal_dma_alloc(c->hal, PAGE_SIZE, &q->cq_bus)))
+    if (!(q->sq = io_dma_alloc(c->hal, PAGE_SIZE, &q->sq_bus)) ||
+        !(q->cq = io_dma_alloc(c->hal, PAGE_SIZE, &q->cq_bus)))
         return false;
-    if (lists && !(q->lists = hal_dma_alloc(c->hal, (size_t)q->depth * LIST_BYTES, &q->lists_bus))) return false;
+    if (lists && !(q->lists = io_dma_alloc(c->hal, (size_t)q->depth * LIST_BYTES, &q->lists_bus))) return false;
     q->slots = kzalloc(q->depth * sizeof *q->slots);
     q->free = kzalloc((q->depth + 63) / 64 * sizeof *q->free);
     if (!q->slots || !q->free) return false;
@@ -512,7 +512,7 @@ static bool controller_stop(struct nvme *c, uint64_t seen) {
                 kprintf("nvme%d: its reset was called off with its thread\n", c->index);
             } else {
                 kprintf("nvme%d: controller did not reset, turned off\n", c->index);
-                hal_failed(c->hal, -N_ERR_IO);
+                io_failed(c->hal, -N_ERR_IO);
                 __atomic_store_n(&c->cut, true, __ATOMIC_RELEASE);
                 for (struct ns *s = c->found; s; s = s->next) __atomic_store_n(&s->blk.gone, true, __ATOMIC_RELEASE);
             }
@@ -795,7 +795,7 @@ static void add_namespaces(struct nvme *c) {
 /* Its messages, as many as there are I/O queues where the function has them; each queue's completion
    queue takes one in turn. A function with none has its INTx line, one vector for all the queues. */
 static void vectors_enable(struct nvme *c) {
-    unsigned want = MIN(MAX(hal_irq_max(c->hal), 1u), c->nio);
+    unsigned want = MIN(MAX(io_irq_max(c->hal), 1u), c->nio);
     struct irq_spec *specs = kzalloc(want * sizeof *specs);
     c->irqs = kzalloc(want * sizeof *c->irqs);
     c->vectors = kzalloc(want * sizeof *c->vectors);
@@ -807,7 +807,7 @@ static void vectors_enable(struct nvme *c) {
         c->vectors[i] = (struct vector){c, i};
         specs[i] = (struct irq_spec){.name = "NVMe", .handler = nvme_isr, .context = &c->vectors[i]};
     }
-    c->nvectors = hal_irq_enable(c->hal, specs, want, c->irqs);
+    c->nvectors = io_irq_enable(c->hal, specs, want, c->irqs);
     kfree(specs);
 }
 
@@ -822,7 +822,7 @@ static bool enable(struct nvme *c) {
         !(__atomic_load_n(&c->called_off, __ATOMIC_ACQUIRE) &&
           controller_stop(c, __atomic_load_n(&c->stops, __ATOMIC_ACQUIRE))))
         return false;
-    hal_enable(c->hal, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA); /* a Function Level Reset's configuration comes back without it */
+    io_enable(c->hal, IO_ENABLE_MEMORY | IO_ENABLE_DMA); /* a Function Level Reset's configuration comes back without it */
     wr32(c, AQA, (ADMIN_ENTRIES - 1u) << 16 | (ADMIN_ENTRIES - 1u));
     wr64(c, ASQ, c->admin.sq_bus);
     wr64(c, ACQ, c->admin.cq_bus);
@@ -892,8 +892,8 @@ down:
 /* reset_lock held. */
 static bool enable_recorded(struct nvme *c) {
     bool up = enable(c);
-    if (up) hal_recovered(c->hal);
-    else if (!__atomic_load_n(&c->cut, __ATOMIC_ACQUIRE)) hal_failed(c->hal, -N_ERR_IO);
+    if (up) io_recovered(c->hal);
+    else if (!__atomic_load_n(&c->cut, __ATOMIC_ACQUIRE)) io_failed(c->hal, -N_ERR_IO);
     return up;
 }
 
@@ -919,7 +919,7 @@ static struct queue *io_queue(struct nvme *c) {
 /* ---- requests ---- */
 /* r のデータの指し（DW6 から DW9）を cmd に。要るなら list（list_bus にある）に作る：頁ごとの PRP（4.3.1：PRP1 は
    最初の頁の中の位置から、PRP2 は二つ目の頁か残りの list）、または SGL（4.3.2：Data Block の記述子一つか、その list
-   を指す Last Segment の記述子一つ）。番地は区切りの bus（blk.c が HAL で求めた装置の番地）だけ。 */
+   を指す Last Segment の記述子一つ）。番地は区切りの bus（blk.c が装置の管理者で求めた装置の番地）だけ。 */
 static void data_pointer(const struct nvme *c, const struct blk_request *r, uint32_t cmd[16], uint64_t *list,
                          uint64_t list_bus) {
     if (c->sgl) {
@@ -1090,12 +1090,12 @@ static void nvme_thread(void *arg) {
     struct nvme *c = arg;
     while (!__atomic_load_n(&c->stopping, __ATOMIC_ACQUIRE)) {
         uint64_t seen = __atomic_load_n(&c->work, __ATOMIC_SEQ_CST);
-        hal_busy_begin();
+        io_busy_begin();
         if (!c->nvectors)
             for (unsigned i = 0; i < __atomic_load_n(&c->nio, __ATOMIC_ACQUIRE); i++) poll_queue(&c->io[i]);
         retries_run(c);
         health_check(c);
-        hal_busy_end();
+        io_busy_end();
         bool polled = !c->nvectors && __atomic_load_n(&c->inflight, __ATOMIC_ACQUIRE);
         wq_wait_unless(&c->work_wq, &c->work, seen, clock_after(polled ? NS_PER_MS : TICK_NS));
     }
@@ -1110,9 +1110,9 @@ static void vectors_place(struct nvme *c) {
 }
 
 static int start(struct nvme *c) {
-    struct hal_device *h = c->hal;
+    struct io_device *h = c->hal;
     /* the registers and the doorbells of every queue pair it has, all in its BAR */
-    c->regs = hal_map(h, 0);
+    c->regs = io_map(h, 0);
     if (!c->regs) {
         kprintf("nvme%d: no register window\n", c->index);
         return -N_ERR_NOT_FOUND;
@@ -1132,8 +1132,8 @@ static int start(struct nvme *c) {
         return -N_ERR_UNSUPPORTED;
     }
     /* 装置が届く番地は 64 bit：ASQ と ACQ（3.1.4 の Figure 45、46）、PRP（4.3.1 の Figure 111）と SGL の番地 */
-    hal_dma_bits(h, 64);
-    if (!(c->ident = hal_dma_alloc(h, PAGE_SIZE, &c->ident_bus)) || !queue_alloc(&c->admin, c, 0, ADMIN_ENTRIES, false))
+    io_dma_bits(h, 64);
+    if (!(c->ident = io_dma_alloc(h, PAGE_SIZE, &c->ident_bus)) || !queue_alloc(&c->admin, c, 0, ADMIN_ENTRIES, false))
         return -N_ERR_NO_MEMORY;
     mutex_lock(&c->reset_lock);
     bool up = enable(c);
@@ -1147,7 +1147,7 @@ static int start(struct nvme *c) {
         return -N_ERR_IO;
     }
     vectors_place(c);
-    hal_name(h, c->model);
+    io_name(h, c->model);
 
     kprintf("nvme%d: %s (%04x:%04x), version %x, %u namespaces, %u I/O queues of %u, %u %s%s, %s\n", c->index, c->model,
             c->pci->vendor, c->pci->device, rd32(c, VS), c->namespaces, c->nio, c->io[0].depth, c->nvectors,
@@ -1162,7 +1162,7 @@ static int start(struct nvme *c) {
     return 0;
 }
 
-static int nvme_attach(struct hal_device *d) {
+static int nvme_attach(struct io_device *d) {
     struct nvme *c = kzalloc(sizeof *c);
     if (!c) {
         kprintf("nvme: no memory for the controller at %s\n", d->location);
@@ -1179,7 +1179,7 @@ static int nvme_attach(struct hal_device *d) {
         kprintf("nvme%d: no thread for it\n", c->index);
         return -N_ERR_NO_MEMORY;
     }
-    hal_enable(d, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA);
+    io_enable(d, IO_ENABLE_MEMORY | IO_ENABLE_DMA);
     int r = start(c); /* CC.EN may take CAP.TO (127.5 s): this thread is the device's own */
     if (r < 0) {
         __atomic_store_n(&c->stopping, true, __ATOMIC_RELEASE);
@@ -1191,7 +1191,7 @@ static int nvme_attach(struct hal_device *d) {
 /* The function leaves, or is given to a program: the controller reset so it moves nothing, every
    command it had ended. The block devices stay listed, gone; the controller's memory stays too, for
    what still points to it. */
-static void nvme_detach(struct hal_device *d) {
+static void nvme_detach(struct io_device *d) {
     struct nvme *c = d->driver_data;
     __atomic_store_n(&c->stopping, true, __ATOMIC_RELEASE);
     for (struct ns *s = c->found; s; s = s->next) __atomic_store_n(&s->blk.gone, true, __ATOMIC_RELEASE);
@@ -1213,9 +1213,9 @@ static void nvme_detach(struct hal_device *d) {
     }
 }
 
-/* ---- 眠り、休止、電源断（hal/hal.h の suspend と resume）----
+/* ---- 眠り、休止、電源断（io/io.h の suspend と resume）----
    どちらも電源の walk の thread で、割り込みは開き、ほかの CPU も thread も動いている。controller の thread は門
-   （hal_busy_begin）で待つので、完了を読むのも時間を見るのもここの仕事。データの道は asleep と ready で閉じる。 */
+   （io_busy_begin）で待つので、完了を読むのも時間を見るのもここの仕事。データの道は asleep と ready で閉じる。 */
 
 /* ready を下ろした後、出ている I/O の命令の終わり（3.6.1 の 1a）。割り込みの無い controller は自分で読む。時間の内に
    終わらない命令は、続く queue の削除か Controller Reset が終える。 */
@@ -1293,13 +1293,13 @@ static bool shutdown_notify(struct nvme *c) {
    電源も PCI の状態も変わらず、I/O の queue の無い controller は何も動かさない。止めた controller（cut）は BME が
    切れて何も動かさないが、別の装置（stranger）には電源が去ることを知らせる。終わっていない FLR の機能には次の
    pci_function_reset のほかは触れない（dev/pci.h）。false は shutdown が完了しない（電源を切ってよいと言わない）。 */
-static bool nvme_suspend(struct hal_device *d, enum hal_power_target target) {
+static bool nvme_suspend(struct io_device *d, enum io_power_target target) {
     struct nvme *c = d->driver_data;
     bool power_goes = false;
     switch (target) {
-    case HAL_POWER_SLEEP:
-    case HAL_POWER_OFF: power_goes = true; break;
-    case HAL_POWER_IMAGE: break;
+    case IO_POWER_SLEEP:
+    case IO_POWER_OFF: power_goes = true; break;
+    case IO_POWER_IMAGE: break;
     }
     mutex_lock(&c->reset_lock);
     __atomic_store_n(&c->asleep, true, __ATOMIC_RELEASE);
@@ -1318,11 +1318,11 @@ static bool nvme_suspend(struct hal_device *d, enum hal_power_target target) {
    いる（写し、取りやめ）。どれも enable の Controller Reset から 3.5.1 の順で立ち上げる（shutdown の後に命令を出すには
    CLR が要る、3.6.1）。Identify が同じ装置かを確かめ、別の装置なら使わない。眠りの間に来た要求は retry の列から出る。
    true なら I/O の queue は命令を受ける。 */
-static bool nvme_resume(struct hal_device *d) {
+static bool nvme_resume(struct io_device *d) {
     struct nvme *c = d->driver_data;
     mutex_lock(&c->reset_lock);
     __atomic_store_n(&c->asleep, false, __ATOMIC_RELEASE);
-    /* 眠る前から使わない controller（cut。hal_failed で言ってある）は、そのまま：戻すものが無い */
+    /* 眠る前から使わない controller（cut。io_failed で言ってある）は、そのまま：戻すものが無い */
     bool up = __atomic_load_n(&c->cut, __ATOMIC_ACQUIRE) || enable_recorded(c);
     mutex_unlock(&c->reset_lock);
     work_wake(c);
@@ -1331,7 +1331,7 @@ static bool nvme_resume(struct hal_device *d) {
 }
 
 static const struct n_hal_rule nvme_rules[] = {N_PCI_CLASS_PROGIF(0x01, 0x08, 0x02)};
-static const struct hal_driver nvme_driver = {
+static const struct io_driver nvme_driver = {
     .name = "nvme",
     .rules = nvme_rules,
     .rule_count = ARRAY_SIZE(nvme_rules),
@@ -1339,6 +1339,6 @@ static const struct hal_driver nvme_driver = {
     .detach = nvme_detach,
     .suspend = nvme_suspend,
     .resume = nvme_resume,
-    .after_sleep = HAL_AFTER_SLEEP_RESUME,
+    .after_sleep = IO_AFTER_SLEEP_RESUME,
 };
-HAL_DRIVER(nvme_driver);
+IO_DRIVER(nvme_driver);

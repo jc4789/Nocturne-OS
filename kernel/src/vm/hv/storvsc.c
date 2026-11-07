@@ -15,7 +15,7 @@
 #include "kernel.h"
 #include "arch/spin.h"
 #include "dev/blk.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "vm/hv/vmbus.h"
 #include "mm/heap.h"
 #include "sys/clock.h"
@@ -97,7 +97,7 @@ struct slot {
 struct scsi_disk;
 struct storvsc {
     struct vmbus_channel *ch;
-    struct hal_device *hal;
+    struct io_device *hal;
     /* The slots, under lock (the callback takes it too): which request is under way where. freed
        moves on as one is given back (room's word). */
     struct spinlock lock;
@@ -410,7 +410,7 @@ static void controller_end(struct storvsc *s, const char *why, int reason) {
         struct blk_request *r = slot_claim(s, i);
         if (r) blk_complete(r, -N_ERR_IO);
     }
-    if (reason) hal_failed(s->hal, reason);
+    if (reason) io_failed(s->hal, reason);
 }
 
 static void watchdog(void *arg) {
@@ -425,7 +425,7 @@ static void watchdog(void *arg) {
     }
 }
 
-static void probe_lun(struct storvsc *s, struct hal_device *hal, uint8_t lun) {
+static void probe_lun(struct storvsc *s, struct io_device *hal, uint8_t lun) {
     static int nscsi;
     char model[41];
     uint64_t sectors;
@@ -451,15 +451,15 @@ static void probe_lun(struct storvsc *s, struct hal_device *hal, uint8_t lun) {
     blk_register(hal, &d->blk);
 }
 
-static int storvsc_attach(struct hal_device *hal) {
+static int storvsc_attach(struct io_device *hal) {
     struct vmbus_channel *ch = vmbus_channel_of(hal);
     struct storvsc *s = kzalloc(sizeof *s);
     if (!s) return -N_ERR_NO_MEMORY;
     s->ch = ch;
     s->hal = hal;
-    hal_dma_bits(hal, 64); /* GPA_DIRECT の頁の番号は 64 bit */
-    /* 手放さない：装置が外れた後、バスが host はもう届かないと答えた時に HAL が返す */
-    s->bounce = hal_dma_alloc(hal, PAGE_SIZE, &s->bounce_gpa);
+    io_dma_bits(hal, 64); /* GPA_DIRECT の頁の番号は 64 bit */
+    /* 手放さない：装置が外れた後、バスが host はもう届かないと答えた時に装置の管理者が返す */
+    s->bounce = io_dma_alloc(hal, PAGE_SIZE, &s->bounce_gpa);
     if (!s->bounce) {
         kfree(s);
         return -N_ERR_NO_MEMORY;
@@ -484,18 +484,18 @@ static int storvsc_attach(struct hal_device *hal) {
 
 /* The channel is withdrawn (the host rescinds it): what is in the host's hands is failed. The disks
    stay listed, gone (blk.c never forgets one), and so does the controller they point to. */
-static void storvsc_detach(struct hal_device *hal) {
+static void storvsc_detach(struct io_device *hal) {
     struct storvsc *s = hal->driver_data;
     __atomic_store_n(&s->stopping, true, __ATOMIC_RELEASE);
     controller_end(s, NULL, 0);
 }
 
 static const struct n_hal_rule storvsc_rules[] = {N_VMBUS_TYPE(scsi_guid.b)};
-static const struct hal_driver storvsc_driver = {
+static const struct io_driver storvsc_driver = {
     .name = "storvsc",
     .rules = storvsc_rules,
     .rule_count = ARRAY_SIZE(storvsc_rules),
     .attach = storvsc_attach,
     .detach = storvsc_detach,
 };
-HAL_DRIVER(storvsc_driver);
+IO_DRIVER(storvsc_driver);

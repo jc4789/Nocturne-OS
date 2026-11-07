@@ -1,12 +1,12 @@
-/* PCI の claim（hal/hal.h の struct hal_claim_ops）：アプリの中のドライバーが PCI の機能を持つとき、バスが持つ分。
-   docs/nocturne-native-abi.md §9。BAR の写し、割り込み、台帳への提供、眠りの知らせは hal/claim.c が持ち、
+/* PCI の claim（io/io.h の struct io_claim_ops）：アプリの中のドライバーが PCI の機能を持つとき、バスが持つ分。
+   docs/nocturne-native-abi.md §9。BAR の写し、割り込み、台帳への提供、眠りの知らせは io/claim.c が持ち、
    ここは機能の隔離、構成空間、リセットと回復、DMA の IOMMU を受け持つ。画面の口は dev/screen_driver.c、firmware の
    記述の口は dev/acpi_claim.c。
    カーネルが握るもの（BAR のレジスター、MSI と MSI-X の capability）は、ここだけが書く。IOMMU が付いていれば、
    機能の DMA は claim で作った DMA の object にしか届かない。claim の終わりは、機能を止めてから（BAR の写像の取消し、
    割り込み、バスマスター）IOMMU の遮断を確かめ、その後に DMA のメモリーが戻る。遮断を確かめられなければ、残る
    DMA の頁は二度と使わない：BME を切っても Transactions Pending が無くても、posted の書込みが全部届いた証拠に
-   ならない。終わりは故障した装置を待たず、リセットもしない（pci_end が false を返し、hal_claim_dma_reusable が
+   ならない。終わりは故障した装置を待たず、リセットもしない（pci_end が false を返し、io_claim_dma_reusable が
    偽になる）。
    claim の開始と終わり、全機能の予約（d->claimed）は claim_mutex が一度に一つにする。claim_mutex は pci.c のリセット
    と dev/iommu.c の錠より先に取る。 */
@@ -16,7 +16,7 @@
 #include "dev/iommu.h"
 #include "dev/pci.h"
 #include "dev/pciuser.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/heap.h"
 #include "sys/thread.h"
 #include "sys/wait.h"
@@ -30,7 +30,7 @@ struct guard {
 };
 
 struct pci_claim {
-    struct hal_claim *claim;
+    struct io_claim *claim;
     struct pci_device *d;
     struct guard guards[CLAIM_GUARDS];
     unsigned guard_count;
@@ -38,7 +38,7 @@ struct pci_claim {
     struct pci_device *reset_port; /* where this claim's attempt sent a Secondary Bus Reset (bus_reset) */
 };
 
-#define PCI_OF(hal_device) ((struct pci_device *)((char *)(hal_device) - offsetof(struct pci_device, hal)))
+#define PCI_OF(io_device) ((struct pci_device *)((char *)(io_device) - offsetof(struct pci_device, hal)))
 
 /* Claiming and a claim's end, and every function's d->claimed (dev/pci.h): one at a time, as a
    claim's resets and its group's reservations span sleeps. Before pci.c's and dev/iommu.c's locks. */
@@ -62,7 +62,7 @@ static void guards_init(struct pci_claim *c) {
     guard(c, 0x0C, 1u << 30); /* BIST: start */
     guard(c, 0x3C, 0xFF);     /* Interrupt Line: the platform's routing record */
     uint8_t pm = pci_find_cap(d, 0x01);
-    if (pm) guard(c, pm + 4, 3); /* PowerState：D 状態は HAL のもの（hal_bus_ops.power）。claim には D0 で渡る */
+    if (pm) guard(c, pm + 4, 3); /* PowerState：D 状態は装置の管理者のもの（io_bus_ops.power）。claim には D0 で渡る */
     if (d->pcie_cap) {
         /* Device Control: Max_Payload_Size must match the whole path to the root, phantom
            functions widen the requester IDs, and Initiate FLR resets the function. */
@@ -389,8 +389,8 @@ static int64_t config_write(struct pci_claim *c, uint32_t offset, uint32_t width
     return 0;
 }
 
-static int pci_begin(struct hal_claim *hc, void **bus) {
-    struct pci_device *d = PCI_OF(hal_claim_device(hc));
+static int pci_begin(struct io_claim *hc, void **bus) {
+    struct pci_device *d = PCI_OF(io_claim_device(hc));
     /* A bridge's registers route other devices' memory, buses and resets. */
     if (d->cls == 0x06) return -N_ERR_DENIED;
     struct pci_claim *c = kzalloc(sizeof *c);
@@ -423,9 +423,9 @@ static int pci_begin(struct hal_claim *hc, void **bus) {
    clear and no pending non-posted request do not prove that posted requests using other TCs,
    relaxed ordering or ID ordering have arrived (PCIe 6.0, 6.4). Keep the claim's remaining DMA
    pages even after a clean driver close; FLR success later is not proof of their drain either.
-   The mappings of its BARs and its interrupts are gone already (hal/claim.c). */
-static bool pci_end(struct hal_claim *hc) {
-    struct pci_claim *c = hal_claim_bus(hc);
+   The mappings of its BARs and its interrupts are gone already (io/claim.c). */
+static bool pci_end(struct io_claim *hc) {
+    struct pci_claim *c = io_claim_bus(hc);
     struct pci_device *d = c->d;
     mutex_lock(&claim_mutex); /* no claim forms a group with these functions meanwhile */
     if (c->domain) iommu_guests_stop(c->domain);
@@ -463,37 +463,37 @@ static bool pci_end(struct hal_claim *hc) {
 }
 
 /* The last reference to the claim is gone, every DMA object of it too. */
-static void pci_release(struct hal_claim *hc) {
-    struct pci_claim *c = hal_claim_bus(hc);
+static void pci_release(struct io_claim *hc) {
+    struct pci_claim *c = io_claim_bus(hc);
     if (c->domain) iommu_domain_free(c->domain);
     kfree(c);
 }
 
-static unsigned pci_irq_max(struct hal_claim *hc) {
-    struct pci_device *d = PCI_OF(hal_claim_device(hc));
+static unsigned pci_irq_max(struct io_claim *hc) {
+    struct pci_device *d = PCI_OF(io_claim_device(hc));
     /* no legacy INTx for apps: one left asserting would hold a shared line */
     return MAX(pci_msix_max_vectors(d), pci_msi_max_vectors(d));
 }
 
-static unsigned pci_dma_bits(struct hal_claim *hc) {
-    struct pci_claim *c = hal_claim_bus(hc);
+static unsigned pci_dma_bits(struct io_claim *hc) {
+    struct pci_claim *c = io_claim_bus(hc);
     return iommu_dma_bits(c->domain);
 }
 
-static bool pci_dma_map(struct hal_claim *hc, const uint64_t *frames, uint64_t base, size_t count) {
-    struct pci_claim *c = hal_claim_bus(hc);
+static bool pci_dma_map(struct io_claim *hc, const uint64_t *frames, uint64_t base, size_t count) {
+    struct pci_claim *c = io_claim_bus(hc);
     return !c->domain || iommu_map(c->domain, frames, base, count);
 }
 
-static bool pci_dma_unmap(struct hal_claim *hc, const uint64_t *frames, uint64_t base, size_t count) {
-    struct pci_claim *c = hal_claim_bus(hc);
+static bool pci_dma_unmap(struct io_claim *hc, const uint64_t *frames, uint64_t base, size_t count) {
+    struct pci_claim *c = io_claim_bus(hc);
     return !c->domain || iommu_unmap(c->domain, frames, base, count);
 }
 
 /* The call's in and out are kernel copies. */
-static int64_t pci_call(struct hal_claim *hc, uint32_t op, const void *in, size_t in_size, void *out, size_t out_size,
+static int64_t pci_call(struct io_claim *hc, uint32_t op, const void *in, size_t in_size, void *out, size_t out_size,
                         size_t *used) {
-    struct pci_claim *c = hal_claim_bus(hc);
+    struct pci_claim *c = io_claim_bus(hc);
     switch (op) {
     case N_PCI_CALL_INFO:
         if (out_size < sizeof(struct n_hal_pci_info)) return -N_ERR_INVALID;
@@ -510,7 +510,7 @@ static int64_t pci_call(struct hal_claim *hc, uint32_t op, const void *in, size_
     return -N_ERR_UNSUPPORTED;
 }
 
-const struct hal_claim_ops pci_claim_ops = {
+const struct io_claim_ops pci_claim_ops = {
     .begin = pci_begin,
     .end = pci_end,
     .release = pci_release,

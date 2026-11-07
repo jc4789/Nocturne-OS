@@ -8,7 +8,7 @@
 #include "arch/cpu.h"
 #include "arch/irq.h"
 #include "arch/spin.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "dev/pci.h"
 #include "mm/heap.h"
 
@@ -250,16 +250,16 @@ static bool tulip_start(struct tulip *c) {
     return true;
 }
 
-static int tulip_attach(struct hal_device *d) {
+static int tulip_attach(struct io_device *d) {
     struct pci_device *pci = pci_device_of(d);
-    uint16_t iobase = hal_port(d, IO_BAR);
+    uint16_t iobase = io_port(d, IO_BAR);
     if (!iobase) return -N_ERR_UNSUPPORTED;
     struct tulip *c = kzalloc(sizeof *c);
     if (!c) return -N_ERR_NO_MEMORY;
     d->driver_data = c;
     c->iobase = iobase;
     int r = -N_ERR_NO_MEMORY;
-    hal_enable(d, HAL_ENABLE_PORTS | HAL_ENABLE_DMA);
+    io_enable(d, IO_ENABLE_PORTS | IO_ENABLE_DMA);
     if (!hw_stop(c)) { /* firmware が動かしたままのものを止める */
         kprintf("net: tulip does not stop\n");
         r = -N_ERR_IO;
@@ -291,9 +291,9 @@ static int tulip_attach(struct hal_device *d) {
     }
 
     /* 記述子とそれが指す緩衝を一つの塊に。記述子の緩衝の指と CSR3・CSR4 は 32 bit しかない */
-    hal_dma_bits(d, 32);
+    io_dma_bits(d, 32);
     uint64_t bus;
-    uint8_t *block = hal_dma_alloc(d, PAGE_SIZE + (NRX + NTX) * BUFSZ, &bus);
+    uint8_t *block = io_dma_alloc(d, PAGE_SIZE + (NRX + NTX) * BUFSZ, &bus);
     if (!block) {
         kprintf("net: tulip DMA allocation failed\n");
         goto fail;
@@ -306,7 +306,7 @@ static int tulip_attach(struct hal_device *d) {
     for (int i = 0; i < NRX; i++) c->rxbuf[i] = block + PAGE_SIZE + i * BUFSZ;
     for (int i = 0; i < NTX; i++) c->txbuf[i] = block + PAGE_SIZE + (NRX + i) * BUFSZ;
 
-    if (!hal_irq_enable(d, &(struct irq_spec){.name = "tulip", .handler = tulip_irq, .context = c}, 1, NULL)) {
+    if (!io_irq_enable(d, &(struct irq_spec){.name = "tulip", .handler = tulip_irq, .context = c}, 1, NULL)) {
         kprintf("net: tulip has no interrupt route\n");
         r = -N_ERR_UNSUPPORTED;
         goto fail;
@@ -330,7 +330,7 @@ static int tulip_attach(struct hal_device *d) {
     net_register(d, &c->nif);
     return 0;
 fail:
-    hal_irq_disable(d); /* 処理の記憶が去る前に */
+    io_irq_disable(d); /* 処理の記憶が去る前に */
     d->driver_data = NULL;
     kfree(c);
     return r;
@@ -338,7 +338,7 @@ fail:
 
 /* 割り込みを覆い、両方の過程を止め（3.2.2.9、表 3-68、3-69）、software reset で全部の状態を初めに戻す（4.3.1）。過程が
    止まらなければ CSR0 は書けない（表 3-44）：止められなかった。三つの目標で同じ。 */
-static bool tulip_suspend(struct hal_device *d, enum hal_power_target target) {
+static bool tulip_suspend(struct io_device *d, enum io_power_target target) {
     (void)target;
     struct tulip *c = d->driver_data;
     mutex_lock(&c->tulip_mutex);
@@ -355,7 +355,7 @@ static bool tulip_suspend(struct hal_device *d, enum hal_power_target target) {
 }
 
 /* 電源を失った装置も保った装置も、4.3.4 の手順で初めから動かす。網の層が持っていたフレームを渡し直させる。 */
-static bool tulip_resume(struct hal_device *d) {
+static bool tulip_resume(struct io_device *d) {
     struct tulip *c = d->driver_data;
     mutex_lock(&c->tulip_mutex);
     bool started = tulip_start(c);
@@ -368,18 +368,18 @@ static bool tulip_resume(struct hal_device *d) {
     net_rx_notify();
     if (started) return true;
     kprintf("net: tulip at %s does not stop\n", d->location);
-    hal_failed(d, -N_ERR_IO);
+    io_failed(d, -N_ERR_IO);
     return false;
 }
 
 /* 21140：Hyper-V の従来の網の装置。21143：QEMU。 */
 static const struct n_hal_rule tulip_rules[] = {N_PCI_ID(0x1011, 0x0009), N_PCI_ID(0x1011, 0x0019)};
-const struct hal_driver tulip_driver = {
+const struct io_driver tulip_driver = {
     .name = "tulip",
     .rules = tulip_rules,
     .rule_count = ARRAY_SIZE(tulip_rules),
     .attach = tulip_attach,
     .suspend = tulip_suspend,
     .resume = tulip_resume,
-    .after_sleep = HAL_AFTER_SLEEP_RESUME,
+    .after_sleep = IO_AFTER_SLEEP_RESUME,
 };

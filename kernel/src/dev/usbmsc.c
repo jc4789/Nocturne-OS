@@ -6,7 +6,7 @@
 #include "kernel.h"
 #include "dev/blk.h"
 #include "dev/usb.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/heap.h"
 #include "sys/clock.h"
 #include "sys/wait.h"
@@ -279,7 +279,7 @@ static void probe_lun(struct msc *m, unsigned lun) {
     }
     while (n && model[n - 1] == ' ') n--;
     model[n] = 0;
-    if (!lun && m->dev) hal_name(&m->dev->hal, model);
+    if (!lun && m->dev) io_name(&m->dev->hal, model);
     if (!unit_ready(m, lun)) {
         if (m->dev) kprintf("usbmsc: %s (unit %u) has no medium or is not ready\n", model, lun);
         return;
@@ -316,7 +316,7 @@ static void probe_lun(struct msc *m, unsigned lun) {
 
 /* An interface of the mass storage class with a bulk pair: the descriptors from its own to the next
    interface's. */
-static int msc_attach(struct hal_device *hal) {
+static int msc_attach(struct io_device *hal) {
     struct usb_interface *node = usb_interface_of(hal);
     struct usb_device *d = node->dev;
     const uint8_t *cfg = d->config;
@@ -349,7 +349,7 @@ static int msc_attach(struct hal_device *hal) {
     if (max >= MAX_LUNS) max = MAX_LUNS - 1;
     kprintf("usbmsc: slot %u bulk-only storage, %u unit%s\n", d->slot, max + 1u, max ? "s" : "");
     mutex_lock(&m->lock);
-    for (unsigned lun = 0; lun <= max && m->dev && !hal_gone(hal); lun++) probe_lun(m, lun);
+    for (unsigned lun = 0; lun <= max && m->dev && !io_gone(hal); lun++) probe_lun(m, lun);
     mutex_unlock(&m->lock);
     return 0;
 }
@@ -357,7 +357,7 @@ static int msc_attach(struct hal_device *hal) {
 /* The block devices stay registered (a mounted filesystem may still hold them); they fail from
  * now on, and their serial threads end once what they hold is failed. The command running ends
  * first: usb_remove ended its transfers. Their memory stays, for whoever holds the devices. */
-static void msc_detach(struct hal_device *hal) {
+static void msc_detach(struct io_device *hal) {
     struct msc *m = hal->driver_data;
     mutex_lock(&m->lock);
     m->dev = NULL;
@@ -367,11 +367,11 @@ static void msc_detach(struct hal_device *hal) {
     hal->driver_data = NULL;
 }
 
-/* 戻せない（HAL_AFTER_SLEEP_LOST）：休止の写しから戻る前に起動のカーネルが制御器を reset し、眠りの間に port の電源
+/* 戻せない（IO_AFTER_SLEEP_LOST）：休止の写しから戻る前に起動のカーネルが制御器を reset し、眠りの間に port の電源
    （VBUS）が切れれば装置は reset される。どちらでもディスクは新しい装置として戻り、その上のボリュームは失われる。だから
    suspend に来るのは電源断だけで、進行中の命令の終わりを待ち、その後の要求を断る。 */
-static bool msc_suspend(struct hal_device *hal, enum hal_power_target target) {
-    ASSERT(target == HAL_POWER_OFF);
+static bool msc_suspend(struct io_device *hal, enum io_power_target target) {
+    ASSERT(target == IO_POWER_OFF);
     struct msc *m = hal->driver_data;
     mutex_lock(&m->lock);
     m->stopped = true;
@@ -385,13 +385,13 @@ static bool msc_suspend(struct hal_device *hal, enum hal_power_target target) {
     N_HAL_RULE(N_HAL_NUMBER(N_HAL_PROP_BUS, N_BUS_USB_INTERFACE), N_HAL_NUMBER(N_PROP_USB_CLASS, N_USB_CLASS_CODE(8, subclass, 0x50)))
 static const struct n_hal_rule msc_rules[] = {MSC_BULK_ONLY(0x00), MSC_BULK_ONLY(0x01), MSC_BULK_ONLY(0x02),
                                               MSC_BULK_ONLY(0x06)};
-static const struct hal_driver msc_driver = {
+static const struct io_driver msc_driver = {
     .name = "usbmsc",
     .rules = msc_rules,
     .rule_count = ARRAY_SIZE(msc_rules),
     .attach = msc_attach,
     .detach = msc_detach,
     .suspend = msc_suspend,
-    .after_sleep = HAL_AFTER_SLEEP_LOST,
+    .after_sleep = IO_AFTER_SLEEP_LOST,
 };
-HAL_DRIVER(msc_driver);
+IO_DRIVER(msc_driver);

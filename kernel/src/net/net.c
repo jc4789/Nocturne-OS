@@ -39,7 +39,7 @@
 #include "../sys/thread.h"
 #include "../sys/wait.h"
 #include "../vm/vm.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "../sys/channel.h"
 #include "../sys/watch.h"
 #include "sys/authority.h"
@@ -2235,7 +2235,7 @@ static bool tx_stages_make(struct net_adapter *a, unsigned tx_queues) {
     return true;
 }
 
-void net_register(struct hal_device *hal, struct netif *dev) {
+void net_register(struct io_device *hal, struct netif *dev) {
     ASSERT(dev->tx_queues && dev->rx_queues && dev->transmit && dev->poll && dev->rx_pending);
     net_enter();
     struct net_adapter *a = adapters;
@@ -2267,7 +2267,7 @@ void net_register(struct hal_device *hal, struct netif *dev) {
     char label[18];
     ksnprintf(label, sizeof label, "%02x:%02x:%02x:%02x:%02x:%02x", dev->mac[0], dev->mac[1], dev->mac[2], dev->mac[3],
               dev->mac[4], dev->mac[5]);
-    hal_offer(hal, N_OFFER_NET, id, label);
+    io_offer(hal, N_OFFER_NET, id, label);
     if (late) kprintf("net: %s adapter arrived\n", dev->driver);
 }
 
@@ -2282,7 +2282,7 @@ void net_unregister(struct netif *dev) {
         adapter_address(a, 0, 0);
     }
     net_leave();
-    if (a) hal_offer_withdraw(dev->hal, N_OFFER_NET, id);
+    if (a) io_offer_withdraw(dev->hal, N_OFFER_NET, id);
 }
 
 /* What new connections take from now on. Physical allocation rounds to pages; RFC 7323's maximum

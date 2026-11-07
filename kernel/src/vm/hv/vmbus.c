@@ -8,7 +8,7 @@
    Each device's channel is a node of the device tree. An offer and a rescind arrive in the
    interrupt handler, which may not publish or remove a node (both sleep): they queue the channel
    for the node thread, which publishes it and, once the host rescinds it, removes it again
-   (hal_remove waits for the driver's detach). A channel is freed only after that. */
+   (io_remove waits for the driver's detach). A channel is freed only after that. */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/spin.h"
@@ -262,7 +262,7 @@ static void channel_unlink(struct vmbus_channel *ch) {
 static void channel_free(struct vmbus_channel *ch) {
     uint32_t m[2 + 1] = {CHMSG_RELID_RELEASED, 0, ch->relid};
     hv_post_message(msg_conn_id, 1, m, sizeof m);
-    /* 外せなかった一覧の記録だけを捨てる：その頁は持ち主（HAL、輪）が使わずに残している */
+    /* 外せなかった一覧の記録だけを捨てる：その頁は持ち主（装置の管理者、輪）が使わずに残している */
     while (ch->gpadls) {
         struct vmbus_gpadl *g = ch->gpadls;
         ch->gpadls = g->next;
@@ -285,16 +285,16 @@ static void channel_reap(struct vmbus_channel *ch, bool in_handler) {
 
 /* ---- nodes (the node thread) ---- */
 
-static bool channel_stop(struct hal_device *d);
-static const struct hal_bus_ops vmbus_bus_ops = {.stop = channel_stop};
+static bool channel_stop(struct io_device *d);
+static const struct io_bus_ops vmbus_bus_ops = {.stop = channel_stop};
 
 static void node_publish(struct vmbus_channel *ch) {
     char location[24];
-    hal_device_init(&ch->hal, N_BUS_VMBUS, &vmbus_bus_ops);
-    hal_prop_bytes(&ch->hal, N_PROP_VMBUS_TYPE, ch->type.b, sizeof ch->type.b);
+    io_device_init(&ch->hal, N_BUS_VMBUS, &vmbus_bus_ops);
+    io_prop_bytes(&ch->hal, N_PROP_VMBUS_TYPE, ch->type.b, sizeof ch->type.b);
     ksnprintf(location, sizeof location, "VMBus %u", ch->relid);
-    hal_location(&ch->hal, location);
-    hal_publish(NULL, &ch->hal);
+    io_location(&ch->hal, location);
+    io_publish(NULL, &ch->hal);
 }
 
 /* One queued channel: publish it if that is not done, remove it if the host took it away. */
@@ -319,7 +319,7 @@ static void node_serve(struct vmbus_channel *ch) {
     }
     ch->node = NODE_REMOVING;
     spin_unlock(&chan_lock, f);
-    hal_remove(&ch->hal);
+    io_remove(&ch->hal);
     f = spin_lock(&chan_lock);
     ch->node = NODE_NONE;
     spin_unlock(&chan_lock, f);
@@ -343,7 +343,7 @@ static void node_thread(void *arg) {
     }
 }
 
-struct vmbus_channel *vmbus_channel_of(struct hal_device *d) {
+struct vmbus_channel *vmbus_channel_of(struct io_device *d) {
     return (struct vmbus_channel *)((char *)d - __builtin_offsetof(struct vmbus_channel, hal));
 }
 
@@ -716,9 +716,9 @@ void vmbus_close(struct vmbus_channel *ch) {
     ring_retire(ch, true);
 }
 
-/* バスの stop（hal.h）：host が装置のメモリーにもう届かない。channel を閉じ、host が持つかもしれない一覧を全部外さ
-   せる。外したと答えない一覧が残れば false：HAL は装置のメモリーを返さない。 */
-static bool channel_stop(struct hal_device *d) {
+/* バスの stop（io.h）：host が装置のメモリーにもう届かない。channel を閉じ、host が持つかもしれない一覧を全部外さ
+   せる。外したと答えない一覧が残れば false：装置の管理者は装置のメモリーを返さない。 */
+static bool channel_stop(struct io_device *d) {
     struct vmbus_channel *ch = vmbus_channel_of(d);
     vmbus_close(ch);
     for (;;) {

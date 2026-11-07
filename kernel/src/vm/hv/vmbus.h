@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "arch/spin.h"
-#include "hal/hal.h"
+#include "io/io.h"
 
 struct guid {
     uint8_t b[16];
@@ -77,7 +77,7 @@ struct vmbus_channel {
     /* The channel's node in the device tree (N_BUS_VMBUS), for the devices' channels and not the
        sockets'. node says where the node is between its offer and its removal (vmbus.c); the
        others link the channel into the thread that publishes and removes nodes. */
-    struct hal_device hal;
+    struct io_device hal;
     uint8_t node;
     bool node_rescind, node_queued;
     struct vmbus_channel *node_next;
@@ -92,12 +92,12 @@ extern int vmbus_version_major, vmbus_version_minor;
 /* Connect to VMBus and collect the device offers. False if this is not Hyper-V. CPU 0, at boot.
    Each offered device's channel becomes a node under the root (bus N_BUS_VMBUS, its type GUID
    as N_PROP_VMBUS_TYPE), published by a thread of its own because an offer arrives in an
-   interrupt handler; the host's rescind removes the node (hal_remove, which waits for the
+   interrupt handler; the host's rescind removes the node (io_remove, which waits for the
    driver's detach). A driver's rule matches N_VMBUS_TYPE(guid). */
 bool vmbus_init(void);
 bool vmbus_ready(void);
 /* The channel behind a node of bus N_BUS_VMBUS: what attach receives. */
-struct vmbus_channel *vmbus_channel_of(struct hal_device *d);
+struct vmbus_channel *vmbus_channel_of(struct io_device *d);
 /* The rest from tasks on any CPU, unless said otherwise; the callbacks run in CPU 0's interrupt
    handler and never close, release or open a channel, or wait for a request. */
 /* Allocate the rings and open the channel. Sizes are rounded up to pages. 0 or -errno. */
@@ -115,9 +115,9 @@ void vmbus_set_rescind(struct vmbus_channel *ch, vmbus_callback_t on_rescind);
    channel lock (it takes no vmbus call). It returns true to keep one (the channel is then claimed
    before the hook hands it on); unclaimed ones are freed when the host rescinds them. */
 void vmbus_set_socket_hook(bool (*hook)(struct vmbus_channel *ch));
-/* 客のメモリー（gpa：HAL の DMA の口が返す装置の番地）を host と分ける頁の一覧（GPADL）を作る。番号か 0。channel は
+/* 客のメモリー（gpa：装置の管理者の DMA の口が返す装置の番地）を host と分ける頁の一覧（GPADL）を作る。番号か 0。channel は
    host が持つかもしれない一覧を、作りの答えが無かったものも、host が外したと答えるまで覚える。バスは覚えた一覧が
-   無くなって初めて HAL に装置が止まったと答える（そこで hal_release がメモリーを返す）。 */
+   無くなって初めて装置の管理者に装置が止まったと答える（そこで io_release がメモリーを返す）。 */
 uint32_t vmbus_gpadl_create(struct vmbus_channel *ch, uint64_t gpa, uint32_t pages);
 /* true：host が外したと答えた。false：メモリーは分けたままで、返しても使い直してもいけない。取り消された channel では
    何も送らずに false。 */

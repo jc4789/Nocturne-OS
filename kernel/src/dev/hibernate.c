@@ -20,7 +20,7 @@
 #include "dev/blk.h"
 #include "dev/fb.h"
 #include "dev/hibernate.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "fs/bootrecord.h"
 #include "dev/iommu.h"
 #include "dev/pci.h"
@@ -680,11 +680,11 @@ void hibernate_restore(void) {
     kprintf("hibernate: restoring %lu frames (%lu copied last) after %lu ms\n", hd.saved + hd.zero, r.pairs,
             (clock_now_ns() - t0) / NS_PER_MS);
 
-    /* 装置は写しの上に DMA を書かず、割り込みも送らない：HAL_POWER_OFF の walk で止める。写しは使い切ったので、
+    /* 装置は写しの上に DMA を書かず、割り込みも送らない：IO_POWER_OFF の walk で止める。写しは使い切ったので、
        止まらない装置や CPU があれば、次の起動は普通の起動になる */
-    hal_power_begin();
+    io_power_begin();
     blk_hold();
-    const char *stuck = hal_power_suspend(HAL_POWER_OFF);
+    const char *stuck = io_power_suspend(IO_POWER_OFF);
     if (stuck) {
         kprintf("hibernate: %s did not stop, restarting instead of restoring\n", stuck);
         power_reboot();

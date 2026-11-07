@@ -1,33 +1,33 @@
-/* 装置の DMA（hal/hal.h）：装置が届く番地の幅、HAL を通したメモリーの一覧、訳の領域に入る・出る止めと始め。
+/* 装置の DMA（io/io.h）：装置が届く番地の幅、装置の管理者を通したメモリーの一覧、訳の領域に入る・出る止めと始め。
    装置へ渡す番地は物理番地と同じ：訳の無いバスはそのまま見せ、訳の領域へはバスが同じ番地で写す（dev/iommu.h）。
    錠：装置の dma_lock（眠れる：バスの写しは眠る）が一覧と dma_translated と dma_paused を守る。順は実装の錠 →
    dma_lock → バスの写しの錠（dev/iommu.c の domain の mutex）。dma_lock の下で実装を呼ばない。 */
 #include "kernel.h"
 #include "arch/topology.h"
-#include "hal/internal.h"
+#include "io/internal.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 
-/* HAL を通したメモリーの一区間：取ったもの（owned）か、ほかの持ち主のものを写したものか。kept：訳の領域から外せたと
+/* 装置の管理者を通したメモリーの一区間：取ったもの（owned）か、ほかの持ち主のものを写したものか。kept：訳の領域から外せたと
    確かめられなかった：装置がまだ届くかもしれないので頁を返さない。 */
-struct hal_dma_block {
-    struct hal_dma_block *next;
+struct io_dma_block {
+    struct io_dma_block *next;
     uint64_t phys, pages;
     bool owned, kept;
 };
 
-void hal_dma_bits(struct hal_device *d, unsigned bits) {
+void io_dma_bits(struct io_device *d, unsigned bits) {
     ASSERT(bits && bits <= 64 && !d->dma);
     d->dma_bits = bits;
 }
 
-static bool within(const struct hal_device *d, uint64_t phys, uint64_t pages) {
+static bool within(const struct io_device *d, uint64_t phys, uint64_t pages) {
     return d->dma_bits >= 64 || !((phys + pages * PAGE_SIZE - 1) >> d->dma_bits);
 }
 
 /* dma_lock の下：訳の領域にいれば写してから一覧に入れる。 */
-static bool block_add(struct hal_device *d, struct hal_dma_block *b) {
+static bool block_add(struct io_device *d, struct io_dma_block *b) {
     if (d->dma_translated && !d->ops->dma_map(d, b->phys, b->pages)) return false;
     b->next = d->dma;
     d->dma = b;
@@ -35,14 +35,14 @@ static bool block_add(struct hal_device *d, struct hal_dma_block *b) {
 }
 
 /* dma_lock の下：訳の領域から外す。外れたと確かめられなければ kept。 */
-static void block_unmap(struct hal_device *d, struct hal_dma_block *b) {
+static void block_unmap(struct io_device *d, struct io_dma_block *b) {
     if (!d->ops->dma_unmap(d, b->phys, b->pages)) b->kept = true;
 }
 
 /* dma_lock の下：phys から始まる区間を一覧から外し、訳の領域にいれば領域からも外す。 */
-static struct hal_dma_block *block_take(struct hal_device *d, uint64_t phys, bool owned) {
-    for (struct hal_dma_block **p = &d->dma; *p; p = &(*p)->next) {
-        struct hal_dma_block *b = *p;
+static struct io_dma_block *block_take(struct io_device *d, uint64_t phys, bool owned) {
+    for (struct io_dma_block **p = &d->dma; *p; p = &(*p)->next) {
+        struct io_dma_block *b = *p;
         if (b->phys != phys || b->owned != owned) continue;
         *p = b->next;
         if (d->dma_translated) block_unmap(d, b);
@@ -52,16 +52,16 @@ static struct hal_dma_block *block_take(struct hal_device *d, uint64_t phys, boo
 }
 
 /* 一覧から外した区間の終わり。give：取った頁を返してよい（装置が止まった）。 */
-static void block_drop(struct hal_device *d, struct hal_dma_block *b, bool give) {
+static void block_drop(struct io_device *d, struct io_dma_block *b, bool give) {
     if (b->kept) kprintf("hal: %s: DMA memory at %#lx may still be reached through a domain it left\n", d->location, b->phys);
     if (b->owned && give && !b->kept) pmm_free_contig(b->phys, b->pages);
     kfree(b);
 }
 
-void *hal_dma_alloc(struct hal_device *d, size_t bytes, uint64_t *bus) {
+void *io_dma_alloc(struct io_device *d, size_t bytes, uint64_t *bus) {
     uint64_t pages = ALIGN_UP(bytes, PAGE_SIZE) / PAGE_SIZE;
     unsigned node = d->node >= 0 ? (unsigned)d->node : topology.cpu[cpu_current_index()].node;
-    struct hal_dma_block *b = kmalloc(sizeof *b);
+    struct io_dma_block *b = kmalloc(sizeof *b);
     if (!b) return NULL;
     /* 幅が全部の番地に届けば装置の node の近くから。届かなければ幅の中から */
     uint64_t phys = d->dma_bits >= 64 ? pmm_alloc_run(pages, node) : 0;
@@ -71,7 +71,7 @@ void *hal_dma_alloc(struct hal_device *d, size_t bytes, uint64_t *bus) {
         return NULL;
     }
     memset(phys_to_virt(phys), 0, pages * PAGE_SIZE);
-    *b = (struct hal_dma_block){.phys = phys, .pages = pages, .owned = true};
+    *b = (struct io_dma_block){.phys = phys, .pages = pages, .owned = true};
     mutex_lock(&d->dma_lock);
     bool added = block_add(d, b);
     mutex_unlock(&d->dma_lock);
@@ -84,19 +84,19 @@ void *hal_dma_alloc(struct hal_device *d, size_t bytes, uint64_t *bus) {
     return phys_to_virt(phys);
 }
 
-void hal_dma_free(struct hal_device *d, void *memory) {
+void io_dma_free(struct io_device *d, void *memory) {
     mutex_lock(&d->dma_lock);
-    struct hal_dma_block *b = block_take(d, hhdm_virt_to_phys(memory), true);
+    struct io_dma_block *b = block_take(d, hhdm_virt_to_phys(memory), true);
     mutex_unlock(&d->dma_lock);
     ASSERT(b);
     block_drop(d, b, true);
 }
 
-bool hal_dma_map(struct hal_device *d, uint64_t phys, uint64_t pages, uint64_t *bus) {
+bool io_dma_map(struct io_device *d, uint64_t phys, uint64_t pages, uint64_t *bus) {
     if (!within(d, phys, pages)) return false;
-    struct hal_dma_block *b = kmalloc(sizeof *b);
+    struct io_dma_block *b = kmalloc(sizeof *b);
     if (!b) return false;
-    *b = (struct hal_dma_block){.phys = phys, .pages = pages};
+    *b = (struct io_dma_block){.phys = phys, .pages = pages};
     mutex_lock(&d->dma_lock);
     bool added = block_add(d, b);
     mutex_unlock(&d->dma_lock);
@@ -108,17 +108,17 @@ bool hal_dma_map(struct hal_device *d, uint64_t phys, uint64_t pages, uint64_t *
     return true;
 }
 
-void hal_dma_unmap(struct hal_device *d, uint64_t phys, uint64_t pages) {
+void io_dma_unmap(struct io_device *d, uint64_t phys, uint64_t pages) {
     mutex_lock(&d->dma_lock);
-    struct hal_dma_block *b = block_take(d, phys, false);
+    struct io_dma_block *b = block_take(d, phys, false);
     mutex_unlock(&d->dma_lock);
     ASSERT(b && b->pages == pages);
     block_drop(d, b, false);
 }
 
-bool hal_dma_pausable(const struct hal_device *d) { return d->driver && d->driver->dma_pause && d->driver->dma_restart; }
+bool io_dma_pausable(const struct io_device *d) { return d->driver && d->driver->dma_pause && d->driver->dma_restart; }
 
-void hal_dma_pause(struct hal_device *d) {
+void io_dma_pause(struct io_device *d) {
     mutex_lock(&d->dma_lock);
     bool already = d->dma_paused;
     d->dma_paused = true;
@@ -129,24 +129,24 @@ void hal_dma_pause(struct hal_device *d) {
     if (d->ops->stop && !d->ops->stop(d)) kprintf("hal: %s: its DMA is not confirmed stopped\n", d->location);
     mutex_lock(&d->dma_lock);
     if (d->dma_translated) {
-        for (struct hal_dma_block *b = d->dma; b; b = b->next) block_unmap(d, b);
+        for (struct io_dma_block *b = d->dma; b; b = b->next) block_unmap(d, b);
         __atomic_store_n(&d->dma_translated, false, __ATOMIC_RELEASE);
     }
     mutex_unlock(&d->dma_lock);
 }
 
-bool hal_dma_restart(struct hal_device *d, bool translated) {
+bool io_dma_restart(struct io_device *d, bool translated) {
     mutex_lock(&d->dma_lock);
     if (!d->dma_paused) {
         mutex_unlock(&d->dma_lock);
         return true;
     }
-    struct hal_dma_block *failed = NULL;
+    struct io_dma_block *failed = NULL;
     if (translated) {
         ASSERT(d->ops->dma_map && d->ops->dma_unmap);
-        for (struct hal_dma_block *b = d->dma; b && !failed; b = b->next)
+        for (struct io_dma_block *b = d->dma; b && !failed; b = b->next)
             if (!d->ops->dma_map(d, b->phys, b->pages)) failed = b;
-        for (struct hal_dma_block *b = d->dma; failed && b != failed; b = b->next) block_unmap(d, b);
+        for (struct io_dma_block *b = d->dma; failed && b != failed; b = b->next) block_unmap(d, b);
     }
     if (!failed) {
         __atomic_store_n(&d->dma_translated, translated, __ATOMIC_RELEASE);
@@ -161,12 +161,12 @@ bool hal_dma_restart(struct hal_device *d, bool translated) {
     return true;
 }
 
-void hal_dma_release(struct hal_device *d, bool stopped) {
+void io_dma_release(struct io_device *d, bool stopped) {
     mutex_lock(&d->dma_lock);
-    struct hal_dma_block *blocks = d->dma;
+    struct io_dma_block *blocks = d->dma;
     d->dma = NULL;
     if (d->dma_translated)
-        for (struct hal_dma_block *b = blocks; b; b = b->next) block_unmap(d, b);
+        for (struct io_dma_block *b = blocks; b; b = b->next) block_unmap(d, b);
     __atomic_store_n(&d->dma_translated, false, __ATOMIC_RELEASE);
     d->dma_paused = false;
     d->dma_bits = 32;
@@ -174,7 +174,7 @@ void hal_dma_release(struct hal_device *d, bool stopped) {
     /* 止まったと確かめられない装置が書くかもしれないメモリーは、誰にも渡さない */
     if (!stopped && blocks) kprintf("hal: %s did not stop: its DMA memory is kept\n", d->location);
     while (blocks) {
-        struct hal_dma_block *next = blocks->next;
+        struct io_dma_block *next = blocks->next;
         block_drop(d, blocks, stopped);
         blocks = next;
     }

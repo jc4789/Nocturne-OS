@@ -184,7 +184,7 @@ static const char *class_name(uint8_t c, uint8_t s) {
 
 static uint64_t bar_probe(const struct pci_device *d, unsigned bar);
 static bool saved_take(struct pci_device *d, bool table);
-static bool bus_power(struct hal_device *h, enum hal_power_state to);
+static bool bus_power(struct io_device *h, enum io_power_state to);
 
 /* A bridge's header has two BARs and a CardBus bridge's one; the dwords after them are bus
    numbers and windows, which must never be probed or written back as BARs. */
@@ -252,28 +252,28 @@ static void function_publish(struct pci_device *d) {
     d->published = true;
     if (d->upstream) function_publish(d->upstream);
     struct pci_address a = d->address;
-    struct hal_device *h = &d->hal;
-    hal_device_init(h, N_BUS_PCI, &pci_bus_ops);
+    struct io_device *h = &d->hal;
+    io_device_init(h, N_BUS_PCI, &pci_bus_ops);
     d->host = d->upstream ? d->upstream->host : acpi_pci_host(a.segment, a.bus);
     h->firmware = acpi_pci_child(d->upstream ? d->upstream->hal.firmware : d->host, a.dev, a.func);
     h->node = h->firmware ? node_of(h->firmware) : -1;
     if (h->node < 0) h->node = d->upstream ? d->upstream->hal.node : node_of(d->host);
     uint32_t revision = pci_read32(a, 8) & 0xFF;
-    hal_prop_number(h, N_PROP_PCI_VENDOR, d->vendor);
-    hal_prop_number(h, N_PROP_PCI_DEVICE, d->device);
-    hal_prop_number(h, N_PROP_PCI_CLASS, N_PCI_CLASS_CODE(d->cls, d->subcls, d->progif));
-    hal_prop_number(h, N_PROP_PCI_REVISION, revision);
+    io_prop_number(h, N_PROP_PCI_VENDOR, d->vendor);
+    io_prop_number(h, N_PROP_PCI_DEVICE, d->device);
+    io_prop_number(h, N_PROP_PCI_CLASS, N_PCI_CLASS_CODE(d->cls, d->subcls, d->progif));
+    io_prop_number(h, N_PROP_PCI_REVISION, revision);
     if (pci_bar_count(d) == 6) { /* header type 0: the subsystem IDs are in the header */
         uint32_t sub = pci_read32(a, 0x2C);
-        hal_prop_number(h, N_PROP_PCI_SUBSYSTEM_VENDOR, sub & 0xFFFF);
-        hal_prop_number(h, N_PROP_PCI_SUBSYSTEM, sub >> 16);
+        io_prop_number(h, N_PROP_PCI_SUBSYSTEM_VENDOR, sub & 0xFFFF);
+        io_prop_number(h, N_PROP_PCI_SUBSYSTEM, sub >> 16);
     }
-    hal_prop_number(h, N_PROP_PCI_ADDRESS, N_PCI_TARGET(a.segment, a.bus, a.dev, a.func));
+    io_prop_number(h, N_PROP_PCI_ADDRESS, N_PCI_TARGET(a.segment, a.bus, a.dev, a.func));
     unsigned bars = pci_bar_count(d);
     for (unsigned b = 0; b < bars; b++) {
         if (!d->bar_size[b]) continue;
-        if (d->bar[b] & 1) hal_resource_add(h, N_HAL_PORT, b, 0, d->bar[b] & ~3u, d->bar_size[b]);
-        else hal_resource_add(h, N_HAL_MEMORY, b, d->bar[b] & 8 ? N_HAL_PREFETCHABLE : 0, pci_bar_address(d, b),
+        if (d->bar[b] & 1) io_resource_add(h, N_HAL_PORT, b, 0, d->bar[b] & ~3u, d->bar_size[b]);
+        else io_resource_add(h, N_HAL_MEMORY, b, d->bar[b] & 8 ? N_HAL_PREFETCHABLE : 0, pci_bar_address(d, b),
                               d->bar_size[b]);
         if (!(d->bar[b] & 1) && (d->bar[b] & 6) == 4) b++;
     }
@@ -281,10 +281,10 @@ static void function_publish(struct pci_device *d) {
     if (!saved_take(d, false)) kprintf("pci: %04x:%02x:%02x.%x: no memory to save its configuration\n", PCI_ADDRESS_ARGS(a));
     char where[24];
     ksnprintf(where, sizeof where, "%04x:%02x:%02x.%x", PCI_ADDRESS_ARGS(a));
-    hal_location(h, where);
-    struct hal_device *host = d->upstream ? NULL : hal_find_firmware(d->host);
-    hal_publish(d->upstream ? &d->upstream->hal : host, h);
-    if (host) hal_put(host);
+    io_location(h, where);
+    struct io_device *host = d->upstream ? NULL : io_find_firmware(d->host);
+    io_publish(d->upstream ? &d->upstream->hal : host, h);
+    if (host) io_put(host);
 }
 
 /* The function found at a with this ID on the list. */
@@ -360,8 +360,8 @@ void pci_init(void) {
 
 /* The host bridges are the PCI bus's own: pci_init found what is below them. */
 static const struct n_hal_rule host_rules[] = {N_ACPI_ID("PNP0A03"), N_ACPI_ID("PNP0A08")};
-static const struct hal_machine pci_hosts = {.owner = "pci", .rules = host_rules, .rule_count = ARRAY_SIZE(host_rules)};
-HAL_MACHINE(pci_hosts);
+static const struct io_machine pci_hosts = {.owner = "pci", .rules = host_rules, .rule_count = ARRAY_SIZE(host_rules)};
+IO_MACHINE(pci_hosts);
 
 void pci_enable_busmaster(struct pci_device *d) {
     d->kernel_owned = true;
@@ -801,13 +801,13 @@ bool pci_requests_done(const struct pci_device *d) {
     return present(d) && (!d->pcie_cap || !transactions_pending(d));
 }
 
-/* ---- the bus operations of the device tree (hal/hal.h) ---- */
+/* ---- the bus operations of the device tree (io/io.h) ---- */
 /* Messages (MSI-X, then MSI) where the function may send them; else its INTx as ACPI routes it
    (_PRT), shared with whatever else sits on the line, specs[0]'s handler saying whether the
    interrupt was its function's. A claimed function gets no INTx: an app's driver that leaves it
    asserted would hold a shared line, and a message is what a claim remaps (dev/iommu.h). The
    line is routed before INTx Disable clears: an assertion finds its handler. */
-static unsigned bus_irq_enable(struct hal_device *h, const struct irq_spec *specs, unsigned count, struct irq **irqs) {
+static unsigned bus_irq_enable(struct io_device *h, const struct irq_spec *specs, unsigned count, struct irq **irqs) {
     struct pci_device *d = pci_device_of(h);
     if (!count) return 0;
     unsigned n = d->no_messages ? 0 : pci_irq_enable(d, specs, count, irqs);
@@ -820,7 +820,7 @@ static unsigned bus_irq_enable(struct hal_device *h, const struct irq_spec *spec
     return 1;
 }
 
-static bool bus_irq_disable(struct hal_device *h) {
+static bool bus_irq_disable(struct io_device *h) {
     struct pci_device *d = pci_device_of(h);
     if (d->intx) {
         intx_disable(d);
@@ -830,39 +830,39 @@ static bool bus_irq_disable(struct hal_device *h) {
     return d->msi_count || d->msix_irqs ? pci_irq_disable(d) : true;
 }
 
-static unsigned bus_irq_max(struct hal_device *h) {
+static unsigned bus_irq_max(struct io_device *h) {
     struct pci_device *d = pci_device_of(h);
     unsigned most = d->no_messages ? 0 : pci_msix_max_vectors(d);
     if (!most && !d->no_messages) most = pci_msi_max_vectors(d);
     return most ? most : 1;
 }
 
-static void bus_enable(struct hal_device *h, unsigned what) {
+static void bus_enable(struct io_device *h, unsigned what) {
     struct pci_device *d = pci_device_of(h);
     d->kernel_owned = true;
     uint16_t cmd = pci_read16(d->address, PCI_COMMAND);
-    if (what & HAL_ENABLE_MEMORY) cmd |= PCI_COMMAND_MEMORY;
-    if (what & HAL_ENABLE_PORTS) cmd |= PCI_COMMAND_IO;
-    if (what & HAL_ENABLE_DMA) cmd |= PCI_COMMAND_MASTER;
+    if (what & IO_ENABLE_MEMORY) cmd |= PCI_COMMAND_MEMORY;
+    if (what & IO_ENABLE_PORTS) cmd |= PCI_COMMAND_IO;
+    if (what & IO_ENABLE_DMA) cmd |= PCI_COMMAND_MASTER;
     pci_write16(d->address, PCI_COMMAND, cmd);
 }
 
 /* No new request from the function, and none of its non-posted ones outstanding (pci_requests_done). */
-static bool bus_stop(struct hal_device *h) {
+static bool bus_stop(struct io_device *h) {
     struct pci_device *d = pci_device_of(h);
     return pci_disable_busmaster(d, NULL) && pci_requests_done(d);
 }
 
-/* 客の DMA のメモリーを claim の domain へ同じ番地で（dev/iommu.h）。HAL が、訳の領域にいる間だけ呼ぶ。 */
-static bool bus_dma_map(struct hal_device *h, uint64_t phys, uint64_t pages) {
+/* 客の DMA のメモリーを claim の domain へ同じ番地で（dev/iommu.h）。装置の管理者が、訳の領域にいる間だけ呼ぶ。 */
+static bool bus_dma_map(struct io_device *h, uint64_t phys, uint64_t pages) {
     return iommu_map(pci_device_of(h)->claim_domain, NULL, phys, pages);
 }
 
-static bool bus_dma_unmap(struct hal_device *h, uint64_t phys, uint64_t pages) {
+static bool bus_dma_unmap(struct io_device *h, uint64_t phys, uint64_t pages) {
     return iommu_unmap(pci_device_of(h)->claim_domain, NULL, phys, pages);
 }
 
-const struct hal_bus_ops pci_bus_ops = {
+const struct io_bus_ops pci_bus_ops = {
     .irq_enable = bus_irq_enable,
     .irq_disable = bus_irq_disable,
     .irq_max = bus_irq_max,
@@ -1525,9 +1525,9 @@ static bool bus_reset(struct pci_device *port) {
 }
 
 /* ---- 電源の状態と眠り ----
-   機能の D 状態は HAL のもの（hal_bus_ops.power。PCI Express Base 6.0 5.3.1、5.9、7.5.2）。D3hot の前に構成を d->saved
+   機能の D 状態は装置の管理者のもの（io_bus_ops.power。PCI Express Base 6.0 5.3.1、5.9、7.5.2）。D3hot の前に構成を d->saved
    へ取り（列挙のときにも一度取る）、D0 の後に戻す。D3hot の機能はメモリー空間に答えない（5.3.1.4.1）ので、pci_suspend は
-   D3 にした機能の構成を取らず、pci_resume も戻さない：HAL の D0 が戻す。reset の記録を持つ機能は reset に任せ、D 状態を
+   D3 にした機能の構成を取らず、pci_resume も戻さない：装置の管理者の D0 が戻す。reset の記録を持つ機能は reset に任せ、D 状態を
    変えない（pci_suspend と pci_resume も同じ）。
    装置ごとの電源の段は電源の walk の装置ごとの thread で並んで走る。機能の power と saved はその機能の thread だけが
    変え、walk の後に眠りが読む。 */
@@ -1579,7 +1579,7 @@ static bool power_down(struct pci_device *d) {
         kprintf("pci: %04x:%02x:%02x.%x: no memory to save its configuration\n", PCI_ADDRESS_ARGS(d->address));
         return false;
     }
-    d->power = HAL_D3HOT;
+    d->power = IO_D3HOT;
     uint8_t pm = pci_find_cap(d, PM_CAP);
     if (!pm) return true;
     uint16_t csr = pci_read16(d->address, pm + PM_PMCSR);
@@ -1588,12 +1588,12 @@ static bool power_down(struct pci_device *d) {
     return true;
 }
 
-/* D0 へ。D3 から（HAL が移したか、firmware が D3 で渡した）なら、保存した構成を戻す。 */
+/* D0 へ。D3 から（装置の管理者が移したか、firmware が D3 で渡した）なら、保存した構成を戻す。 */
 static bool power_up(struct pci_device *d) {
     if (resetting(d)) return present(d);
-    bool cold = d->power == HAL_D3COLD;
+    bool cold = d->power == IO_D3COLD;
     if (cold ? !cold_wait(d) : !present(d)) return false;
-    bool moved = d->power != HAL_D0;
+    bool moved = d->power != IO_D0;
     uint8_t pm = pci_find_cap(d, PM_CAP);
     uint16_t csr = pm ? pci_read16(d->address, pm + PM_PMCSR) : 0;
     if (csr & PM_STATE) {
@@ -1601,20 +1601,20 @@ static bool power_up(struct pci_device *d) {
         if (!(pci_read32(d->address, pm) & PM_PMC_IMMEDIATE)) sleep_until(clock_after(PM_STATE_NS));
         moved = true;
     }
-    d->power = HAL_D0;
+    d->power = IO_D0;
     if (!moved || !d->saved) return true;
     state_restore(d, d->saved);
     if (d->upstream && __atomic_exchange_n(&d->upstream->retrain, false, __ATOMIC_ACQ_REL)) link_retrain(d->upstream, true);
     return true;
 }
 
-static bool bus_power(struct hal_device *h, enum hal_power_state to) {
+static bool bus_power(struct io_device *h, enum io_power_state to) {
     struct pci_device *d = pci_device_of(h);
     switch (to) {
-    case HAL_D0: return power_up(d);
-    case HAL_D3HOT: return power_down(d);
-    case HAL_D3COLD:
-        if (!resetting(d)) d->power = HAL_D3COLD;
+    case IO_D0: return power_up(d);
+    case IO_D3HOT: return power_down(d);
+    case IO_D3COLD:
+        if (!resetting(d)) d->power = IO_D3COLD;
         return true;
     }
     return false;
@@ -1632,7 +1632,7 @@ const char *pci_suspend(void) {
     if (busy) return "PCI (a device is being reset)";
     for (size_t i = 0; i < ndevices; i++) {
         struct pci_device *d = &devices[i];
-        if (d->reset || d->power != HAL_D0) continue;
+        if (d->reset || d->power != IO_D0) continue;
         if (!saved_take(d, true)) return "PCI (no memory to save it)";
     }
     suspended = true;
@@ -1706,7 +1706,7 @@ void pci_resume(bool slept, bool remake) {
         watching = false;
         for (size_t i = 0; i < ndevices; i++) {
             struct pci_device *b = devices[i].upstream;
-            if (devices[i].power != HAL_D0) continue; /* the HAL's D0 waits for it (cold_wait) */
+            if (devices[i].power != IO_D0) continue; /* the device manager's D0 waits for it (cold_wait) */
             if (b && b->pcie_cap && b->pcie_type == 4 && !b->below) watching |= !below_ready(b);
         }
         if (watching) pause();
@@ -1714,7 +1714,7 @@ void pci_resume(bool slept, bool remake) {
     for (size_t i = 0; i < ndevices; i++) {
         struct pci_device *d = &devices[i];
         struct pci_reset *r = d->reset;
-        if (d->power != HAL_D0) continue;
+        if (d->power != IO_D0) continue;
         if (r && !slept) continue;
         if (r) reset_phase_set(r, RESET_IDLE);
         uint64_t reset_end = since;

@@ -9,7 +9,7 @@
 #include "dev/gpu.h"
 #include "vm/vm.h"
 #include "dev/pci.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "arch/cpu.h"
 #include "arch/irq.h"
 #include "sys/clock.h"
@@ -79,9 +79,9 @@ struct header {
     uint8_t ring, pad[3];
 } PACKED;
 
-/* この file が動かす一つの装置（gpu_attach）。装置が読み書きするメモリーは全部 hal_dma_alloc で取り、装置へ書く番地は
+/* この file が動かす一つの装置（gpu_attach）。装置が読み書きするメモリーは全部 io_dma_alloc で取り、装置へ書く番地は
    その bus だけ。CPU はその指（packets、target、vertices、source_pixels）で触る。 */
-static struct hal_device *gpu_device;
+static struct io_device *gpu_device;
 static struct virtio_common *common;
 static volatile uint16_t *notify;
 /* ISR status (virtio 1.x 4.1.4.5), read by the handler on INTx alone: bit 0 says the queue raised
@@ -144,27 +144,27 @@ static void completion_nap(uint64_t deadline) {
 }
 
 static inline void barrier(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
-static uint32_t config32(struct hal_device *d, unsigned off) {
+static uint32_t config32(struct io_device *d, unsigned off) {
     return pci_read32(pci_device_of(d)->address, (uint8_t)off);
 }
-static uint8_t config8(struct hal_device *d, unsigned off) {
+static uint8_t config8(struct io_device *d, unsigned off) {
     return (uint8_t)(config32(d, off & ~3u) >> ((off & 3u) * 8));
 }
 /* virtio の PCI の capability が指す構造（virtio 1.2 4.1.4）を、それが居る BAR を写した所から求める。bars は BAR
-   ごとの写し（hal_map）で、一つの BAR は一度だけ写す。NULL：使えない capability（4.1.4.1 の予約の bar の値、I/O の
+   ごとの写し（io_map）で、一つの BAR は一度だけ写す。NULL：使えない capability（4.1.4.1 の予約の bar の値、I/O の
    空間の BAR、BAR に収まらない構造）。呼ぶ側は同じ種類の次の capability を見る。 */
-static void *cap_map(struct hal_device *d, uint8_t *bars[6], unsigned cap, uint32_t *length) {
+static void *cap_map(struct io_device *d, uint8_t *bars[6], unsigned cap, uint32_t *length) {
     unsigned bar = config8(d, cap + 4);
     if (bar > 5) return NULL;
-    const struct n_hal_resource *memory = hal_resource(d, N_HAL_MEMORY, bar);
+    const struct n_hal_resource *memory = io_resource(d, N_HAL_MEMORY, bar);
     uint32_t off = config32(d, cap + 8), len = config32(d, cap + 12);
     if (!memory || !len || off > memory->size || len > memory->size - off) return NULL;
-    if (!bars[bar] && !(bars[bar] = hal_map(d, bar))) return NULL;
+    if (!bars[bar] && !(bars[bar] = io_map(d, bar))) return NULL;
     *length = len;
     return bars[bar] + off;
 }
 
-static bool transport_init(struct hal_device *d) {
+static bool transport_init(struct io_device *d) {
     uint8_t cap = config8(d, 0x34) & ~3u;
     uint8_t *bars[6] = {0};
     volatile uint8_t *notify_base = NULL;
@@ -197,7 +197,7 @@ static bool transport_init(struct hal_device *d) {
         cap = (uint8_t)next;
     }
     if (!common || !notify_base) return false;
-    hal_enable(d, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA);
+    io_enable(d, IO_ENABLE_MEMORY | IO_ENABLE_DMA);
     mmio_write8(&common->device_status, 0);
     uint64_t deadline = clock_after(100 * NS_PER_MS); /* the reset reads 0 once it is done */
     while (mmio_read8(&common->device_status)) {
@@ -213,7 +213,7 @@ static bool transport_init(struct hal_device *d) {
     mmio_write32(&common->driver_feature_select, 0);
     mmio_write32(&common->driver_feature, VIRGL_FEATURE);
     mmio_write32(&common->driver_feature_select, 1);
-    /* VIRTIO_F_ACCESS_PLATFORM は申告があれば受ける（6.1）：装置は HAL が返す bus の番地で読み書きする */
+    /* VIRTIO_F_ACCESS_PLATFORM は申告があれば受ける（6.1）：装置は装置の管理者が返す bus の番地で読み書きする */
     mmio_write32(&common->driver_feature, VERSION_1 | (offered & ACCESS_PLATFORM));
     mmio_write8(&common->device_status, 1 | 2 | 8);
     if (!(mmio_read8(&common->device_status) & 8)) return false;
@@ -221,10 +221,10 @@ static bool transport_init(struct hal_device *d) {
 
     /* 輪の番地（4.1.4.3 の queue_desc・queue_driver・queue_device）、記述子の addr（2.7.5）、資源の backing の addr
        （5.7 の struct virtio_gpu_mem_entry）は、どれも le64 */
-    hal_dma_bits(d, 64);
+    io_dma_bits(d, 64);
     uint64_t ring_bus;
-    desc = hal_dma_alloc(d, PAGE_SIZE, &ring_bus);
-    packets = hal_dma_alloc(d, 2 * PAGE_SIZE, &packets_bus);
+    desc = io_dma_alloc(d, PAGE_SIZE, &ring_bus);
+    packets = io_dma_alloc(d, 2 * PAGE_SIZE, &packets_bus);
     if (!desc || !packets) return false;
     avail = (struct avail *)((uint8_t *)desc + 256);
     used = (struct used *)((uint8_t *)desc + 512);
@@ -246,13 +246,13 @@ static bool transport_init(struct hal_device *d) {
     /* The queue's interrupt: MSI-X entry 0 (virtio 1.x 4.1.4.3), or INTx with ISR status (4.1.4.5),
        which the handler reads from the first delivery on. Without either the ring is read again
        instead. */
-    if (hal_irq_max(d) && hal_irq_enable(d, &(struct irq_spec){.name = "virtio-gpu", .handler = gpu_isr}, 1, NULL)) {
+    if (io_irq_max(d) && io_irq_enable(d, &(struct irq_spec){.name = "virtio-gpu", .handler = gpu_isr}, 1, NULL)) {
         if (pci_device_of(d)->intx) {
             if (isr_status) {
                 completion_irq = true;
                 avail->flags = 0;
             } else
-                hal_irq_disable(d);
+                io_irq_disable(d);
         } else {
             __atomic_store_n(&isr_status, NULL, __ATOMIC_RELEASE);
             mmio_write16(&common->queue_msix_vector, 0);
@@ -260,7 +260,7 @@ static bool transport_init(struct hal_device *d) {
                 completion_irq = true;
                 avail->flags = 0;
             } else
-                hal_irq_disable(d);
+                io_irq_disable(d);
         }
     }
     mmio_write16(&common->queue_enable, 1);
@@ -272,8 +272,8 @@ static bool transport_init(struct hal_device *d) {
 }
 
 /* 要求は全部この file が書き、packets の連続の二頁（要求と答え）を通る。時間切れか誤りの後は装置をもう使わず、
-   DMA のメモリーも返さない（装置がまだ読み書きするかもしれない）。attach の中の失敗なら、HAL が装置の止まりを
-   確かめてから返す（hal/hal.h）。 */
+   DMA のメモリーも返さない（装置がまだ読み書きするかもしれない）。attach の中の失敗なら、装置の管理者が装置の止まりを
+   確かめてから返す（io/io.h）。 */
 static bool exchange(const void *request, size_t len, uint32_t response_type) {
     if (broken || !packets || len > PAGE_SIZE) return false;
     memcpy(packets, request, len);
@@ -443,11 +443,11 @@ static bool retire_resource(uint32_t id) {
     p.h = hdr(0x102, false);
     return exchange(&p, sizeof p, OK_NODATA);
 }
-/* 絵の backing（hal_dma_alloc、0 埋め）。backing の記述の長さは le32 で、それより小さくても連続のメモリーと
+/* 絵の backing（io_dma_alloc、0 埋め）。backing の記述の長さは le32 で、それより小さくても連続のメモリーと
    ホストの確保は断りうる。backing を取り替えるときは、新しい資源を作ってから古い資源を外し（detach と unref の
    fence の後）、古い backing を返す。途中で装置が失敗したら、新旧どちらの backing も返さない（exchange）。 */
 static uint32_t *image_backing(size_t bytes, uint64_t *bus) {
-    return bytes && bytes <= UINT32_MAX ? hal_dma_alloc(gpu_device, bytes, bus) : NULL;
+    return bytes && bytes <= UINT32_MAX ? io_dma_alloc(gpu_device, bytes, bus) : NULL;
 }
 static bool image_resource(bool input, uint32_t w, uint32_t h) {
     uint32_t *cw = input ? &source_width : &target_width, *ch = input ? &source_height : &target_height;
@@ -480,7 +480,7 @@ static bool image_resource(bool input, uint32_t w, uint32_t h) {
     }
     if (*pixels) {
         if (!retire_resource(*id)) return false;
-        hal_dma_free(gpu_device, *pixels);
+        io_dma_free(gpu_device, *pixels);
     }
     *pixels = fresh;
     *id = fresh_id;
@@ -496,7 +496,7 @@ static bool pipeline_init(void) {
     } PACKED ctx = {.h = hdr(CMD_CTX_CREATE, true), .len = 8, .name = "Nocturne"};
     if (!exchange(&ctx, sizeof ctx, OK_NODATA)) return false;
     uint64_t vertex_bus;
-    vertices = hal_dma_alloc(gpu_device, PAGE_SIZE, &vertex_bus);
+    vertices = io_dma_alloc(gpu_device, PAGE_SIZE, &vertex_bus);
     if (!vertices) return false;
     /* PIPE_TEXTURE_2D=2, RENDER_TARGET|SAMPLER_VIEW; PIPE_BUFFER=0. */
     if (!image_resource(false, 32, 32) || !resource(VERTEX_ID, 0, 64, 16, VERTEX_BYTES, 1, vertex_bus, PAGE_SIZE))
@@ -703,11 +703,11 @@ static bool pixel_test(void) {
     return ok;
 }
 
-static int gpu_attach(struct hal_device *d) {
-    if (test_flag("nogpu")) return HAL_DECLINE;
+static int gpu_attach(struct io_device *d) {
+    if (test_flag("nogpu")) return IO_DECLINE;
     if (!test_flag("gpu-enable") && !test_flag("gpu-slow-test")) {
         kprintf("gpu: optional virgl device present; gpu-enable required (cold host fences can be slow)\n");
-        return HAL_DECLINE;
+        return IO_DECLINE;
     }
     if (common) return -N_ERR_BUSY; /* one device: its state is this file's */
     gpu_device = d;
@@ -907,7 +907,7 @@ int gpu_blit(const struct n_gpu_blit *r, const uint32_t *pixels, size_t source_b
 }
 
 static const struct n_hal_rule gpu_rules[] = {N_PCI_ID(0x1af4, 0x1050)};
-const struct hal_driver virtio_gpu_driver = {
+const struct io_driver virtio_gpu_driver = {
     .name = "virtio-gpu",
     .rules = gpu_rules,
     .rule_count = ARRAY_SIZE(gpu_rules),

@@ -41,7 +41,7 @@
 #include "arch/irq.h"
 #include "arch/spin.h"
 #include "dev/entropy.h"
-#include "hal/hal.h"
+#include "io/io.h"
 #include "mm/heap.h"
 #include "sys/clock.h"
 #include "sys/wait.h"
@@ -590,7 +590,7 @@ static unsigned rtl_transmit(struct netif *self, unsigned queue, const struct ne
 
 /* D3 の前の MAC の設定（re_hw_d3_para の RTL8125B の分）：EEE+ を入れ（re_set_eeeplus）、MAC の側で LTR を切り
    （_re_set_enable_ltr）、L1 off を切る（re_set_enable_l1off）。ASPM を使わないので LTR の要求は出していない
-   （re_issue_ltr_no_req は何もしない）。構成の空間（Device Control 2 の LTR の許し）は HAL のもので、ここでは書かない。 */
+   （re_issue_ltr_no_req は何もしない）。構成の空間（Device Control 2 の LTR の許し）は装置の管理者のもので、ここでは書かない。 */
 static void d3_prepare(struct rtl8125 *c) {
     mac_ocp_modify(c, 0xE080, 0, 1u << 1);
     mac_ocp_modify(c, 0xE032, (1u << 0) | (1u << 1), 0);
@@ -605,29 +605,29 @@ static void phy_power_down(struct rtl8125 *c) {
     wr8(c, PMCH, rd8(c, PMCH) & ~PMCH_PHY_WAKE);
 }
 
-/* hal.h の suspend（re_suspend と re_shutdown）。道を閉じてから MAC を reset する：DMA と割り込みが止まる。眠りと電源断
+/* io.h の suspend（re_suspend と re_shutdown）。道を閉じてから MAC を reset する：DMA と割り込みが止まる。眠りと電源断
    では装置が D3 に入るか電源を失うので、D3 の前の設定と PHY の電源断を続ける。休止の写しでは電源が残り、resume が
    初めから立て直す。reset が済まなければ false：眠りと休止の取りやめで resume が続き、立て直す。 */
-static bool rtl_suspend(struct hal_device *d, enum hal_power_target target) {
+static bool rtl_suspend(struct io_device *d, enum io_power_target target) {
     struct rtl8125 *c = d->driver_data;
     path_close(c);
     if (!mac_reset(c)) return false;
     switch (target) {
-    case HAL_POWER_SLEEP:
-    case HAL_POWER_OFF:
+    case IO_POWER_SLEEP:
+    case IO_POWER_OFF:
         d3_prepare(c);
         phy_power_down(c);
         break;
-    case HAL_POWER_IMAGE:
+    case IO_POWER_IMAGE:
         break;
     }
     return true;
 }
 
-/* hal.h の resume（re_resume）。装置は電源を失っていても、そのままでもよい：道を閉じて hw_init（re_hw_init）がどちら
+/* io.h の resume（re_resume）。装置は電源を失っていても、そのままでもよい：道を閉じて hw_init（re_hw_init）がどちら
    からも初めから立て、道を開く。局の番地と輪の場所は記憶にあり、電源を失っても失われない。MAC が reset を出て送受信が
    入ったら true。 */
-static bool rtl_resume(struct hal_device *d) {
+static bool rtl_resume(struct io_device *d) {
     struct rtl8125 *c = d->driver_data;
     path_close(c);
     hw_init(c);
@@ -637,14 +637,14 @@ static bool rtl_resume(struct hal_device *d) {
     path_open(c);
     if (!back) {
         kprintf("rtl8125: did not come back after sleeping\n");
-        hal_failed(d, -N_ERR_IO);
+        io_failed(d, -N_ERR_IO);
     }
     return back;
 }
 
 static bool valid_mac(const uint8_t *m) { return !(m[0] & 1) && (m[0] | m[1] | m[2] | m[3] | m[4] | m[5]); }
 
-static int rtl_attach(struct hal_device *d) {
+static int rtl_attach(struct io_device *d) {
     struct rtl8125 *c = kzalloc(sizeof *c);
     if (!c) {
         kprintf("rtl8125: no memory for a device\n");
@@ -653,16 +653,16 @@ static int rtl_attach(struct hal_device *d) {
     d->driver_data = c;
     int r = -N_ERR_UNSUPPORTED;
     unsigned bar = 0;
-    while (bar < 6 && !hal_resource(d, N_HAL_MEMORY, bar)) bar++;
+    while (bar < 6 && !io_resource(d, N_HAL_MEMORY, bar)) bar++;
     if (bar == 6) {
         kprintf("rtl8125: no memory register window\n");
         goto fail;
     }
-    if (!(c->mmio = hal_map(d, bar))) {
+    if (!(c->mmio = io_map(d, bar))) {
         r = -N_ERR_NO_MEMORY;
         goto fail;
     }
-    hal_enable(d, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA);
+    io_enable(d, IO_ENABLE_MEMORY | IO_ENABLE_DMA);
 
     uint32_t txcfg = rd32(c, TXCFG);
     c->macver = txcfg & 0xFCF00000;
@@ -688,10 +688,10 @@ static int rtl_attach(struct hal_device *d) {
 
     /* MAC は 64 bit の番地を読み書きする：輪のレジスターと descriptor の番地は 64 bit で、Realtek の driver は全部の DMA の
        tag を BUS_SPACE_MAXADDR で作る。輪、続いてそれが指す緩衝：それぞれ一つの塊で、緩衝は並べて */
-    hal_dma_bits(d, 64);
+    io_dma_bits(d, 64);
     uint64_t ring_bus, buffer_bus;
-    uint8_t *rings = hal_dma_alloc(d, 2 * PAGE_SIZE, &ring_bus);
-    uint8_t *buffers = hal_dma_alloc(d, (NRX + NTX) * BUFSZ, &buffer_bus);
+    uint8_t *rings = io_dma_alloc(d, 2 * PAGE_SIZE, &ring_bus);
+    uint8_t *buffers = io_dma_alloc(d, (NRX + NTX) * BUFSZ, &buffer_bus);
     if (!rings || !buffers) {
         kprintf("rtl8125: DMA allocation failed\n");
         r = -N_ERR_NO_MEMORY;
@@ -712,7 +712,7 @@ static int rtl_attach(struct hal_device *d) {
 
     /* 割り込む PCI Express の機能は MSI か MSI-X を持つ（PCIe 6.0、6.1.4）。chip の割り込みの mask は輪が立つまで
        切ったまま（mac_reset） */
-    if (!hal_irq_enable(d, &(struct irq_spec){.name = "RTL8125", .handler = rtl_irq, .context = c}, 1, NULL)) {
+    if (!io_irq_enable(d, &(struct irq_spec){.name = "RTL8125", .handler = rtl_irq, .context = c}, 1, NULL)) {
         kprintf("rtl8125: no interrupt message could be enabled\n");
         r = -N_ERR_IO;
         goto fail;
@@ -733,20 +733,20 @@ static int rtl_attach(struct hal_device *d) {
             c->nif.mac[0], c->nif.mac[1], c->nif.mac[2], c->nif.mac[3], c->nif.mac[4], c->nif.mac[5]);
     return 0;
 fail:
-    hal_irq_disable(d); /* handler の記憶が消える前に */
+    io_irq_disable(d); /* handler の記憶が消える前に */
     d->driver_data = NULL;
     kfree(c);
     return r;
 }
 
 static const struct n_hal_rule rtl_rules[] = {N_PCI_ID(0x10EC, 0x8125)};
-static const struct hal_driver rtl8125_driver = {
+static const struct io_driver rtl8125_driver = {
     .name = "rtl8125",
     .rules = rtl_rules,
     .rule_count = ARRAY_SIZE(rtl_rules),
     .attach = rtl_attach,
     .suspend = rtl_suspend,
     .resume = rtl_resume,
-    .after_sleep = HAL_AFTER_SLEEP_RESUME,
+    .after_sleep = IO_AFTER_SLEEP_RESUME,
 };
-HAL_DRIVER(rtl8125_driver);
+IO_DRIVER(rtl8125_driver);
