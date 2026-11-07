@@ -31,13 +31,13 @@ SECTIONS
     .rodata : {
         *(.rodata .rodata.*)
         . = ALIGN(8);
-        __hal_drivers_start = .;
-        KEEP(*(.hal_drivers))
-        __hal_drivers_end = .;
+        __io_drivers_start = .;
+        KEEP(*(.io_drivers))
+        __io_drivers_end = .;
         . = ALIGN(8);
-        __hal_machine_start = .;
-        KEEP(*(.hal_machine))
-        __hal_machine_end = .;
+        __io_machine_start = .;
+        KEEP(*(.io_machine))
+        __io_machine_end = .;
     } :rodata
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));

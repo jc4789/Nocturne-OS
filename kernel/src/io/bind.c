@@ -14,8 +14,8 @@ struct driver_entry {
     uint32_t order;
 };
 
-extern const struct io_driver *const __hal_drivers_start[], *const __hal_drivers_end[];
-extern const struct io_machine *const __hal_machine_start[], *const __hal_machine_end[];
+extern const struct io_driver *const __io_drivers_start[], *const __io_drivers_end[];
+extern const struct io_machine *const __io_machine_start[], *const __io_machine_end[];
 
 static struct driver_entry *drivers_first, **drivers_tail = &drivers_first;
 static uint32_t drivers_added;
@@ -135,7 +135,7 @@ static void bind_thread(void *arg) {
 
 /* d が機械の装置なら、持ち主のものとして台帳に載せて true。 */
 static bool machine_take(struct io_device *d) {
-    for (const struct io_machine *const *p = __hal_machine_start; p < __hal_machine_end; p++) {
+    for (const struct io_machine *const *p = __io_machine_start; p < __io_machine_end; p++) {
         const struct io_machine *m = *p;
         bool matches = false;
         for (uint32_t i = 0; i < m->rule_count && !matches; i++)
@@ -255,7 +255,7 @@ void io_driver_add(const struct io_driver *driver) {
 }
 
 void io_start(void) {
-    for (const struct io_driver *const *p = __hal_drivers_start; p < __hal_drivers_end; p++) io_driver_add(*p);
+    for (const struct io_driver *const *p = __io_drivers_start; p < __io_drivers_end; p++) io_driver_add(*p);
     uint64_t f = spin_lock(&io_lock);
     started = true;
     spin_unlock(&io_lock, f);
