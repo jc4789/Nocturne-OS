@@ -80,17 +80,17 @@
 #define BACKUP_ADDR 0x19E0
 #define EEE_TXIDLE  0x6048
 
-#define CMD_TX_EN    0x04
-#define CMD_RX_EN    0x08
-#define CMD_RESET    0x10
-#define CMD_STOP_REQ 0x80
-#define EECMD_UNLOCK 0xC0 /* 構成のレジスターへ書ける */
-#define MCU_NOW_IS_OOB 0x80
+#define CMD_TX_EN       0x04
+#define CMD_RX_EN       0x08
+#define CMD_RESET       0x10
+#define CMD_STOP_REQ    0x80
+#define EECMD_UNLOCK    0xC0 /* 構成のレジスターへ書ける */
+#define MCU_NOW_IS_OOB  0x80
 #define MCU_FIFOS_EMPTY 0x30
-#define RX_ACCEPT (0x02 | 0x04 | 0x08) /* 自分の番地、multicast、broadcast */
-#define RX_FILTER 0x3Fu                /* 受ける frame の選び（re_clear_all_rx_packet_filter） */
-#define TXCFG_INIT 0x03000780          /* frame の間の隙間、DMA の burst は限らない */
-#define PMCH_PHY_WAKE 0x80             /* PHY の電源（RL_FLAG_PHYWAKE_PM の機種） */
+#define RX_ACCEPT       (0x02 | 0x04 | 0x08) /* 自分の番地、multicast、broadcast */
+#define RX_FILTER       0x3Fu                /* 受ける frame の選び（re_clear_all_rx_packet_filter） */
+#define TXCFG_INIT      0x03000780           /* frame の間の隙間、DMA の burst は限らない */
+#define PMCH_PHY_WAKE   0x80                 /* PHY の電源（RL_FLAG_PHYWAKE_PM の機種） */
 
 /* 8125B の割り込みの割り当て（割り込みの構成の bit 0） */
 #define INT_RX0  (1u << 0)
@@ -98,49 +98,49 @@
 #define INT_LINK (1u << 21)
 #define INT_MASK (INT_RX0 | INT_TX0 | INT_LINK)
 
-#define LINK_UP   0x02
-#define FULL_DUP  0x01
+#define LINK_UP  0x02
+#define FULL_DUP 0x01
 
 /* descriptor の最初の語：両方の輪 */
-#define D_OWN (1u << 31)
-#define D_EOR (1u << 30)
-#define D_FS  (1u << 29)
-#define D_LS  (1u << 28)
+#define D_OWN  (1u << 31)
+#define D_EOR  (1u << 30)
+#define D_FS   (1u << 29)
+#define D_LS   (1u << 28)
 #define RX_RES (1u << 21) /* 受けた frame の誤りのまとめ */
 #define RX_LEN 0x3FFFu
 /* 受けた frame の checksum について MAC が言うこと（opts1。IP の版は opts2） */
 #define RX_TCPT (1u << 17)
 #define RX_UDPT (1u << 18)
-#define RX_IPF (1u << 16)
+#define RX_IPF  (1u << 16)
 #define RX_UDPF (1u << 15)
 #define RX_TCPF (1u << 14)
-#define RX_V4F (1u << 30)
+#define RX_V4F  (1u << 30)
 /* 送る frame が MAC に埋めさせるもの（opts2、8125 の descriptor の形） */
 #define TX_IPV4CS (1u << 29)
-#define TX_TCPCS (1u << 30)
-#define TX_UDPCS (1u << 31)
+#define TX_TCPCS  (1u << 30)
+#define TX_UDPCS  (1u << 31)
 
 /* PHY（標準のレジスターは OCP の 0xA400 + 2 * 番号に写る、IEEE 802.3 22.2.4） */
-#define MII_BMCR 0
-#define MII_ANAR 4
-#define MII_GBCR 9
-#define BMCR_RESET    0x8000
-#define BMCR_AUTONEG  0x1000
-#define BMCR_PDOWN    0x0800
-#define BMCR_RESTART  0x0200
-#define ANAR_10       0x0020
-#define ANAR_10_FD    0x0040
-#define ANAR_100      0x0080
-#define ANAR_100_FD   0x0100
-#define ANAR_PAUSE    0x0400
-#define ANAR_ASYM     0x0800
-#define GBCR_1000_FD  0x0200
-#define GBCR_1000_HD  0x0100
-#define ADV_2500_FD   0x0080
+#define MII_BMCR     0
+#define MII_ANAR     4
+#define MII_GBCR     9
+#define BMCR_RESET   0x8000
+#define BMCR_AUTONEG 0x1000
+#define BMCR_PDOWN   0x0800
+#define BMCR_RESTART 0x0200
+#define ANAR_10      0x0020
+#define ANAR_10_FD   0x0040
+#define ANAR_100     0x0080
+#define ANAR_100_FD  0x0100
+#define ANAR_PAUSE   0x0400
+#define ANAR_ASYM    0x0800
+#define GBCR_1000_FD 0x0200
+#define GBCR_1000_HD 0x0100
+#define ADV_2500_FD  0x0080
 
-#define BUFSZ 2048
+#define BUFSZ     2048
 #define FRAME_MAX 1522 /* 1500 + 頭 + VLAN の札 + FCS */
-#define UDP_PAD 121 /* MAC に checksum を埋めさせない短い IPv4 UDP の frame はこの長さで出す（8125A/B） */
+#define UDP_PAD   121 /* MAC に checksum を埋めさせない短い IPv4 UDP の frame はこの長さで出す（8125A/B） */
 #define LINK_LOOK NS_PER_S /* link の割り込みのほかに、poll はこの間ごとに link の状態を読む */
 
 struct desc {
@@ -182,8 +182,8 @@ static void wr32(struct rtl8125 *c, uint32_t r, uint32_t v) { mmio_write32(c->mm
 
 /* size バイトのレジスター r の値と mask の積が want になるまで、step ごとに眠ってから読み（Realtek の手順と同じく、
    一歩の後に見る）、ns まで待つ。来たら true。last があれば最後に読んだ値を入れる。 */
-static bool wait_reg(struct rtl8125 *c, uint32_t r, unsigned size, uint32_t mask, uint32_t want, uint64_t step, uint64_t ns,
-                     uint32_t *last) {
+static bool wait_reg(struct rtl8125 *c, uint32_t r, unsigned size, uint32_t mask, uint32_t want, uint64_t step,
+                     uint64_t ns, uint32_t *last) {
     uint64_t until = clock_after(ns);
     for (;;) {
         sleep_until(clock_after(step));
@@ -200,7 +200,9 @@ static uint16_t mac_ocp_read(struct rtl8125 *c, uint16_t a) {
     return (uint16_t)rd32(c, MAC_OCP);
 }
 
-static void mac_ocp_write(struct rtl8125 *c, uint16_t a, uint16_t v) { wr32(c, MAC_OCP, 1u << 31 | (uint32_t)(a / 2) << 16 | v); }
+static void mac_ocp_write(struct rtl8125 *c, uint16_t a, uint16_t v) {
+    wr32(c, MAC_OCP, 1u << 31 | (uint32_t)(a / 2) << 16 | v);
+}
 
 static void mac_ocp_modify(struct rtl8125 *c, uint16_t a, uint16_t clear, uint16_t set) {
     mac_ocp_write(c, a, (mac_ocp_read(c, a) & ~clear) | set);
@@ -219,7 +221,9 @@ static void phy_write(struct rtl8125 *c, uint16_t a, uint16_t v) {
     wait_reg(c, PHY_OCP, 4, 1u << 31, 0, NS_PER_US, 100 * NS_PER_US, NULL);
 }
 
-static void phy_modify(struct rtl8125 *c, uint16_t a, uint16_t clear, uint16_t set) { phy_write(c, a, (phy_read(c, a) & ~clear) | set); }
+static void phy_modify(struct rtl8125 *c, uint16_t a, uint16_t clear, uint16_t set) {
+    phy_write(c, a, (phy_read(c, a) & ~clear) | set);
+}
 static uint16_t mii_read(struct rtl8125 *c, unsigned reg) { return phy_read(c, (uint16_t)(0xA400 + reg * 2)); }
 static void mii_write(struct rtl8125 *c, unsigned reg, uint16_t v) { phy_write(c, (uint16_t)(0xA400 + reg * 2), v); }
 
@@ -312,11 +316,10 @@ static void hw_init(struct rtl8125 *c) {
 
     /* PCI Express の PHY の値 */
     static const uint16_t ephy_b1[][2] = {
-        {0x06, 0x001F}, {0x0A, 0xB66B}, {0x01, 0xA852}, {0x24, 0x0008}, {0x2F, 0x6052}, {0x0D, 0xF716},
-        {0x20, 0xD477}, {0x21, 0x4477}, {0x22, 0x0013}, {0x23, 0xBB66}, {0x0B, 0xA909}, {0x29, 0xFF04},
-        {0x1B, 0x1EA0}, {0x46, 0x001F}, {0x4A, 0xB66B}, {0x41, 0xA84A}, {0x64, 0x000C}, {0x6F, 0x604A},
-        {0x4D, 0xF716}, {0x60, 0xD477}, {0x61, 0x4477}, {0x62, 0x0013}, {0x63, 0xBB66}, {0x4B, 0xA909},
-        {0x69, 0xFF04}, {0x5B, 0x1EA0},
+        {0x06, 0x001F}, {0x0A, 0xB66B}, {0x01, 0xA852}, {0x24, 0x0008}, {0x2F, 0x6052}, {0x0D, 0xF716}, {0x20, 0xD477},
+        {0x21, 0x4477}, {0x22, 0x0013}, {0x23, 0xBB66}, {0x0B, 0xA909}, {0x29, 0xFF04}, {0x1B, 0x1EA0}, {0x46, 0x001F},
+        {0x4A, 0xB66B}, {0x41, 0xA84A}, {0x64, 0x000C}, {0x6F, 0x604A}, {0x4D, 0xF716}, {0x60, 0xD477}, {0x61, 0x4477},
+        {0x62, 0x0013}, {0x63, 0xBB66}, {0x4B, 0xA909}, {0x69, 0xFF04}, {0x5B, 0x1EA0},
     };
     static const uint16_t ephy_b2[][2] = {
         {0x0B, 0xA908}, {0x1E, 0x20EB}, {0x22, 0x0023}, {0x02, 0x60C2}, {0x29, 0xFF00},
@@ -376,8 +379,9 @@ static void start_autoneg(struct rtl8125 *c) {
     phy_modify(c, 0xA5EA, 1, 0);
     phy_modify(c, 0xA5D4, 0, ADV_2500_FD);
     mii_write(c, MII_GBCR, (mii_read(c, MII_GBCR) & ~GBCR_1000_HD) | GBCR_1000_FD);
-    mii_write(c, MII_ANAR, (mii_read(c, MII_ANAR) & ~0x0FE0u) | ANAR_10 | ANAR_10_FD | ANAR_100 | ANAR_100_FD |
-                            ANAR_PAUSE | ANAR_ASYM);
+    mii_write(c, MII_ANAR,
+              (mii_read(c, MII_ANAR) & ~0x0FE0u) | ANAR_10 | ANAR_10_FD | ANAR_100 | ANAR_100_FD | ANAR_PAUSE |
+                  ANAR_ASYM);
     mii_write(c, MII_BMCR, BMCR_RESET | BMCR_AUTONEG | BMCR_RESTART);
 }
 
@@ -442,8 +446,10 @@ static void check_link(struct rtl8125 *c) {
         return;
     }
     uint32_t cfg = rd32(c, TXCFG);
-    if (s & FULL_DUP) cfg = (cfg | 1u << 24 | 1u << 25) & ~(1u << 19);
-    else cfg = (cfg | 1u << 25) & ~(1u << 19 | 1u << 24);
+    if (s & FULL_DUP)
+        cfg = (cfg | 1u << 24 | 1u << 25) & ~(1u << 19);
+    else
+        cfg = (cfg | 1u << 25) & ~(1u << 19 | 1u << 24);
     wr32(c, TXCFG, cfg);
     const char *speed = s & 0x400 ? "2500" : s & 0x10 ? "1000" : s & 0x08 ? "100" : s & 0x04 ? "10" : "?";
     kprintf("rtl8125: link up, %s Mbit/s %s duplex\n", speed, s & FULL_DUP ? "full" : "half");
@@ -535,14 +541,16 @@ static void tx_post(struct rtl8125 *c, const struct net_tx_frame *frame) {
     }
     uint32_t opts2 = 0;
     if (frame->offload & NET_TX_IP_CSUM) opts2 |= TX_IPV4CS;
-    if (frame->offload & NET_TX_TCP_CSUM) opts2 |= TX_TCPCS;
-    else if (frame->offload & NET_TX_UDP_CSUM) opts2 |= TX_UDPCS;
+    if (frame->offload & NET_TX_TCP_CSUM)
+        opts2 |= TX_TCPCS;
+    else if (frame->offload & NET_TX_UDP_CSUM)
+        opts2 |= TX_UDPCS;
     /* 8125A/B は短い IPv4 UDP の frame を詰め物なしでは壊す。MAC が自分で checksum を埋めるなら要らない（Realtek の
        driver の re_8125_pad） */
     size_t min = !(frame->offload & (NET_TX_TCP_CSUM | NET_TX_UDP_CSUM)) && len >= 24 && b[12] == 0x08 &&
-                         b[13] == 0x00 && b[23] == 17 ?
-                     UDP_PAD :
-                     60;
+                         b[13] == 0x00 && b[23] == 17
+                     ? UDP_PAD
+                     : 60;
     if (len < min) {
         memset(b + len, 0, min - len);
         len = min;
@@ -610,7 +618,8 @@ static bool rtl_suspend(struct hal_device *d, enum hal_power_target target) {
         d3_prepare(c);
         phy_power_down(c);
         break;
-    case HAL_POWER_IMAGE: break;
+    case HAL_POWER_IMAGE:
+        break;
     }
     return true;
 }
@@ -633,9 +642,7 @@ static bool rtl_resume(struct hal_device *d) {
     return back;
 }
 
-static bool valid_mac(const uint8_t *m) {
-    return !(m[0] & 1) && (m[0] | m[1] | m[2] | m[3] | m[4] | m[5]);
-}
+static bool valid_mac(const uint8_t *m) { return !(m[0] & 1) && (m[0] | m[1] | m[2] | m[3] | m[4] | m[5]); }
 
 static int rtl_attach(struct hal_device *d) {
     struct rtl8125 *c = kzalloc(sizeof *c);

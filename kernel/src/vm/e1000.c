@@ -11,42 +11,42 @@
 #include "hal/hal.h"
 #include "mm/heap.h"
 
-#define REG_CTRL   0x0000
-#define REG_EERD   0x0014
-#define REG_ICR    0x00C0
-#define REG_ITR    0x00C4
-#define REG_IMS    0x00D0
-#define REG_IMC    0x00D8
-#define REG_RCTL   0x0100
-#define REG_TCTL   0x0400
-#define REG_TIPG   0x0410
-#define REG_RDBAL  0x2800
-#define REG_RDBAH  0x2804
-#define REG_RDLEN  0x2808
-#define REG_RDH    0x2810
-#define REG_RDT    0x2818
-#define REG_RDTR   0x2820
-#define REG_RADV   0x282C
-#define REG_TDBAL  0x3800
-#define REG_TDBAH  0x3804
-#define REG_TDLEN  0x3808
-#define REG_TDH    0x3810
-#define REG_TDT    0x3818
-#define REG_MTA    0x5200
-#define REG_RAL    0x5400
-#define REG_RAH    0x5404
+#define REG_CTRL  0x0000
+#define REG_EERD  0x0014
+#define REG_ICR   0x00C0
+#define REG_ITR   0x00C4
+#define REG_IMS   0x00D0
+#define REG_IMC   0x00D8
+#define REG_RCTL  0x0100
+#define REG_TCTL  0x0400
+#define REG_TIPG  0x0410
+#define REG_RDBAL 0x2800
+#define REG_RDBAH 0x2804
+#define REG_RDLEN 0x2808
+#define REG_RDH   0x2810
+#define REG_RDT   0x2818
+#define REG_RDTR  0x2820
+#define REG_RADV  0x282C
+#define REG_TDBAL 0x3800
+#define REG_TDBAH 0x3804
+#define REG_TDLEN 0x3808
+#define REG_TDH   0x3810
+#define REG_TDT   0x3818
+#define REG_MTA   0x5200
+#define REG_RAL   0x5400
+#define REG_RAH   0x5404
 
-#define CTRL_RST (1u << 26) /* Device Reset（13.4.1） */
-#define BUFSZ 2048
-#define ICR_TXDW   (1u << 0)
-#define ICR_LSC    (1u << 2)
-#define ICR_RXDMT0 (1u << 4)
-#define ICR_RXO    (1u << 6)
-#define ICR_RXT0   (1u << 7)
-#define RX_IRQS (ICR_RXDMT0 | ICR_RXO | ICR_RXT0)
-#define DESC_DD  1u
-#define RX_EOP   2u
-#define ITR_TICK_NS 256u /* ITR の刻み（13.4.18） */
+#define CTRL_RST          (1u << 26) /* Device Reset（13.4.1） */
+#define BUFSZ             2048
+#define ICR_TXDW          (1u << 0)
+#define ICR_LSC           (1u << 2)
+#define ICR_RXDMT0        (1u << 4)
+#define ICR_RXO           (1u << 6)
+#define ICR_RXT0          (1u << 7)
+#define RX_IRQS           (ICR_RXDMT0 | ICR_RXO | ICR_RXT0)
+#define DESC_DD           1u
+#define RX_EOP            2u
+#define ITR_TICK_NS       256u /* ITR の刻み（13.4.18） */
 #define ITR_DEFAULT_TICKS 651u /* Intel が勧める 651 から 5580 の低い端 */
 /* reset の終わりを待つ限り。13.4.1 は RST を立ててから約 1 µs 後に見よと言い、上の限りを言わない。 */
 #define RESET_NS NS_PER_S
@@ -104,8 +104,10 @@ static uint32_t rd(struct e1000 *c, uint32_t r) { return mmio_read32(c->mmio + r
 static void wr(struct e1000 *c, uint32_t r, uint32_t v) { mmio_write32(c->mmio + r, v); }
 
 static uint16_t eeprom_read(struct e1000 *c, uint8_t addr) {
-    if (c->new_eerd) wr(c, REG_EERD, 1 | ((uint32_t)addr << 2));
-    else wr(c, REG_EERD, 1 | ((uint32_t)addr << 8));
+    if (c->new_eerd)
+        wr(c, REG_EERD, 1 | ((uint32_t)addr << 2));
+    else
+        wr(c, REG_EERD, 1 | ((uint32_t)addr << 8));
     uint32_t done = c->new_eerd ? 2 : 16;
     for (int i = 0; i < 100000; i++) {
         uint32_t v = rd(c, REG_EERD);
@@ -229,9 +231,14 @@ static unsigned e1000_transmit(struct netif *self, unsigned queue, const struct 
     mutex_lock(&c->e1000_mutex);
     unsigned taken = 0;
     switch (c->state) {
-    case E1000_STOPPED: break;
-    case E1000_RUNNING: taken = tx_post(c, frames, count); break;
-    case E1000_BROKEN: taken = count; break;
+    case E1000_STOPPED:
+        break;
+    case E1000_RUNNING:
+        taken = tx_post(c, frames, count);
+        break;
+    case E1000_BROKEN:
+        taken = count;
+        break;
     }
     mutex_unlock(&c->e1000_mutex);
     return taken;
@@ -239,8 +246,7 @@ static unsigned e1000_transmit(struct netif *self, unsigned queue, const struct 
 
 static uint32_t e1000_itr_ticks(void) {
     uint64_t us;
-    if (!test_number("e1000-itr-us", &us) || us > (uint64_t)UINT16_MAX * ITR_TICK_NS / 1000)
-        return ITR_DEFAULT_TICKS;
+    if (!test_number("e1000-itr-us", &us) || us > (uint64_t)UINT16_MAX * ITR_TICK_NS / 1000) return ITR_DEFAULT_TICKS;
     return (uint32_t)((us * 1000 + ITR_TICK_NS - 1) / ITR_TICK_NS);
 }
 
@@ -258,7 +264,7 @@ static bool hw_reset(struct e1000 *c) {
 /* reset の後：link、番地、最初の記述子からの両方の輪、割り込みの頻度。割り込みの覆いは外さない（e1000_start）。 */
 static void hw_start(struct e1000 *c) {
     uint32_t ctrl = rd(c, REG_CTRL);
-    ctrl |= (1u << 6) | (1u << 5);                  /* SLU、ASDE */
+    ctrl |= (1u << 6) | (1u << 5);                 /* SLU、ASDE */
     ctrl &= ~((1u << 3) | (1u << 31) | (1u << 7)); /* LRST、PHY_RST、ILOS */
     wr(c, REG_CTRL, ctrl);
     const uint8_t *mac = c->nif.mac;
@@ -383,8 +389,8 @@ static int e1000_attach(struct hal_device *d) {
     c->nif.poll = e1000_poll;
     net_register(d, &c->nif);
     net_rx_notify(); /* 載る前に受けたフレームを網の thread に見させる */
-    kprintf("net: e1000 (%04x) mac %02x:%02x:%02x:%02x:%02x:%02x\n", pci->device, mac[0], mac[1], mac[2], mac[3], mac[4],
-            mac[5]);
+    kprintf("net: e1000 (%04x) mac %02x:%02x:%02x:%02x:%02x:%02x\n", pci->device, mac[0], mac[1], mac[2], mac[3],
+            mac[4], mac[5]);
     return 0;
 fail:
     hal_irq_disable(d); /* 処理の記憶が去る前に */
@@ -431,8 +437,9 @@ static bool e1000_resume(struct hal_device *d) {
     return false;
 }
 
-static const struct n_hal_rule e1000_rules[] = {N_PCI_ID(0x8086, 0x100E), N_PCI_ID(0x8086, 0x100F), N_PCI_ID(0x8086, 0x1004),
-                                                N_PCI_ID(0x8086, 0x100C), N_PCI_ID(0x8086, 0x1015), N_PCI_ID(0x8086, 0x10D3)};
+static const struct n_hal_rule e1000_rules[] = {N_PCI_ID(0x8086, 0x100E), N_PCI_ID(0x8086, 0x100F),
+                                                N_PCI_ID(0x8086, 0x1004), N_PCI_ID(0x8086, 0x100C),
+                                                N_PCI_ID(0x8086, 0x1015), N_PCI_ID(0x8086, 0x10D3)};
 const struct hal_driver e1000_driver = {
     .name = "e1000",
     .rules = e1000_rules,

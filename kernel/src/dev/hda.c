@@ -71,51 +71,51 @@
 #define SD_FIRST  0x80
 #define SD_STRIDE 0x20
 
-#define GCAP_OSS(g) (((g) >> 12) & 15)
-#define GCAP_ISS(g) (((g) >> 8) & 15)
-#define GCAP_BSS(g) (((g) >> 3) & 31)
-#define GCAP_64OK   (1u << 0)
-#define GCTL_CRST   (1u << 0)
-#define GCTL_UNSOL  (1u << 8)
-#define INT_GLOBAL  (1u << 31)
+#define GCAP_OSS(g)    (((g) >> 12) & 15)
+#define GCAP_ISS(g)    (((g) >> 8) & 15)
+#define GCAP_BSS(g)    (((g) >> 3) & 31)
+#define GCAP_64OK      (1u << 0)
+#define GCTL_CRST      (1u << 0)
+#define GCTL_UNSOL     (1u << 8)
+#define INT_GLOBAL     (1u << 31)
 #define INT_CONTROLLER (1u << 30)
-#define CORBCTL_RUN (1u << 1)
-#define CORBRP_RST  (1u << 15)
-#define RIRBWP_RST  (1u << 15)
-#define RIRBCTL_INT (1u << 0)
-#define RIRBCTL_DMA (1u << 1)
-#define RIRBSTS_ALL 0x05 /* 答えの割り込みと溢れ */
+#define CORBCTL_RUN    (1u << 1)
+#define CORBRP_RST     (1u << 15)
+#define RIRBWP_RST     (1u << 15)
+#define RIRBCTL_INT    (1u << 0)
+#define RIRBCTL_DMA    (1u << 1)
+#define RIRBSTS_ALL    0x05 /* 答えの割り込みと溢れ */
 
 /* stream の descriptor のレジスター（3.3.35 から） */
-#define SD_CTL   0x00
-#define SD_CTL2  0x02 /* 三つ目の byte：stripe、優先、向き、stream の番号 */
-#define SD_STS   0x03
-#define SD_LPIB  0x04
-#define SD_CBL   0x08
-#define SD_LVI   0x0C
-#define SD_FIFOS 0x10
-#define SD_FMT   0x12
-#define SD_BDPL  0x18
-#define SD_BDPU  0x1C
-#define CTL_SRST (1u << 0)
-#define CTL_RUN  (1u << 1)
-#define CTL_IOCE (1u << 2)
-#define CTL_FEIE (1u << 3)
-#define CTL_DEIE (1u << 4)
-#define CTL2_DIR (1u << 3)
+#define SD_CTL        0x00
+#define SD_CTL2       0x02 /* 三つ目の byte：stripe、優先、向き、stream の番号 */
+#define SD_STS        0x03
+#define SD_LPIB       0x04
+#define SD_CBL        0x08
+#define SD_LVI        0x0C
+#define SD_FIFOS      0x10
+#define SD_FMT        0x12
+#define SD_BDPL       0x18
+#define SD_BDPU       0x1C
+#define CTL_SRST      (1u << 0)
+#define CTL_RUN       (1u << 1)
+#define CTL_IOCE      (1u << 2)
+#define CTL_FEIE      (1u << 3)
+#define CTL_DEIE      (1u << 4)
+#define CTL2_DIR      (1u << 3)
 #define CTL2_TAG(tag) ((uint8_t)((tag) << 4))
-#define STS_BCIS  (1u << 2)
-#define STS_FIFOE (1u << 3)
-#define STS_DESE  (1u << 4)
+#define STS_BCIS      (1u << 2)
+#define STS_FIFOE     (1u << 3)
+#define STS_DESE      (1u << 4)
 
-#define POLL_NS        NS_PER_S           /* 自分で告げない jack を見る間 */
-#define VERB_NS        (10 * NS_PER_MS)   /* これだけ答えない codec は去った（link の次の reset まで） */
-#define RESET_NS       (100 * NS_PER_MS)  /* 制御器が reset を出る・入るのに与える一番長い時間 */
-#define STOP_NS        NS_PER_MS          /* stream と輪の RUN の bit はこの間に 0 を読む（40 us、3.3.35） */
-#define RESET_PULSE_NS (100 * NS_PER_US)  /* codec が link の reset を見る一番短い長さ（5.5.1.2） */
-#define CODEC_WAKE_NS  (521 * NS_PER_US)  /* CRST# の後、codec が番地を求め終える（4.3） */
-#define FRAME_NS       20834              /* link の frame の長さ（5.3）：レジスターの変わりと答えを見る間 */
-#define STREAM_TAG     1u                 /* link の上の stream の番号：制御器ごとに一つ */
+#define POLL_NS        NS_PER_S         /* 自分で告げない jack を見る間 */
+#define VERB_NS        (10 * NS_PER_MS) /* これだけ答えない codec は去った（link の次の reset まで） */
+#define RESET_NS       (100 * NS_PER_MS) /* 制御器が reset を出る・入るのに与える一番長い時間 */
+#define STOP_NS        NS_PER_MS /* stream と輪の RUN の bit はこの間に 0 を読む（40 us、3.3.35） */
+#define RESET_PULSE_NS (100 * NS_PER_US) /* codec が link の reset を見る一番短い長さ（5.5.1.2） */
+#define CODEC_WAKE_NS  (521 * NS_PER_US) /* CRST# の後、codec が番地を求め終える（4.3） */
+#define FRAME_NS       20834 /* link の frame の長さ（5.3）：レジスターの変わりと答えを見る間 */
+#define STREAM_TAG     1u    /* link の上の stream の番号：制御器ごとに一つ */
 
 /* 輪の頁は一枚で、CORB、続いて RIRB。descriptor の頁は一枚で、stream が持てる数（3.6.2）。frame の輪は別の object で、
    出口が開いている間だけある。 */
@@ -165,8 +165,8 @@ struct hda {
     /* state の下 */
     struct mutex state;
     bool probed;
-    bool restore;   /* link が reset から上がった：codec に全部をもう一度言う */
-    bool responses; /* 制御器の割り込みが開き、答えのたびに一つ来る */
+    bool restore;                 /* link が reset から上がった：codec に全部をもう一度言う */
+    bool responses;               /* 制御器の割り込みが開き、答えのたびに一つ来る */
     struct hda_codec *codecs[15]; /* 番地ごと（4.3） */
     struct hda_output *outputs[15];
     struct hda_sink *sinks;
@@ -189,9 +189,9 @@ struct hda {
     bool routed, running;
     uint32_t rate, block_frames, blocks;
     unsigned frame_bytes;
-    uint64_t pos;       /* stream の始まりからの frame */
+    uint64_t pos; /* stream の始まりからの frame */
     uint32_t last_lpib;
-    uint64_t last_at;   /* last_lpib を読んだ時 */
+    uint64_t last_at; /* last_lpib を読んだ時 */
     uint64_t started_at;
     uint32_t guard;
     uint32_t fifo_errors; /* 割り込みが数える */
@@ -346,7 +346,8 @@ static void rirb_take(struct hda *h) {
         cpu_cache_flush(&h->rirb[at], sizeof h->rirb[at]);
         uint64_t entry = h->rirb[at];
         unsigned extended = (unsigned)(entry >> 32);
-        if (extended & 0x10) h->sense_due |= (uint16_t)(1u << (extended & 15));
+        if (extended & 0x10)
+            h->sense_due |= (uint16_t)(1u << (extended & 15));
         else {
             h->answer = (uint32_t)entry;
             h->answered = true;
@@ -564,7 +565,9 @@ static int hda_open(struct audio_output *output, const struct n_audio_device_for
         stream_idle(h);
         stream_route(h, o);
         __atomic_store_n(&h->open, o, __ATOMIC_RELEASE);
-        *ring = (struct audio_ring){.memory = memory, .block_frames = (uint32_t)frames, .blocks = blocks,
+        *ring = (struct audio_ring){.memory = memory,
+                                    .block_frames = (uint32_t)frames,
+                                    .blocks = blocks,
                                     .flush_bytes = cpu_features.clflush_bytes};
     }
     mutex_unlock(&h->stream);
@@ -596,11 +599,15 @@ static int hda_run(struct audio_output *output, bool run) {
     struct hda *h = o->h;
     int r = 0;
     mutex_lock(&h->stream);
-    if (!run) stream_stop(h);
-    else if (!stream_route(h, o)) r = -N_ERR_NOT_READY; /* 電源の変化の間：resume が period で知らせる */
+    if (!run)
+        stream_stop(h);
+    else if (!stream_route(h, o))
+        r = -N_ERR_NOT_READY; /* 電源の変化の間：resume が period で知らせる */
     else if (!h->running) {
-        if (!stream_start(h, o)) r = -N_ERR_IO;
-        else if (h->quiet) alarm_set(&h->tick, clock_after(block_ns(h)));
+        if (!stream_start(h, o))
+            r = -N_ERR_IO;
+        else if (h->quiet)
+            alarm_set(&h->tick, clock_after(block_ns(h)));
     }
     mutex_unlock(&h->stream);
     return r;
@@ -617,14 +624,16 @@ static void hda_status(struct audio_output *output, struct n_audio_device_status
         status->at_ns = h->last_at;
         status->guard_frames = h->guard + delay;
         if (h->quiet) alarm_set(&h->tick, clock_after(block_ns(h)));
-    } else status->at_ns = clock_now_ns();
+    } else
+        status->at_ns = clock_now_ns();
     status->generation = h->generation;
     status->running = h->running;
     status->errors = __atomic_load_n(&h->fifo_errors, __ATOMIC_RELAXED);
     mutex_unlock(&h->stream);
 }
 
-static const struct audio_output_ops hda_ops = {.open = hda_open, .close = hda_close, .run = hda_run, .status = hda_status};
+static const struct audio_output_ops hda_ops = {
+    .open = hda_open, .close = hda_close, .run = hda_run, .status = hda_status};
 
 /* ---- 出口 ---- */
 
@@ -632,8 +641,10 @@ static const struct audio_output_ops hda_ops = {.open = hda_open, .close = hda_c
 static void sink_label(struct hda_sink *o) {
     mutex_lock(&label_mutex);
     for (unsigned n = 1;; n++) {
-        if (n == 1) strlcpy(o->label, o->out->name, sizeof o->label);
-        else ksnprintf(o->label, sizeof o->label, "%s %u", o->out->name, n);
+        if (n == 1)
+            strlcpy(o->label, o->out->name, sizeof o->label);
+        else
+            ksnprintf(o->label, sizeof o->label, "%s %u", o->out->name, n);
         bool taken = false;
         for (struct hda_sink *s = every_sink; s && !taken; s = s->every) taken = s != o && !strcmp(s->label, o->label);
         if (!taken) break;
@@ -646,9 +657,10 @@ static enum n_audio_jack jack_of(const struct hda_output *out) {
 }
 
 static bool sink_add(struct hda *h, struct hda_codec *codec, struct hda_output *out) {
-    static const enum n_audio_kind kinds[] = {[HDA_OUTPUT_SPEAKER] = N_AUDIO_KIND_SPEAKER, [HDA_OUTPUT_HEADPHONE] = N_AUDIO_KIND_HEADPHONE,
-                                              [HDA_OUTPUT_LINE] = N_AUDIO_KIND_LINE, [HDA_OUTPUT_DISPLAY] = N_AUDIO_KIND_DISPLAY,
-                                              [HDA_OUTPUT_DIGITAL] = N_AUDIO_KIND_DIGITAL, [HDA_OUTPUT_OTHER] = N_AUDIO_KIND_OTHER};
+    static const enum n_audio_kind kinds[] = {
+        [HDA_OUTPUT_SPEAKER] = N_AUDIO_KIND_SPEAKER, [HDA_OUTPUT_HEADPHONE] = N_AUDIO_KIND_HEADPHONE,
+        [HDA_OUTPUT_LINE] = N_AUDIO_KIND_LINE,       [HDA_OUTPUT_DISPLAY] = N_AUDIO_KIND_DISPLAY,
+        [HDA_OUTPUT_DIGITAL] = N_AUDIO_KIND_DIGITAL, [HDA_OUTPUT_OTHER] = N_AUDIO_KIND_OTHER};
     struct hda_sink *o = kzalloc(sizeof *o);
     if (!o) return false;
     o->h = h;
@@ -663,7 +675,8 @@ static bool sink_add(struct hda *h, struct hda_codec *codec, struct hda_output *
     o->output.ops = &hda_ops;
     o->output.priv = o;
     o->output.name = o->label;
-    ksnprintf(o->key, sizeof o->key, "hda-%04x:%02x:%02x.%x-%u-%u", PCI_ADDRESS_ARGS(h->pci->address), codec->address, out->pin->nid);
+    ksnprintf(o->key, sizeof o->key, "hda-%04x:%02x:%02x.%x-%u-%u", PCI_ADDRESS_ARGS(h->pci->address), codec->address,
+              out->pin->nid);
     o->output.key = o->key;
     o->output.kind = kinds[out->kind];
     o->output.jack = jack_of(out);
@@ -679,7 +692,9 @@ static bool sink_add(struct hda *h, struct hda_codec *codec, struct hda_output *
     while (*tail) tail = &(*tail)->next;
     *tail = o;
     kprintf("audio: HD Audio codec %u pin %u: \"%s\" (%s)\n", codec->address, out->pin->nid, o->label,
-            !out->senses ? "no jack sense" : out->plugged ? "plugged in" : "nothing plugged in");
+            !out->senses   ? "no jack sense"
+            : out->plugged ? "plugged in"
+                           : "nothing plugged in");
     audio_output_add(&o->output);
     hal_offer(h->hal, N_OFFER_AUDIO, (uint32_t)codec->address << 8 | out->pin->nid, o->label);
     return true;
@@ -694,7 +709,8 @@ static void probe(struct hda *h) {
         if (!(present & (1u << at))) continue;
         h->codecs[at] = hda_codec_read(&h->link, at);
         if (!h->codecs[at]) {
-            kprintf("audio: HD Audio codec %u at %04x:%02x:%02x.%x has no audio function that can be read\n", at, PCI_ADDRESS_ARGS(h->pci->address));
+            kprintf("audio: HD Audio codec %u at %04x:%02x:%02x.%x has no audio function that can be read\n", at,
+                    PCI_ADDRESS_ARGS(h->pci->address));
             continue;
         }
         h->outputs[at] = hda_codec_outputs(h->codecs[at]);
@@ -706,8 +722,9 @@ static void probe(struct hda *h) {
             if (sink_add(h, h->codecs[at], o)) found++;
     }
     h->probed = true;
-    kprintf("audio: HD Audio at %04x:%02x:%02x.%x (%04x:%04x): codecs %x, %u outputs, %s\n", PCI_ADDRESS_ARGS(h->pci->address),
-            h->pci->vendor, h->pci->device, present, found, h->quiet ? "timed refill" : "interrupts");
+    kprintf("audio: HD Audio at %04x:%02x:%02x.%x (%04x:%04x): codecs %x, %u outputs, %s\n",
+            PCI_ADDRESS_ARGS(h->pci->address), h->pci->vendor, h->pci->device, present, found,
+            h->quiet ? "timed refill" : "interrupts");
 }
 
 /* state を持って：告げた codec の出口と、look なら自分で告げない出口。 */
@@ -747,7 +764,8 @@ static void hda_thread(void *arg) {
                 h->responses = true;
             }
             bool looks = false;
-            for (struct hda_sink *o = h->sinks; o; o = o->next) looks = looks || (o->out->senses && (h->quiet || !o->out->announces));
+            for (struct hda_sink *o = h->sinks; o; o = o->next)
+                looks = looks || (o->out->senses && (h->quiet || !o->out->announces));
             uint64_t now = clock_now_ns();
             bool look = looks && now >= h->next_look;
             if (look) h->next_look = now + POLL_NS;
@@ -795,7 +813,8 @@ static bool hda_resume(struct hal_device *d) {
     mutex_unlock(&h->stream);
     mutex_unlock(&h->state);
     if (!back) {
-        kprintf("audio: HD Audio at %04x:%02x:%02x.%x does not come out of reset after sleeping\n", PCI_ADDRESS_ARGS(h->pci->address));
+        kprintf("audio: HD Audio at %04x:%02x:%02x.%x does not come out of reset after sleeping\n",
+                PCI_ADDRESS_ARGS(h->pci->address));
         hal_failed(d, -N_ERR_IO);
     }
     signal(h);
@@ -812,7 +831,8 @@ static void hda_dma_pause(struct hal_device *d) {
     mutex_lock(&h->state);
     for (struct hda_sink *o = h->sinks; o; o = o->next) audio_output_available(&o->output, false);
     mutex_lock(&h->stream);
-    if (!link_reset(h)) kprintf("audio: HD Audio at %04x:%02x:%02x.%x does not stop\n", PCI_ADDRESS_ARGS(h->pci->address));
+    if (!link_reset(h))
+        kprintf("audio: HD Audio at %04x:%02x:%02x.%x does not stop\n", PCI_ADDRESS_ARGS(h->pci->address));
     irq_off(h);
     mutex_unlock(&h->stream);
     mutex_unlock(&h->state);
@@ -870,7 +890,8 @@ static int controller_start(struct hda *h) {
         return -N_ERR_NO_MEMORY;
     }
     if (!rings_start(h)) {
-        kprintf("audio: HD Audio at %04x:%02x:%02x.%x: its command ring does not come out of reset\n", PCI_ADDRESS_ARGS(address));
+        kprintf("audio: HD Audio at %04x:%02x:%02x.%x: its command ring does not come out of reset\n",
+                PCI_ADDRESS_ARGS(address));
         return -N_ERR_IO;
     }
     irq_on(h);

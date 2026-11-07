@@ -27,29 +27,29 @@
 #define NAM_EXT_CTRL   0x2A
 #define NAM_FRONT_RATE 0x2C
 /* bus master の登録（NABM、BAR1）：PCM の出力の箱、全体の制御 */
-#define PO_BDBAR  0x10
-#define PO_CIV    0x14
-#define PO_LVI    0x15
-#define PO_SR     0x16
-#define PO_PICB   0x18 /* 今の記述子に残る 16 bit の標本 */
-#define PO_CR     0x1B
-#define GLOB_CNT  0x2C
-#define GLOB_STA  0x30
+#define PO_BDBAR 0x10
+#define PO_CIV   0x14
+#define PO_LVI   0x15
+#define PO_SR    0x16
+#define PO_PICB  0x18 /* 今の記述子に残る 16 bit の標本 */
+#define PO_CR    0x1B
+#define GLOB_CNT 0x2C
+#define GLOB_STA 0x30
 
-#define CR_RUN     0x01 /* RPBM（2.2.7） */
-#define CR_RESET   0x02 /* RR（2.2.7）：RPBM が 0 の時だけ立てる */
-#define CR_IOCE    0x10 /* IOC を頼む記述子の終わりに割り込む（2.2.7） */
-#define SR_HALTED  0x01 /* DCH（2.2.4）：止めの bit が 0 で DMA の機関が休んでいる */
-#define SR_CLEAR   0x1C /* 1 を書いて消す（2.2.4）：最後の有効な緩衝、終わり、FIFO の誤り */
-#define BD_IOC     0x8000 /* 記述子の旗：終わりに割り込む */
-#define GLOB_COLD_RESET_OFF 0x2 /* AC '97 Cold Reset#（2.2.8）：1 で cold reset の外 */
-#define GLOB_S0_READY 0x100     /* ACZ_SDIN0 Codec Ready（2.2.9） */
+#define CR_RUN              0x01 /* RPBM（2.2.7） */
+#define CR_RESET            0x02 /* RR（2.2.7）：RPBM が 0 の時だけ立てる */
+#define CR_IOCE             0x10 /* IOC を頼む記述子の終わりに割り込む（2.2.7） */
+#define SR_HALTED           0x01 /* DCH（2.2.4）：止めの bit が 0 で DMA の機関が休んでいる */
+#define SR_CLEAR            0x1C /* 1 を書いて消す（2.2.4）：最後の有効な緩衝、終わり、FIFO の誤り */
+#define BD_IOC              0x8000 /* 記述子の旗：終わりに割り込む */
+#define GLOB_COLD_RESET_OFF 0x2    /* AC '97 Cold Reset#（2.2.8）：1 で cold reset の外 */
+#define GLOB_S0_READY       0x100  /* ACZ_SDIN0 Codec Ready（2.2.9） */
 
-#define ADDRESS_BITS 32  /* 機関が届く番地の幅：BDBAR と記述子の番地は 32 bit（2.2.1） */
-#define NBUF       32    /* 輪の記述子の数 */
-#define RATE       48000
-#define FRAME      4     /* バイト：16 bit の標本二つ */
-#define BUF_MOST   32766 /* 記述子の frame の上限：長さは標本の 16 bit で、最後は偶数 */
+#define ADDRESS_BITS 32 /* 機関が届く番地の幅：BDBAR と記述子の番地は 32 bit（2.2.1） */
+#define NBUF         32 /* 輪の記述子の数 */
+#define RATE         48000
+#define FRAME        4     /* バイト：16 bit の標本二つ */
+#define BUF_MOST     32766 /* 記述子の frame の上限：長さは標本の 16 bit で、最後は偶数 */
 /* codec の ready を待つ限り。2.2.9 は bus master を始める前に見よと言い、時の限りを言わない。 */
 #define READY_NS (100 * NS_PER_MS)
 /* 止めの bit を 0 にしてから DCH を待つ限り。機関は今の取り込みを終えて休む（2.2.4）。 */
@@ -72,7 +72,7 @@ struct ac97 {
     struct audio_output output; /* 最初：音の層が返してくる */
     struct mutex ac97_mutex;
     struct spinlock engine;
-    bool ready;   /* codec と PCM の出力の箱が整っている（suspend から resume までは false：登録に触らない） */
+    bool ready; /* codec と PCM の出力の箱が整っている（suspend から resume までは false：登録に触らない） */
     bool running; /* 機関が鳴らしている */
     uint32_t generation;
     uint16_t nam, nabm;
@@ -157,8 +157,10 @@ static int engine_stop(struct ac97 *c) {
     if (!c->has_irq) alarm_cancel(&c->refill);
     uint64_t f = spin_lock(&c->engine);
     bool ready = c->ready;
-    if (ready) engine_pause(c);
-    else c->running = false;
+    if (ready)
+        engine_pause(c);
+    else
+        c->running = false;
     spin_unlock(&c->engine, f);
     if (!ready) return 0;
     return engine_halted(c) && box_reset(c) ? 0 : -N_ERR_IO;
@@ -295,7 +297,8 @@ static bool codec_start(struct ac97 *c) {
     return true;
 }
 
-static const struct audio_output_ops ac97_ops = {.open = ac97_open, .close = ac97_close, .run = ac97_run, .status = ac97_status};
+static const struct audio_output_ops ac97_ops = {
+    .open = ac97_open, .close = ac97_close, .run = ac97_run, .status = ac97_status};
 
 /* 混合器の登録はポートの BAR 0、bus master のものはポートの BAR 1。 */
 static int ac97_attach(struct hal_device *d) {
@@ -320,7 +323,8 @@ static int ac97_attach(struct hal_device *d) {
     }
     c->bdl_bus = (uint32_t)bus;
     alarm_init(&c->refill, ac97_refill);
-    c->has_irq = hal_irq_enable(d, &(struct irq_spec){.name = "AC'97", .handler = ac97_irq, .context = c}, 1, NULL) == 1;
+    c->has_irq =
+        hal_irq_enable(d, &(struct irq_spec){.name = "AC'97", .handler = ac97_irq, .context = c}, 1, NULL) == 1;
     mutex_lock(&c->ac97_mutex);
     bool started = codec_start(c);
     mutex_unlock(&c->ac97_mutex);
@@ -385,9 +389,10 @@ static bool ac97_resume(struct hal_device *d) {
     return false;
 }
 
-static const struct n_hal_rule ac97_rules[] = {N_PCI_ID(0x8086, 0x2415), N_PCI_ID(0x8086, 0x2425), N_PCI_ID(0x8086, 0x2445),
-                                               N_PCI_ID(0x8086, 0x2485), N_PCI_ID(0x8086, 0x24C5), N_PCI_ID(0x8086, 0x24D5),
-                                               N_PCI_ID(0x8086, 0x266E), N_PCI_ID(0x8086, 0x27DE), N_PCI_ID(0x8086, 0x7195)};
+static const struct n_hal_rule ac97_rules[] = {
+    N_PCI_ID(0x8086, 0x2415), N_PCI_ID(0x8086, 0x2425), N_PCI_ID(0x8086, 0x2445),
+    N_PCI_ID(0x8086, 0x2485), N_PCI_ID(0x8086, 0x24C5), N_PCI_ID(0x8086, 0x24D5),
+    N_PCI_ID(0x8086, 0x266E), N_PCI_ID(0x8086, 0x27DE), N_PCI_ID(0x8086, 0x7195)};
 const struct hal_driver ac97_driver = {
     .name = "ac97",
     .rules = ac97_rules,

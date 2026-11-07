@@ -12,18 +12,18 @@
 #include "dev/pci.h"
 #include "mm/heap.h"
 
-#define NRX   32
-#define NTX   16
-#define BUFSZ 1536
-#define OWN   0x80000000u
+#define NRX    32
+#define NTX    16
+#define BUFSZ  1536
+#define OWN    0x80000000u
 #define IO_BAR 0
 
-#define CSR0_SWR       1u          /* Software Reset（3.2.2.1、4.3.1） */
-#define CSR0_BUS_MODE  0x4800u     /* 8 longword の cache の揃え、burst の長さ 8 */
-#define CSR5_STATUS    0x1FFFFu    /* 1 を書いて消す状態の bit（表 3-70） */
+#define CSR0_SWR       1u            /* Software Reset（3.2.2.1、4.3.1） */
+#define CSR0_BUS_MODE  0x4800u       /* 8 longword の cache の揃え、burst の長さ 8 */
+#define CSR5_STATUS    0x1FFFFu      /* 1 を書いて消す状態の bit（表 3-70） */
 #define CSR5_PROCESSES (0x3Fu << 17) /* RS（19:17）と TS（22:20）。000 が止まっている（表 3-68、3-69） */
-#define CSR6_SR        (1u << 1)   /* Start/Stop Receive（3.2.2.9） */
-#define CSR6_ST        (1u << 13)  /* Start/Stop Transmission Command（3.2.2.9） */
+#define CSR6_SR        (1u << 1)     /* Start/Stop Receive（3.2.2.9） */
+#define CSR6_ST        (1u << 13)    /* Start/Stop Transmission Command（3.2.2.9） */
 /* 止めの命令から止まるまで待つ限り。過程は今のフレームを終えてから止まる（3.2.2.9 の SR、ST）：10 Mb/s で最大の
    フレームと、半二重の link の衝突の後の待ちが入る長さ。 */
 #define STOP_NS NS_PER_S
@@ -125,12 +125,16 @@ static enum irq_result tulip_irq(void *context) {
 
 /* 受信は割り込みの処理のもの（net_rx）なので、網の層が poll するものは無い。 */
 static size_t tulip_poll(struct netif *self, unsigned queue, size_t budget, net_input_fn input) {
-    (void)self; (void)queue; (void)budget; (void)input;
+    (void)self;
+    (void)queue;
+    (void)budget;
+    (void)input;
     return 0;
 }
 
 static bool tulip_rx_pending(struct netif *self, unsigned queue) {
-    (void)self; (void)queue;
+    (void)self;
+    (void)queue;
     return false;
 }
 
@@ -167,9 +171,14 @@ static unsigned tulip_transmit(struct netif *self, unsigned queue, const struct 
     mutex_lock(&c->tulip_mutex);
     unsigned taken = 0;
     switch (c->state) {
-    case TULIP_STOPPED: break;
-    case TULIP_RUNNING: taken = tx_post(c, frames, count); break;
-    case TULIP_BROKEN: taken = count; break;
+    case TULIP_STOPPED:
+        break;
+    case TULIP_RUNNING:
+        taken = tx_post(c, frames, count);
+        break;
+    case TULIP_BROKEN:
+        taken = count;
+        break;
     }
     mutex_unlock(&c->tulip_mutex);
     return taken;
