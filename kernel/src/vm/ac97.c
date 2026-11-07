@@ -1,10 +1,10 @@
-/* Intel AC'97 audio (ICH and compatibles; QEMU's -device AC97, VirtualBox's default): one output of
-   the sound layer (dev/audio.h), at 48 kHz stereo. The PCM-out DMA engine walks a ring of its 32 buffer
-   descriptors, of the length the open asks for, from the one playing (CIV) up to the last valid one (LVI). The ring is
-   shared with the service that opened the output, which writes it. To walk it without end, LVI stays
-   one behind CIV: every descriptor asks for an interrupt once the engine has played it (IOC), which
-   moves LVI on and tells the service to look; a card whose interrupt line is not known takes an
-   alarm at the end of each buffer instead. */
+/* Intel AC'97 の音（ICH とその互換。QEMU の -device AC97、VirtualBox の既定）：音の層（dev/audio.h）の出口の一つ、
+   48 kHz の stereo。PCM の出力の DMA の機関は、自分の 32 個の緩衝の記述子の輪を、開くときに頼まれた長さで、鳴らして
+   いるもの（CIV）から最後の有効なもの（LVI）まで辿る。輪は出口を開いたサービスと分け、サービスが書く。終わり無く
+   辿らせるため、LVI は CIV の一つ後ろに置く：どの記述子も機関が鳴らし終えると割り込みを頼み（IOC）、それが LVI を
+   進めてサービスに見よと言う。割り込みの線の分からない板は、代わりに各緩衝の終わりに alarm を受ける。
+   登録と bit は Intel の「I/O Controller Hub 7 (ICH7) High Definition Audio / AC'97 Programmer's Reference Manual」の
+   2.2（AC '97 Audio I/O Space）のもの。 */
 #include "kernel.h"
 #include "dev/audio.h"
 #include "dev/pci.h"
@@ -17,64 +17,71 @@
 #include "sys/alarm.h"
 #include "sys/clock.h"
 #include "sys/object.h"
+#include "sys/wait.h"
 
-/* mixer registers (NAM, BAR0) */
+/* 混合器の登録（NAM、BAR0） */
 #define NAM_RESET      0x00
 #define NAM_MASTER     0x02
 #define NAM_PCM_OUT    0x18
 #define NAM_EXT_ID     0x28
 #define NAM_EXT_CTRL   0x2A
 #define NAM_FRONT_RATE 0x2C
-/* bus master registers (NABM, BAR1): PCM out box, global control */
+/* bus master の登録（NABM、BAR1）：PCM の出力の箱、全体の制御 */
 #define PO_BDBAR  0x10
 #define PO_CIV    0x14
 #define PO_LVI    0x15
 #define PO_SR     0x16
-#define PO_PICB   0x18 /* remaining 16-bit samples in current descriptor */
+#define PO_PICB   0x18 /* 今の記述子に残る 16 bit の標本 */
 #define PO_CR     0x1B
 #define GLOB_CNT  0x2C
 #define GLOB_STA  0x30
 
-#define CR_RUN     0x01
-#define CR_RESET   0x02
-#define CR_LVBIE   0x04 /* interrupt when the last valid buffer has been played */
-#define CR_IOCE    0x10 /* interrupt on the completion of a descriptor that asks for it */
-#define SR_HALTED  0x01
-#define SR_CELV    0x02 /* final descriptor has been processed, not merely CIV == LVI */
-#define SR_CLEAR   0x1C /* write 1 to clear: last valid buffer, completion, FIFO error */
-#define BD_IOC     0x8000 /* a descriptor's flags: interrupt on its completion */
+#define CR_RUN     0x01 /* RPBM（2.2.7） */
+#define CR_RESET   0x02 /* RR（2.2.7）：RPBM が 0 の時だけ立てる */
+#define CR_IOCE    0x10 /* IOC を頼む記述子の終わりに割り込む（2.2.7） */
+#define SR_HALTED  0x01 /* DCH（2.2.4）：止めの bit が 0 で DMA の機関が休んでいる */
+#define SR_CLEAR   0x1C /* 1 を書いて消す（2.2.4）：最後の有効な緩衝、終わり、FIFO の誤り */
+#define BD_IOC     0x8000 /* 記述子の旗：終わりに割り込む */
+#define GLOB_COLD_RESET_OFF 0x2 /* AC '97 Cold Reset#（2.2.8）：1 で cold reset の外 */
+#define GLOB_S0_READY 0x100     /* ACZ_SDIN0 Codec Ready（2.2.9） */
 
-#define NBUF       32    /* the descriptors of its list */
+#define NBUF       32    /* 輪の記述子の数 */
 #define RATE       48000
-#define FRAME      4     /* bytes: two 16-bit samples */
-#define BUF_MOST   32766 /* frames of a descriptor: its length is 16 bits of samples, of which the last is even */
+#define FRAME      4     /* バイト：16 bit の標本二つ */
+#define BUF_MOST   32766 /* 記述子の frame の上限：長さは標本の 16 bit で、最後は偶数 */
+/* codec の ready を待つ限り。2.2.9 は bus master を始める前に見よと言い、時の限りを言わない。 */
+#define READY_NS (100 * NS_PER_MS)
+/* 止めの bit を 0 にしてから DCH を待つ限り。機関は今の取り込みを終えて休む（2.2.4）。 */
+#define HALT_NS (10 * NS_PER_MS)
 
 struct bd {
     uint32_t addr;
-    uint16_t samples; /* 16-bit samples, not frames */
+    uint16_t samples; /* frame でなく 16 bit の標本 */
     uint16_t flags;
 } PACKED;
 
-/* One codec. The fields below engine are the sound layer's calls', which come one at a time
-   (audio_output_ops). A power change comes between any two steps of them, on a CPU that may not
-   wait for them: it changes hw_ready and power_gen and stops the engine under `engine`, and a call
-   starts the engine only under it, having seen hw_ready and its generation there. */
+/* 一つの codec。
+   錠の順：音の層の mutex → ac97_mutex → engine。
+   ac97_mutex：音の層の呼出し（open、close、run、status。層が一つずつ呼ぶ）と、suspend・resume を一つずつにする。
+   generation、輪の大きさ、played、last_civ、last_at、ring_object はこの下。
+   engine：割り込みの処理と alarm（どちらもどの CPU でも）と、呼出しの間で、LVI と CR の書込みと、ready と running。
+   ready と running は両方の錠の下で書き、どちらかの下で読む。葉。 */
 struct ac97 {
-    struct audio_output output; /* first: the sound layer hands it back */
+    struct audio_output output; /* 最初：音の層が返してくる */
+    struct mutex ac97_mutex;
     struct spinlock engine;
-    bool hw_ready; /* the codec and the PCM-out box are set up (not during sleep) */
-    uint64_t power_gen, seen_gen;
+    bool ready;   /* codec と PCM の出力の箱が整っている（suspend から resume までは false：登録に触らない） */
+    bool running; /* 機関が鳴らしている */
     uint32_t generation;
     uint16_t nam, nabm;
     struct bd *bdl_view;
     uint32_t bdl_bus;
-    bool running;
-    bool has_irq;        /* its interrupt is routed: without one an alarm refills at the end of each buffer */
-    struct alarm refill; /* the end of the playing buffer */
+    bool has_irq;        /* 割り込みの線がある。無ければ alarm が各緩衝の終わりに埋め直す */
+    struct alarm refill; /* 鳴っている緩衝の終わり */
     struct hal_device *hal;
-    uint32_t buf_frames; /* of what is open */
+    uint32_t buf_frames; /* 開いたものの */
     uint64_t buf_ns;
-    uint64_t played; /* the frames of the buffers finished since the engine started */
+    uint64_t played; /* 機関が始めてから終えた緩衝の frame */
     int last_civ;
     uint64_t last_at;
     struct object *ring_object;
@@ -82,22 +89,27 @@ struct ac97 {
 
 static struct ac97 *ac97_of(struct audio_output *output) { return (struct ac97 *)output; }
 
-/* engine held: LVI one behind what plays, so the engine never comes to it. */
+/* engine の下：LVI を鳴っているものの一つ後ろに置き、機関がそこへ着かないようにする。 */
 static void ring_keep(struct ac97 *c) {
     outb(c->nabm + PO_LVI, (uint8_t)((inb(c->nabm + PO_CIV) + NBUF - 1) & (NBUF - 1)));
 }
 
-/* The engine's interrupt: a buffer played. Its status bits are answered here, so what the engine does
-   after this interrupts again. The line may be another device's too: its interrupt finds none of this
-   engine's status bits. */
+/* 機関の割り込み：緩衝が鳴り終えた。状態の bit にここで答えるので、この後の機関の動きはまた割り込む。線はほかの装置の
+   ものでもありうる：その割り込みはこの機関の状態の bit を見つけない。 */
 static enum irq_result ac97_irq(void *context) {
     struct ac97 *c = context;
+    spin_take(&c->engine);
+    if (!c->ready) { /* 止めた機関は割り込まない：共有の線のほかの装置のもの */
+        spin_give(&c->engine);
+        return IRQ_NONE;
+    }
     uint16_t status = inw(c->nabm + PO_SR) & SR_CLEAR;
+    if (status) {
+        outw(c->nabm + PO_SR, status);
+        if (c->running) ring_keep(c);
+    }
+    spin_give(&c->engine);
     if (!status) return IRQ_NONE;
-    outw(c->nabm + PO_SR, status);
-    uint64_t f = spin_lock(&c->engine);
-    if (c->hw_ready && c->running) ring_keep(c);
-    spin_unlock(&c->engine, f);
     audio_output_period(&c->output);
     return IRQ_HANDLED;
 }
@@ -106,80 +118,97 @@ static void ac97_refill(struct alarm *a, struct regs *r) {
     (void)r;
     struct ac97 *c = (struct ac97 *)((char *)a - __builtin_offsetof(struct ac97, refill));
     uint64_t f = spin_lock(&c->engine);
-    bool on = c->hw_ready && c->running;
+    bool on = c->ready && c->running;
     if (on) ring_keep(c);
     spin_unlock(&c->engine, f);
     if (on) alarm_set(&c->refill, clock_after(c->buf_ns));
     audio_output_period(&c->output);
 }
 
-/* A new generation: what the engine held is gone with the reset. */
-static void engine_sync(struct ac97 *c) {
-    uint64_t f = spin_lock(&c->engine);
-    uint64_t gen = c->power_gen;
-    spin_unlock(&c->engine, f);
-    if (gen == c->seen_gen) return;
-    c->seen_gen = gen;
-    c->generation++;
+/* engine の下：機関を止める（RPBM を 0、割り込みの許しも 0）。立っていた状態に答え、線を下ろす。 */
+static void engine_pause(struct ac97 *c) {
     c->running = false;
+    outb(c->nabm + PO_CR, 0);
+    outw(c->nabm + PO_SR, SR_CLEAR);
+}
+
+/* ac97_mutex の下、engine_pause の後：DMA の機関が休んだと DCH が言うまで待つ（2.2.4）。眠る。 */
+static bool engine_halted(struct ac97 *c) {
+    for (uint64_t until = clock_after(HALT_NS); !(inw(c->nabm + PO_SR) & SR_HALTED) && clock_now_ns() < until;)
+        sleep_until(clock_after(NS_PER_MS / 10));
+    return inw(c->nabm + PO_SR) & SR_HALTED;
+}
+
+/* ac97_mutex の下、止まった機関で：PCM の出力の箱の bus master の登録を初めに戻し（RR、2.2.7）、記述子を渡し直す。 */
+static bool box_reset(struct ac97 *c) {
+    outb(c->nabm + PO_CR, CR_RESET);
+    for (uint64_t until = clock_after(HALT_NS); (inb(c->nabm + PO_CR) & CR_RESET) && clock_now_ns() < until;)
+        sleep_until(clock_after(NS_PER_MS / 10));
+    bool reset = !(inb(c->nabm + PO_CR) & CR_RESET);
+    outl(c->nabm + PO_BDBAR, c->bdl_bus);
+    return reset;
+}
+
+/* ac97_mutex の下：鳴っていれば止め、箱を初めに戻す。 */
+static int engine_stop(struct ac97 *c) {
+    if (!c->has_irq) alarm_cancel(&c->refill);
+    uint64_t f = spin_lock(&c->engine);
+    bool ready = c->ready;
+    if (ready) engine_pause(c);
+    else c->running = false;
+    spin_unlock(&c->engine, f);
+    if (!ready) return 0;
+    return engine_halted(c) && box_reset(c) ? 0 : -N_ERR_IO;
 }
 
 static void ac97_status(struct audio_output *output, struct n_audio_device_status *status) {
     struct ac97 *c = ac97_of(output);
-    engine_sync(c);
+    mutex_lock(&c->ac97_mutex);
     status->generation = c->generation;
     status->running = c->running;
     status->at_ns = clock_now_ns();
-    if (!c->running) return;
+    if (!c->running) {
+        mutex_unlock(&c->ac97_mutex);
+        return;
+    }
+    /* PICB と CIV は別の登録：後に読んだ CIV が同じなら PICB はその CIV のもの。読む間に記述子を一つ越えるのは普通：
+       新しい CIV でもう一度。 */
     uint64_t f = spin_lock(&c->engine);
-    bool ready = c->hw_ready;
-    int civ = c->last_civ;
-    unsigned remaining = c->buf_frames * 2;
+    int confirmed = inb(c->nabm + PO_CIV) & (NBUF - 1);
+    int civ = confirmed;
+    unsigned remaining = 0;
     uint64_t at = status->at_ns;
-    if (ready) {
-        /* PICB and CIV are separate registers: PICB is CIV's when CIV reads the same after it. One
-           descriptor crossing between the reads is normal: once more against the new CIV. */
-        int confirmed = inb(c->nabm + PO_CIV) & (NBUF - 1);
-        for (int tries = 0; tries < 2; tries++) {
-            civ = confirmed;
-            remaining = inw(c->nabm + PO_PICB);
-            at = clock_now_ns();
-            confirmed = inb(c->nabm + PO_CIV) & (NBUF - 1);
-            if (confirmed == civ) break;
-        }
+    for (int tries = 0; tries < 2; tries++) {
+        civ = confirmed;
+        remaining = inw(c->nabm + PO_PICB);
+        at = clock_now_ns();
+        confirmed = inb(c->nabm + PO_CIV) & (NBUF - 1);
+        if (confirmed == civ) break;
     }
     spin_unlock(&c->engine, f);
     uint64_t moved = (uint64_t)((civ + NBUF - c->last_civ) & (NBUF - 1));
     uint64_t late = (at - c->last_at) / c->buf_ns;
-    if (late > moved + NBUF / 2) moved += (late - moved + NBUF / 2) / NBUF * NBUF; /* whole turns while no one looked */
+    if (late > moved + NBUF / 2) moved += (late - moved + NBUF / 2) / NBUF * NBUF; /* 誰も見ない間の輪の周回 */
     c->played += moved * c->buf_frames;
     c->last_civ = civ;
     c->last_at = at;
     if (remaining > c->buf_frames * 2) remaining = c->buf_frames * 2;
     status->position = c->played + c->buf_frames - remaining / 2;
     status->at_ns = at;
-    status->guard_frames = remaining / 2 + c->buf_frames; /* the engine has fetched the descriptor after it */
-}
-
-/* The PCM-out box reset, polling the clock, and its descriptors given again. */
-static bool box_reset(struct ac97 *c) {
-    outb(c->nabm + PO_CR, CR_RESET);
-    uint64_t until = clock_after(100 * NS_PER_MS);
-    while ((inb(c->nabm + PO_CR) & CR_RESET) && clock_now_ns() < until) pause();
-    bool reset = !(inb(c->nabm + PO_CR) & CR_RESET);
-    outl(c->nabm + PO_BDBAR, c->bdl_bus);
-    return reset;
+    status->guard_frames = remaining / 2 + c->buf_frames; /* 機関はその後の記述子を取り込んである */
+    mutex_unlock(&c->ac97_mutex);
 }
 
 static int ac97_open(struct audio_output *output, const struct n_audio_device_format *format, struct audio_ring *ring) {
     struct ac97 *c = ac97_of(output);
-    (void)format; /* the one it declares */
+    (void)format; /* 申告した一つ */
     uint32_t frames = MAX(MIN(ring->block_frames, BUF_MOST), 2u);
     uint64_t phys;
     size_t bytes = (size_t)frames * FRAME * NBUF;
     struct object *memory = shared_kernel_contig(ALIGN_UP(bytes, PAGE_SIZE) / PAGE_SIZE, 32, &phys);
     if (!memory) return -N_ERR_NO_MEMORY;
     uint64_t bus = hal_dma_address(c->hal, phys);
+    mutex_lock(&c->ac97_mutex);
     for (uint32_t i = 0; i < NBUF; i++) {
         c->bdl_view[i].addr = (uint32_t)(bus + (uint64_t)i * frames * FRAME);
         c->bdl_view[i].samples = (uint16_t)(frames * 2);
@@ -188,70 +217,76 @@ static int ac97_open(struct audio_output *output, const struct n_audio_device_fo
     c->buf_frames = frames;
     c->buf_ns = frames * NS_PER_S / RATE;
     c->ring_object = memory;
+    mutex_unlock(&c->ac97_mutex);
     *ring = (struct audio_ring){.memory = memory, .block_frames = frames, .blocks = NBUF};
+    return 0;
+}
+
+/* 止まった機関から始める：最初の記述子から鳴らし、最後の記述子は機関が進むまで有効。眠りの間（ready が false）は
+   始められない：resume の周期の知らせが、また見る時を言う。 */
+static int engine_start(struct ac97 *c) {
+    uint64_t f = spin_lock(&c->engine);
+    bool ready = c->ready;
+    spin_unlock(&c->engine, f);
+    if (!ready) return -N_ERR_NOT_READY;
+    if (!box_reset(c)) return -N_ERR_IO;
+    c->played = 0;
+    c->last_civ = 0;
+    c->last_at = clock_now_ns();
+    f = spin_lock(&c->engine);
+    outb(c->nabm + PO_LVI, NBUF - 1);
+    outb(c->nabm + PO_CR, c->has_irq ? CR_RUN | CR_IOCE : CR_RUN);
+    c->running = true;
+    spin_unlock(&c->engine, f);
+    if (!c->has_irq) alarm_set(&c->refill, clock_after(c->buf_ns));
     return 0;
 }
 
 static int ac97_run(struct audio_output *output, bool run) {
     struct ac97 *c = ac97_of(output);
-    engine_sync(c);
-    if (run == c->running) return 0;
-    if (!c->has_irq) alarm_cancel(&c->refill);
-    uint64_t f = spin_lock(&c->engine);
-    bool ready = c->hw_ready;
-    uint64_t gen = c->power_gen;
-    spin_unlock(&c->engine, f);
-    if (!ready) return run ? -N_ERR_NOT_READY : 0;
-    bool reset = box_reset(c);
-    if (!run) {
-        c->running = false;
-        return reset ? 0 : -N_ERR_IO;
-    }
-    /* the engine starts at the first descriptor, and the last one is valid until it moves on */
-    c->played = 0;
-    c->last_civ = 0;
-    c->last_at = clock_now_ns();
-    f = spin_lock(&c->engine);
-    ready = c->hw_ready && gen == c->power_gen;
-    if (ready) {
-        outb(c->nabm + PO_LVI, NBUF - 1);
-        outb(c->nabm + PO_CR, c->has_irq ? CR_RUN | CR_IOCE : CR_RUN);
-    }
-    spin_unlock(&c->engine, f);
-    if (!ready) return -N_ERR_NOT_READY;
-    c->running = true;
-    if (!c->has_irq) alarm_set(&c->refill, clock_after(c->buf_ns));
-    return 0;
+    mutex_lock(&c->ac97_mutex);
+    int r = 0;
+    if (run != c->running) r = run ? engine_start(c) : engine_stop(c);
+    mutex_unlock(&c->ac97_mutex);
+    return r;
 }
 
-/* Another output plays: the engine stops where it is. */
+/* ほかの出口が鳴らす：機関は居る所で止まる。 */
 static void ac97_close(struct audio_output *output) {
     struct ac97 *c = ac97_of(output);
-    ac97_run(output, false);
+    mutex_lock(&c->ac97_mutex);
+    engine_stop(c);
     object_unref(c->ring_object);
     c->ring_object = NULL;
+    mutex_unlock(&c->ac97_mutex);
 }
 
-/* The codec out of cold reset at 0 dB and 48 kHz, the PCM-out box reset: at boot and after a sleep,
-   which powered the codec off. It polls the clock: nothing may sleep here. */
-static bool hw_init(struct ac97 *c) {
-    outl(c->nabm + GLOB_CNT, 0x2); /* out of cold reset, interrupts off */
-    uint64_t until = clock_after(100 * NS_PER_MS);
-    while (!(inl(c->nabm + GLOB_STA) & 0x100) && clock_now_ns() < until) pause(); /* codec ready */
-    bool codec = inl(c->nabm + GLOB_STA) & 0x100;
+/* codec を cold reset の外へ出して ready を待ち（2.2.8、2.2.9）、0 dB と 48 kHz にし、PCM の出力の箱を初めに戻す。
+   電源を失った制御器では Cold Reset# が 0 に戻っているのでここで codec が初めから立ち上がる。電源を保った制御器では
+   Cold Reset# は 1 のまま（2.2.8）で、混合器の値を書き直すだけになる。attach と resume が ac97_mutex の下で呼ぶ。眠る。 */
+static bool codec_start(struct ac97 *c) {
+    outl(c->nabm + GLOB_CNT, GLOB_COLD_RESET_OFF); /* 割り込みの許しは 0 */
+    for (uint64_t until = clock_after(READY_NS); !(inl(c->nabm + GLOB_STA) & GLOB_S0_READY) && clock_now_ns() < until;)
+        sleep_until(clock_after(NS_PER_MS));
+    if (!(inl(c->nabm + GLOB_STA) & GLOB_S0_READY)) return false;
     outw(c->nam + NAM_RESET, 1);
-    outw(c->nam + NAM_MASTER, 0x0000);  /* 0 dB, not muted */
+    outw(c->nam + NAM_MASTER, 0x0000);  /* 0 dB、消音でない */
     outw(c->nam + NAM_PCM_OUT, 0x0808); /* 0 dB */
-    if (inw(c->nam + NAM_EXT_ID) & 1) { /* variable rate: make sure it is 48 kHz */
+    if (inw(c->nam + NAM_EXT_ID) & 1) { /* 可変の rate：48 kHz にする */
         outw(c->nam + NAM_EXT_CTRL, inw(c->nam + NAM_EXT_CTRL) | 1);
         outw(c->nam + NAM_FRONT_RATE, RATE);
     }
-    return box_reset(c) && codec;
+    outb(c->nabm + PO_CR, 0); /* RR は RPBM が 0 の時だけ（2.2.7） */
+    if (!engine_halted(c) || !box_reset(c)) return false;
+    uint64_t f = spin_lock(&c->engine);
+    c->ready = true;
+    spin_unlock(&c->engine, f);
+    return true;
 }
 
 static const struct audio_output_ops ac97_ops = {.open = ac97_open, .close = ac97_close, .run = ac97_run, .status = ac97_status};
 
-/* The mixer registers are the port BAR 0, the bus master's the port BAR 1. */
+/* 混合器の登録はポートの BAR 0、bus master のものはポートの BAR 1。 */
 static int ac97_attach(struct hal_device *d) {
     struct pci_device *pci = pci_device_of(d);
     uint16_t nam = hal_port(d, 0), nabm = hal_port(d, 1);
@@ -263,21 +298,26 @@ static int ac97_attach(struct hal_device *d) {
     c->nabm = nabm;
     d->driver_data = c;
     hal_enable(d, HAL_ENABLE_PORTS | HAL_ENABLE_DMA);
+    int r = -N_ERR_NO_MEMORY;
 
-    /* the descriptors, below 4 GiB for the 32-bit addresses */
+    /* 記述子は 32 bit の番地のため 4 GiB より下に */
     uint64_t bus;
     c->bdl_view = hal_dma_alloc(d, PAGE_SIZE, 32, &bus);
     if (!c->bdl_view) {
         kprintf("audio: AC'97 found, but no memory below 4 GiB for its descriptors\n");
-        d->driver_data = NULL;
-        kfree(c);
-        return -N_ERR_NO_MEMORY;
+        goto fail;
     }
     c->bdl_bus = (uint32_t)bus;
-    hw_init(c);
-    c->hw_ready = true;
     alarm_init(&c->refill, ac97_refill);
     c->has_irq = hal_irq_enable(d, &(struct irq_spec){.name = "AC'97", .handler = ac97_irq, .context = c}, 1, NULL) == 1;
+    mutex_lock(&c->ac97_mutex);
+    bool started = codec_start(c);
+    mutex_unlock(&c->ac97_mutex);
+    if (!started) {
+        kprintf("audio: AC'97 (%04x): the codec is not ready\n", pci->device);
+        r = -N_ERR_IO;
+        goto fail;
+    }
     c->output.ops = &ac97_ops;
     static const uint32_t rates[] = {RATE};
     static const struct n_audio_size sizes[] = {{16, FRAME / 2}};
@@ -295,6 +335,43 @@ static int ac97_attach(struct hal_device *d) {
     kprintf("audio: AC'97 (%04x) at ports %#x/%#x, %s, 48 kHz stereo\n", pci->device, nam, nabm,
             c->has_irq ? "interrupt" : "no interrupt (timed refill)");
     return 0;
+fail:
+    hal_irq_disable(d); /* 処理の記憶が去る前に */
+    d->driver_data = NULL;
+    kfree(c);
+    return r;
+}
+
+/* 機関を止め（RPBM を 0、2.2.7）、DMA が休むのを DCH で見る（2.2.4）。輪の位置は失われる：status は新しい世代で
+   止まったと言い（dev/audio.h）、サービスは resume の後に始め直す。三つの目標で同じ。 */
+static bool ac97_suspend(struct hal_device *d, enum hal_power_target target) {
+    (void)target;
+    struct ac97 *c = d->driver_data;
+    mutex_lock(&c->ac97_mutex);
+    if (!c->has_irq) alarm_cancel(&c->refill);
+    uint64_t f = spin_lock(&c->engine);
+    engine_pause(c);
+    c->ready = false;
+    spin_unlock(&c->engine, f);
+    bool halted = engine_halted(c);
+    c->generation++;
+    mutex_unlock(&c->ac97_mutex);
+    audio_output_period(&c->output);
+    if (!halted) kprintf("audio: AC'97 at %s did not halt\n", d->location);
+    return halted;
+}
+
+/* 電源を失った制御器も保った制御器も codec_start で整える。サービスに見させ、始め直させる。 */
+static bool ac97_resume(struct hal_device *d) {
+    struct ac97 *c = d->driver_data;
+    mutex_lock(&c->ac97_mutex);
+    bool started = codec_start(c);
+    mutex_unlock(&c->ac97_mutex);
+    audio_output_period(&c->output);
+    if (started) return true;
+    kprintf("audio: AC'97 at %s: the codec is not ready\n", d->location);
+    hal_failed(d, -N_ERR_IO);
+    return false;
 }
 
 static const struct n_hal_rule ac97_rules[] = {N_PCI_ID(0x8086, 0x2415), N_PCI_ID(0x8086, 0x2425), N_PCI_ID(0x8086, 0x2445),
@@ -305,4 +382,7 @@ const struct hal_driver ac97_driver = {
     .rules = ac97_rules,
     .rule_count = ARRAY_SIZE(ac97_rules),
     .attach = ac97_attach,
+    .suspend = ac97_suspend,
+    .resume = ac97_resume,
+    .after_sleep = HAL_AFTER_SLEEP_RESUME,
 };
