@@ -11,8 +11,10 @@
    its commands (flush, identify, standby) have the port to themselves, since a non-queued command
    may not meet a queued one (SATA 3.3, 13.6): they, and a queued command that failed, which is
    given again alone where a failure is its own, run one at a time on the disk's own thread
-   (blk_serial_start). A disk without queuing takes one command at a time on that thread. The data
-   goes straight between the disk and the caller's memory, a PRD for each segment of the request;
+   (blk_serial_start). A disk without queuing takes one command at a time on that thread.
+   データは円盤と呼ぶ者のメモリーの間を直に動き、要求の区切りごとに PRD を一つ、その番地は blk.c が HAL で求めた
+   bus である。adapter の届く番地の幅は CAP.S64A が言い（無ければ 32 bit）、届かないメモリーの要求は blk.c の緩衝を
+   通る（dev/blk.h）。
 
    Completions arrive by MSI or INTx, or are polled when the platform offers none. A thread for each
    adapter handles what may wait: a device that came or went (7.3, 6.2.2.3), what an HBA reset left
@@ -132,10 +134,12 @@
 #define SCTL_SLUMBER_ALONE(h) ((h)->sds ? 0x500u : 0x100u)
 #define SIG_ATA 0x00000101u
 
-/* The port's memory, one run: the command list (32 headers), the FISes it receives, then a command
-   table for each slot: the command FIS and its PRDs, 128-byte aligned (4.2). */
+/* port の記憶、一続き：命令の一覧（32 の見出し、1 KiB に揃う）、受ける FIS（256 バイトに揃う）、IDENTIFY の答え
+   （PRD の番地は偶数）、slot ごとの命令の表：命令の FIS と PRD、128 バイトに揃う（4.2）。 */
 #define LIST_AT 0x000
 #define FIS_AT 0x400
+#define IDENT_AT 0x500 /* 受ける FIS（FIS-based switching なしで 256 バイト、3.3.3、4.2.1）の後 */
+#define IDENT_BYTES 512
 #define TABLES_AT 0x800
 #define PRDT_AT 0x80 /* in a command table, after the command FIS */
 #define TABLE_BYTES ALIGN_UP(PRDT_AT + PRDS * 16, 128)
@@ -187,9 +191,8 @@ struct port {
     struct hba *h;
     unsigned no;
     volatile uint8_t *regs;
-    uint8_t *mem; /* LIST_AT, FIS_AT, TABLES_AT */
+    uint8_t *mem; /* LIST_AT, FIS_AT, IDENT_AT, TABLES_AT */
     uint64_t mem_bus;
-    unsigned pages; /* of mem */
     struct disk *disk; /* the last one seen; written with the port to itself */
     struct disk *disks; /* atomic: every one it has seen, newest first */
     uint64_t retry_at, retry_ns; /* a device that did not answer: its next look (the examiner's) */
@@ -227,7 +230,7 @@ struct hba {
     struct hal_device *hal;
     struct pci_device *pci;
     volatile uint8_t *regs;
-    bool s64, sncq, sss, ssc, sds, sadm;
+    bool sncq, sss, ssc, sds, sadm;
     unsigned nslots;
     uint32_t implemented; /* PI */
     struct irq *irq; /* its message (pci_irq_enable), NULL: polled */
@@ -863,20 +866,19 @@ static void halt(struct port *p, uint32_t bit) {
     slots_end(p, woken);
 }
 
-/* The PRDs for `count` segments in the slot's table (4.2.3.3), one for each: a segment is physically
-   contiguous, and a request's total is far below a PRD's 4 MiB (4.2.3.3). 0 when there are more than
-   the table holds, or one lies beyond the adapter's reach. */
-static unsigned prds(struct port *p, uint8_t *table, const struct blk_segment *segs, unsigned count) {
+/* slot の表に count の区切りの PRD を一つずつ（4.2.3.3）。区切りは装置の番地（bus）で一続きで、偶数の番地と長さを
+   持ち（blk.c の segment_align）、要求の全部でも PRD の 4 MiB よりずっと小さい。区切りの数は blk.c が max_segments
+   （PRDS）までにする。 */
+static void prds(uint8_t *table, const struct blk_segment *segs, unsigned count) {
+    ASSERT(count <= PRDS);
     uint32_t *prd = (uint32_t *)(table + PRDT_AT);
-    if (count > PRDS) return 0;
     for (unsigned i = 0; i < count; i++) {
         uint32_t *e = &prd[4 * i];
-        e[0] = (uint32_t)bus;
-        e[1] = (uint32_t)(bus >> 32);
+        e[0] = (uint32_t)segs[i].bus;
+        e[1] = (uint32_t)(segs[i].bus >> 32);
         e[2] = 0;
-        e[3] = segs[i].bytes - 1; /* no interrupt of its own: the command's FIS ends it */
+        e[3] = segs[i].bytes - 1; /* 自分の割り込みは無い：命令の FIS が終える */
     }
-    return count;
 }
 
 /* An H2D register FIS (SATA 3.3, 10.5.6) for `command` on `count` sectors from `lba`. A queued
@@ -906,36 +908,28 @@ static void fis_make(uint8_t f[20], uint8_t command, uint64_t lba, unsigned coun
     }
 }
 
-/* The command table and list header of `slot` for the FIS and the PRDs of segs. False when the
-   segments cannot be described to the adapter. */
-static bool table_make(struct port *p, int slot, const uint8_t fis[20], bool queued, bool write,
+/* `slot` の命令の表と一覧の見出し：FIS と segs の PRD。 */
+static void table_make(struct port *p, int slot, const uint8_t fis[20], bool queued, bool write,
                        const struct blk_segment *segs, unsigned count) {
     uint64_t table_bus = p->mem_bus + TABLES_AT + (uint64_t)slot * TABLE_BYTES;
     uint8_t *table = p->mem + TABLES_AT + (size_t)slot * TABLE_BYTES;
     memset(table, 0, PRDT_AT);
     memcpy(table, fis, 20);
     if (queued) table[12] = (uint8_t)(slot << 3); /* the tag is the slot (3.3.13) */
-    unsigned n = prds(p, table, segs, count);
-    if (count && !n) {
-        kprintf("ahci%d: port %u: the memory for command %02x has too many parts, or is beyond the adapter's reach\n",
-                p->h->index, p->no, fis[2]);
-        return false;
-    }
+    prds(table, segs, count);
     uint32_t *hdr = (uint32_t *)(p->mem + LIST_AT) + 8 * slot;
-    hdr[0] = 5u | (write ? 1u << 6 : 0) | n << 16; /* a 5-dword FIS, its direction, its PRDs */
+    hdr[0] = 5u | (write ? 1u << 6 : 0) | count << 16; /* a 5-dword FIS, its direction, its PRDs */
     hdr[1] = 0;
     hdr[2] = (uint32_t)table_bus;
     hdr[3] = (uint32_t)(table_bus >> 32);
-    return true;
 }
 
-/* One command with the data of `segs`, given in the slot the caller entered with, and its end waited
-   for. 0; -1 when the disk reported an error, the adapter one of its own or the time ran out; -2
-   when the segments cannot be described to the adapter. */
+/* segs のデータの命令を一つ、呼ぶ者が enter で得た slot で渡し、終わりを待つ。0。円盤か adapter が誤りを言った、
+   または時間が切れたなら -1。 */
 static int command_in(struct port *p, int slot, const uint8_t fis[20], bool queued, bool write,
                       const struct blk_segment *segs, unsigned count, uint64_t ns) {
     uint32_t bit = 1u << slot;
-    if (!table_make(p, slot, fis, queued, write, segs, count)) return -2;
+    table_make(p, slot, fis, queued, write, segs, count);
     struct slot *s = &p->slots[slot];
     uint64_t start = __atomic_load_n(&s->seq, __ATOMIC_ACQUIRE);
     uint64_t f = spin_lock(&p->lock);
@@ -1081,16 +1075,13 @@ static void ahci_submit(struct blkdev *b, struct blk_request *chain) {
         }
         chain = r->next;
         r->next = NULL;
-        uint8_t fis[20];
-        request_fis(d, r, fis);
-        if (slot >= 0 && !table_make(p, slot, fis, true, r->op == BLK_WRITE, r->segments, r->segment_count)) {
-            leave(p, slot, false);
-            slot = -1;
-        }
         if (slot < 0) {
             blk_serial_ops.submit(b, r);
             continue;
         }
+        uint8_t fis[20];
+        request_fis(d, r, fis);
+        table_make(p, slot, fis, true, r->op == BLK_WRITE, r->segments, r->segment_count);
         __atomic_store_n(&p->slots[slot].request, r, __ATOMIC_RELEASE);
         batch |= 1u << slot;
     }
@@ -1114,24 +1105,17 @@ static int flush(struct disk *d) {
    another's error, and which one failed would have to be read from a log page: so it is given again
    alone, where a failure is its own, up to three times. A flush (FLUSH CACHE) puts the write cache
    on the medium, with every write that ended before it; a disk's cache may come on or go off with
-   its power, which IDENTIFY says each time it is looked at (word 85). On an adapter that reaches
-   only 4 GiB the data goes through the port's buffer below it. */
+   its power, which IDENTIFY says each time it is looked at (word 85). */
 static int transfer(struct blkdev *b, const struct blk_request *r) {
     struct disk *d = b->priv;
-    struct port *p = d->p;
     if (r->op == BLK_PERSIST) return __atomic_load_n(&d->cache, __ATOMIC_ACQUIRE) && flush(d) < 0 ? -N_ERR_IO : 0;
     bool write = r->op == BLK_WRITE;
-    const struct blk_segment *segs = r->segments;
-    unsigned count = r->segment_count;
     uint8_t fis[20];
     request_fis(d, r, fis);
     bool alone = !d->ncq;
     for (int failed_alone = 0; failed_alone < 3;) {
-        int rc = command(d, fis, d->ncq, alone, write, segs, count, IO_NS);
-        if (rc != -1) {
-            if (rc) return -N_ERR_IO;
-            return 0;
-        }
+        int rc = command(d, fis, d->ncq, alone, write, r->segments, r->segment_count, IO_NS);
+        if (rc != -1) return rc ? -N_ERR_IO : 0;
         if (alone) failed_alone++;
         alone = true;
     }
@@ -1139,20 +1123,15 @@ static int transfer(struct blkdev *b, const struct blk_request *r) {
 }
 
 /* IDENTIFY DEVICE (ACS-3 7.12): its size, sector size, commands, queue and write cache, in d. The
-   caller has the port to itself, slot its own. *again: it did not answer, or there was no memory,
-   and it may yet be a disk. */
+   caller has the port to itself, slot its own. *again: it did not answer, and it may yet be a disk.
+   答えは port の記憶の IDENT_AT に来る（port を独りで持つ者だけが使う）。 */
 static bool identify(struct port *p, int slot, struct disk *d, char model[41], bool *again) {
-    uint64_t bus;
-    uint16_t *id = hal_dma_alloc(p->h->hal, PAGE_SIZE, p->h->s64 ? 0 : 32, &bus);
-    if (!id) {
-        *again = true;
-        return false;
-    }
+    const struct blk_segment page = {.bus = p->mem_bus + IDENT_AT, .bytes = IDENT_BYTES}; /* prds は bus だけを読む */
+    const uint16_t *id = (const uint16_t *)(p->mem + IDENT_AT);
     uint8_t fis[20];
     fis_make(fis, ATA_IDENTIFY, 0, 0, false, false);
     fis[7] = 0;
     if (command_in(p, slot, fis, false, false, &page, 1, IO_NS)) {
-        hal_dma_free(p->h->hal, id);
         *again = true;
         return false;
     }
@@ -1175,7 +1154,6 @@ static bool identify(struct port *p, int slot, struct disk *d, char model[41], b
     d->ncq = p->h->sncq && d->lba48 && id[76] != 0xFFFF && (id[76] >> 8 & 1);
     unsigned depth = d->ncq ? MIN(p->h->nslots, (id[75] & 0x1Fu) + 1) : 1;
     d->all = depth == 32 ? 0xFFFFFFFFu : (1u << depth) - 1;
-    hal_dma_free(p->h->hal, id);
     if (d->block < 512 || d->block > 4096 || (d->block & (d->block - 1)) || !sectors) {
         kprintf("ahci%d: port %u: %s has %u-byte sectors, skipped\n", p->h->index, p->no, model, d->block);
         return false;
@@ -1192,9 +1170,8 @@ static void port_add(struct hba *h, unsigned no) {
     p->no = no;
     p->regs = h->regs + 0x100 + 0x80 * no;
     p->all = 1;
-    p->pages = (unsigned)(ALIGN_UP(TABLES_AT + (uint64_t)h->nslots * TABLE_BYTES, PAGE_SIZE) / PAGE_SIZE);
-    if (!(p->mem = hal_dma_alloc(h->hal, (size_t)p->pages * PAGE_SIZE, h->s64 ? 0 : 32, &p->mem_bus))) {
-        kprintf("ahci%d: port %u: no memory %sfor its commands\n", h->index, no, h->s64 ? "" : "below 4 GiB ");
+    if (!(p->mem = hal_dma_alloc(h->hal, TABLES_AT + (size_t)h->nslots * TABLE_BYTES, &p->mem_bus))) {
+        kprintf("ahci%d: port %u: no memory for its commands\n", h->index, no);
         kfree(p);
         return;
     }
@@ -1290,9 +1267,10 @@ static void port_examine(struct port *p) {
     found->blk.max_segments = PRDS;
     found->blk.segment_align = 2; /* a PRD's address and byte count are even (4.2.3.3) */
     found->blk.has_cache = true;  /* whether its cache is on is IDENTIFY's word at each look (transfer) */
+    found->blk.dma = h->hal;
     found->blk.priv = found;
     blk_serial_start(&found->blk, transfer);
-    if (found->ncq && h->s64) found->blk.ops = &ahci_ops;
+    if (found->ncq) found->blk.ops = &ahci_ops;
     const char *cache = found->cache ? "" : ", no write cache now";
     if (found->ncq)
         kprintf("ahci%d: port %u: %s, %u queued commands at once%s\n", h->index, p->no, model,
@@ -1424,7 +1402,9 @@ static int start(struct hba *h) {
     hba_take(h);
     uint32_t cap = hba_rd(h, CAP);
     h->implemented = hba_rd(h, PI);
-    h->s64 = cap & CAP_S64A;
+    /* 装置が届く番地：CAP.S64A なら一覧、受ける FIS、命令の表、PRD の上の 32 bit を読み、無ければそれを 0 と見なす
+       （3.1.1、3.3.2、3.3.4、4.2.2、4.2.3） */
+    hal_dma_bits(h->hal, cap & CAP_S64A ? 64 : 32);
     h->sncq = cap & CAP_SNCQ;
     h->sss = cap & CAP_SSS;
     h->ssc = cap & CAP_SSC;

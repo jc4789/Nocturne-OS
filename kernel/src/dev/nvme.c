@@ -423,10 +423,10 @@ static bool queue_alloc(struct queue *q, struct nvme *c, uint16_t qid, uint16_t 
     q->qid = qid;
     q->size = entries;
     q->depth = (uint16_t)(entries - 1);
-    if (!(q->sq = hal_dma_alloc(c->hal, PAGE_SIZE, 0, &q->sq_bus)) ||
-        !(q->cq = hal_dma_alloc(c->hal, PAGE_SIZE, 0, &q->cq_bus)))
+    if (!(q->sq = hal_dma_alloc(c->hal, PAGE_SIZE, &q->sq_bus)) ||
+        !(q->cq = hal_dma_alloc(c->hal, PAGE_SIZE, &q->cq_bus)))
         return false;
-    if (lists && !(q->lists = hal_dma_alloc(c->hal, (size_t)q->depth * LIST_BYTES, 0, &q->lists_bus))) return false;
+    if (lists && !(q->lists = hal_dma_alloc(c->hal, (size_t)q->depth * LIST_BYTES, &q->lists_bus))) return false;
     q->slots = kzalloc(q->depth * sizeof *q->slots);
     q->free = kzalloc((q->depth + 63) / 64 * sizeof *q->free);
     if (!q->slots || !q->free) return false;
@@ -748,6 +748,7 @@ static void add_namespace(struct nvme *c, uint32_t nsid) {
     s->blk.segment_align = 4;                        /* a data pointer is dword aligned */
     /* PRPs: every entry after the first starts a page, every one before the last ends one (4.3.1) */
     s->blk.segment_boundary = c->sgl ? 0 : PAGE_SIZE;
+    s->blk.dma = c->hal;
     s->blk.ops = &nvme_ops;
     s->blk.priv = s;
     struct ns **tail = &c->found;
@@ -916,23 +917,21 @@ static struct queue *io_queue(struct nvme *c) {
 }
 
 /* ---- requests ---- */
-/* The data pointer of r in cmd (DW6 to DW9), built in `list` (at list_bus) where it needs one: the
-   PRPs of its pages (4.3.1: PRP1 at its offset in the first page, PRP2 the second page, or the list
-   of the rest), or its SGL (4.3.2: one Data Block descriptor, or a Last Segment descriptor over a
-   list of them). The segments are physical; the bus address of each adds the device's offset. */
+/* r のデータの指し（DW6 から DW9）を cmd に。要るなら list（list_bus にある）に作る：頁ごとの PRP（4.3.1：PRP1 は
+   最初の頁の中の位置から、PRP2 は二つ目の頁か残りの list）、または SGL（4.3.2：Data Block の記述子一つか、その list
+   を指す Last Segment の記述子一つ）。番地は区切りの bus（blk.c が HAL で求めた装置の番地）だけ。 */
 static void data_pointer(const struct nvme *c, const struct blk_request *r, uint32_t cmd[16], uint64_t *list,
                          uint64_t list_bus) {
-    const struct hal_device *h = c->hal;
     if (c->sgl) {
         cmd[0] |= PSDT_SGL;
         if (r->segment_count == 1) {
-            *(uint64_t *)&cmd[6] = hal_dma_address(h, r->segments[0].phys);
+            *(uint64_t *)&cmd[6] = r->segments[0].bus;
             cmd[8] = r->segments[0].bytes;
             cmd[9] = SGL_DATA_BLOCK << 24;
             return;
         }
         for (uint32_t i = 0; i < r->segment_count; i++) {
-            list[2 * i] = hal_dma_address(h, r->segments[i].phys);
+            list[2 * i] = r->segments[i].bus;
             list[2 * i + 1] = r->segments[i].bytes | (uint64_t)SGL_DATA_BLOCK << 56;
         }
         *(uint64_t *)&cmd[6] = list_bus;
@@ -940,14 +939,14 @@ static void data_pointer(const struct nvme *c, const struct blk_request *r, uint
         cmd[9] = SGL_LAST_SEGMENT << 24;
         return;
     }
-    *(uint64_t *)&cmd[6] = hal_dma_address(h, r->segments[0].phys);
+    *(uint64_t *)&cmd[6] = r->segments[0].bus;
     unsigned pages = 0;
     uint64_t second = 0;
     for (uint32_t i = 0; i < r->segment_count; i++) {
-        uint64_t at = r->segments[i].phys & ~(uint64_t)(PAGE_SIZE - 1), end = r->segments[i].phys + r->segments[i].bytes;
+        uint64_t at = r->segments[i].bus & ~(uint64_t)(PAGE_SIZE - 1), end = r->segments[i].bus + r->segments[i].bytes;
         for (; at < end; at += PAGE_SIZE, pages++) {
-            if (pages == 1) second = hal_dma_address(h, at);
-            if (pages >= 1) list[pages - 1] = hal_dma_address(h, at);
+            if (pages == 1) second = at;
+            if (pages >= 1) list[pages - 1] = at;
         }
     }
     if (pages == 2) *(uint64_t *)&cmd[8] = second;
@@ -1132,8 +1131,9 @@ static int start(struct nvme *c) {
         kprintf("nvme%d: no NVM command set or no 4 KiB pages (capabilities %lx), skipped\n", c->index, cap);
         return -N_ERR_UNSUPPORTED;
     }
-    if (!(c->ident = hal_dma_alloc(h, PAGE_SIZE, 0, &c->ident_bus)) ||
-        !queue_alloc(&c->admin, c, 0, ADMIN_ENTRIES, false))
+    /* 装置が届く番地は 64 bit：ASQ と ACQ（3.1.4 の Figure 45、46）、PRP（4.3.1 の Figure 111）と SGL の番地 */
+    hal_dma_bits(h, 64);
+    if (!(c->ident = hal_dma_alloc(h, PAGE_SIZE, &c->ident_bus)) || !queue_alloc(&c->admin, c, 0, ADMIN_ENTRIES, false))
         return -N_ERR_NO_MEMORY;
     mutex_lock(&c->reset_lock);
     bool up = enable(c);

@@ -1,14 +1,12 @@
-/* Block devices: every disk driver (ATA, NVMe, USB, Hyper-V SCSI) registers its disks here, and the
-   filesystems scan them. Requests are in 512-byte sectors.
+/* block 装置：ディスクの実装（NVMe、AHCI、USB の大容量記憶、VM の ATA と Hyper-V の SCSI）がディスクをここに載せ、
+   store がそれを読む。要求は 512 バイトの sector で数える。
 
-   Writing and persisting are separate requests. A write returns once the device has the data, which
-   may still sit in its volatile cache; blk_persist returns once everything written before it is on
-   the medium. A filesystem orders its writes with it (data before the record that names it) and asks
-   for it once per save, not once per write.
+   書くことと残すことは別の要求である。書込みは装置がデータを持てば終わり、データはまだ装置の揮発の cache にありうる。
+   blk_persist は、その前に書いた全部が媒体に載ったときに終わる。store は書く順をこれで決め（データを先に、それを
+   指す記録を後に）、保存ごとに一度だけ頼む。
 
-   Any CPU, any task: a driver orders the requests it gets for a device itself, one at a time or
-   side by side as the device takes them; blk.c keeps the list of devices, the power gate and the
-   write counters, and makes every request a driver gets regular (below). */
+   どの CPU、どの thread からでもよい。実装は一つの装置に来た要求を自分で並べる（一つずつ、または装置が受けるだけ
+   並べて）。blk.c は装置の一覧、電源の門、書込みの数を持ち、実装に渡す要求を全部整える（下）。 */
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
@@ -19,54 +17,57 @@ struct blk_serial;
 
 struct blkdev {
     int index;
-    char name[24];  /* for the log: "nvme0.1" (controller, namespace), "sata0.2" (adapter, port), "usb0" */
+    char name[24]; /* ログのため："nvme0.1"（controller、namespace）、"sata0.2"（adapter、port）、"usb0" */
     char model[41];
     uint64_t sectors;
-    uint32_t block;  /* the device's own block in bytes, a power of two from 512: a write covering
-                        whole blocks needs no read-modify-write in the driver */
-    bool gone;       /* atomic: the device left (unplugged, its adapter dead). The device stays listed
-                        and its requests fail; a power change does not wait for what it cannot keep */
-    uint32_t errors;    /* failed requests since the device appeared (atomic) */
-    uint64_t written;   /* requests to write that ended, ever (atomic, blk.c) */
-    uint64_t persisted; /* of them, the ones a persist that ended began after (atomic, blk.c) */
-    /* A driver that calls blk_cache_lost counts its write commands, all atomic: */
-    uint64_t given;     /* those that went into the device (blk_write_given) */
-    uint64_t ended;     /* of them, the ones that are over, however (blk_write_ended) */
-    uint64_t flushed;   /* of them, the ones a persist that ended began after (blk.c) */
-    bool cache_lost;    /* blk_cache_lost: for good, every persist fails (atomic) */
-    struct mutex partial; /* parts of a block written at once: each one's read, change and write
-                             whole, so none writes back another's bytes as they were */
-    /* What the driver declares before blk_register. A request it gets stays within these: blk.c
-       splits what is larger, and turns a write of part of a block into its read, change and write,
-       so a driver only ever moves whole blocks. */
-    uint32_t max_sectors;    /* in one request; 0: no limit */
-    uint32_t max_segments;   /* in one request; 0: no limit */
-    uint32_t segment_align;  /* a segment's physical address and length are multiples of this; 0: 512 */
-    uint32_t segment_boundary; /* where one segment ends and the next begins, both are multiples of this
-                                  (NVMe PRPs: the page size); 0: anywhere */
-    bool has_cache;          /* the device may keep a volatile cache: BLK_PERSIST reaches it */
+    /* 装置の block のバイト。512 からの 2 の冪：block を丸ごと覆う書込みは実装の中で読み・変え・書きを要らない */
+    uint32_t block;
+    /* atomic：装置が去った（抜かれた、adapter が死んだ）。一覧に残り、要求は失敗する。電源の変化は持てないものを
+       待たない */
+    bool gone;
+    uint32_t errors;    /* 現れてから失敗した要求（atomic） */
+    uint64_t written;   /* 終わった書込みの要求の全部（atomic、blk.c） */
+    uint64_t persisted; /* そのうち、終わった残しが始まる前のもの（atomic、blk.c） */
+    /* blk_cache_lost を呼ぶ実装は書込みの命令を数える。どれも atomic： */
+    uint64_t given;   /* 装置に入ったもの（blk_write_given） */
+    uint64_t ended;   /* そのうち、どうであれ終わったもの（blk_write_ended） */
+    uint64_t flushed; /* そのうち、終わった残しが始まる前のもの（blk.c） */
+    bool cache_lost;  /* blk_cache_lost：これからの残しは全部失敗する（atomic） */
+    /* 一つの block の部分を同時に書く者：それぞれの読み・変え・書きを丸ごと一つずつにし、ほかの者のバイトを元のまま
+       書き戻さない */
+    struct mutex partial;
+    /* 実装が blk_register の前に申告するもの。実装に来る要求はこの中にある：blk.c は大きいものを割り、block の一部の
+       書込みを読み・変え・書きにするので、実装は block を丸ごと動かすだけである。揃えと境で見る番地は装置が受ける
+       もの（DMA の装置は bus、ほかは phys）。 */
+    uint32_t max_sectors;   /* 一つの要求で。0：上限なし */
+    uint32_t max_segments;  /* 一つの要求で。0：上限なし */
+    uint32_t segment_align; /* 区切りの番地と長さはこの倍数。0：512 */
+    /* 一つの区切りが終わり次が始まる所は、どちらもこの倍数（NVMe の PRP：頁の大きさ）。0：どこでも */
+    uint32_t segment_boundary;
+    bool has_cache; /* 装置は揮発の cache を持ちうる：BLK_PERSIST がそれに届く */
+    /* データを DMA で動かす装置（HAL の装置）。blk.c は区切りごとに装置へ渡す番地を HAL に問い（hal_dma_reach）、
+       届かない区切りを持つ要求は装置の届くメモリーの緩衝を通す。NULL：装置はデータを物理番地で受ける（CPU が写す
+       実装、客の物理番地で読む hypervisor の口） */
+    struct hal_device *dma;
     const struct blk_ops *ops;
     void *priv;
-    int node;               /* the NUMA node near it, -1: not known (blk_register) */
+    int node; /* 近い NUMA node、-1：知らない（blk_register） */
     struct blk_serial *serial;
 };
 
-/* A request: chained through next into a batch, so one submit can fill a device's queue with one
-   doorbell. A segment is physical memory; blk.c gives the driver bus-ready lists, and no request
-   goes through a copy here except where the request is not regular. done runs exactly once per
-   request, in any context (an interrupt handler too), never sleeps, and status is 0 or a negative
-   N_ERR_*. The caller sets done and context before blk_submit; blk.c puts its own done in its place
-   (a driver does not read either). A driver ends a request it was given with blk_complete. BLK_PERSIST moves
-   no data: everything whose done ran before it was submitted is on the medium when its done runs.
+/* 要求。next で鎖になり、実装は一度の submit で鎖を全部受ける（一つの queue を一度の doorbell で満たせる）。区切りは
+   一続きのメモリーである。done は要求ごとにちょうど一度、どの文脈でも（割り込みの処理でも）走り、眠らない。status は
+   0 か負の N_ERR_*。実装は渡された要求を blk_complete で終える。BLK_PERSIST はデータを動かさない：それを渡す前に done
+   が走った全部は、その done が走るときに媒体にある。
 
-   A request a driver gets is regular: lba and sectors are whole blocks, sectors and segment_count
-   are within max_sectors and max_segments, every segment is aligned as the device says, and the
-   segments hold sectors * 512 bytes. blk_submit splits what is larger, and one that is not whole
-   blocks or aligned is read, changed and written through a bounce buffer before blk_submit returns
-   (it sleeps for that, and only for that). */
+   実装に来る要求は整っている：lba と sectors は block の丸ごと、sectors と segment_count は max_sectors と
+   max_segments の中、どの区切りも装置の言うとおりに揃い、区切りは合わせて sectors * 512 バイト、DMA の装置なら
+   どの区切りの bus にも装置がそのまま届く。blk.c は大きいものを割り、整わないもの（block の一部、揃わない、装置が
+   届かない）は自分の緩衝で読み・変え・書く。 */
 enum blk_op { BLK_READ, BLK_WRITE, BLK_PERSIST };
 struct blk_segment {
-    uint64_t phys;
+    uint64_t phys; /* 物理番地：blkdev.dma の無い実装が読む */
+    uint64_t bus;  /* 装置へ渡す番地：blkdev.dma のある実装が読む。blk.c が HAL で求める */
     uint32_t bytes;
 };
 struct blk_request {
@@ -76,64 +77,57 @@ struct blk_request {
     uint32_t sectors;
     const struct blk_segment *segments;
     uint32_t segment_count;
+    struct blkdev *device;
+    uint32_t tries; /* 実装の：装置に渡した回数 */
+    int result;     /* 実装の：要求を終える status */
+    /* blk.c の： */
     void (*done)(struct blk_request *r, int status);
     void *context;
-    /* blk.c's: */
-    struct blkdev *device;
     void (*done_to)(struct blk_request *r, int status);
-    struct blk_request *parent; /* a part of a split request: the whole */
-    uint32_t parts;             /* the whole: parts not over, atomic */
-    int status;                 /* the whole: the first part's failure, atomic */
-    uint64_t written_at, ended_at; /* BLK_PERSIST: the counts it covers */
-    uint32_t tries;             /* the driver's: the times it has been given to the device */
-    int result;                 /* the driver's: the status it will end the request with */
+    struct blk_request *parent;    /* 割った要求の部分：全体 */
+    uint32_t parts;                /* 全体：終わっていない部分、atomic */
+    int status;                    /* 全体：最初に失敗した部分の status、atomic */
+    uint64_t written_at, ended_at; /* BLK_PERSIST：覆う数 */
 };
-/* A driver ends r: its status, 0 or a negative N_ERR_*. Any context. */
+/* 実装が r を終える：status は 0 か負の N_ERR_*。どの文脈でも。 */
 void blk_complete(struct blk_request *r, int status);
-/* The data path: called directly by blk.c from a thread that may sleep, any CPU, several at once on
-   one device. submit starts all of the chain and returns: it may wait for room in a queue, never
-   for a request to end. A driver with queues per CPU uses the calling CPU's. */
+/* データの道：blk.c が眠ってよい thread から、どの CPU からでも、一つの装置に同時に幾つでも直に呼ぶ。submit は鎖の
+   全部を始めて戻る：queue の空きを待ってよく、要求の終わりは待たない。CPU ごとの queue を持つ実装は呼んだ CPU の
+   ものを使う。 */
 struct blk_ops {
     void (*submit)(struct blkdev *d, struct blk_request *chain);
 };
-/* Submit a chain from any thread that may sleep, the power gate waiting at blk_hold. The way for
-   anything that has more than one request to give (the block cache's read-ahead and write-back). */
-void blk_submit(struct blkdev *d, struct blk_request *chain);
-/* A device that does one thing at a time (a port's PIO, a USB bulk pipe): its driver gives transfer,
-   and sets blk_serial_ops as ops. blk.c runs the requests one by one on a thread of that device's. */
-typedef int (*blk_transfer_fn)(struct blkdev *d, const struct blk_request *r); /* 0 or a negative N_ERR_*; all three ops */
+/* 一度に一つのことをする装置（port の PIO、USB の bulk の pipe）：実装は transfer を渡し、ops に blk_serial_ops を
+   置く。blk.c はその装置の thread で要求を一つずつ行う。 */
+typedef int (*blk_transfer_fn)(struct blkdev *d, const struct blk_request *r); /* 0 か負の N_ERR_*。三つの op の全部 */
 extern const struct blk_ops blk_serial_ops;
 void blk_serial_start(struct blkdev *d, blk_transfer_fn transfer);
-/* The device is gone (blkdev.gone set): the thread ends once what it has is failed. */
+/* 装置が去った（blkdev.gone を立てた）：thread は持っているものを失敗させて終わる。 */
 void blk_serial_stop(struct blkdev *d);
 
-/* Lists the disk and offers it on the device that has it (N_OFFER_DISK, hal_offer): any thread
-   that may sleep. */
+/* ディスクを一覧に載せ、それを持つ装置の上に出す（N_OFFER_DISK、hal_offer）：眠ってよい thread から。 */
 void blk_register(struct hal_device *hal, struct blkdev *d);
 int blk_count(void);
 struct blkdev *blk_get(int i);
+/* buf は核のメモリー。眠ってよい thread から、電源の門を blk_hold で待つ。 */
 int blk_read(struct blkdev *d, uint64_t lba, uint32_t n, void *buf);
 int blk_write(struct blkdev *d, uint64_t lba, uint32_t n, const void *buf);
 int blk_persist(struct blkdev *d);
-/* Power changes: blk_hold waits for every transfer under way to end, and from then on only the
-   calling thread reaches the disks; everyone else waits in blk_read/blk_write until blk_release.
-   Across a sleep no request is lost with the controller's state, and between a hibernation
-   snapshot and the power going off nothing changes on disk that the snapshot does not know. */
+/* 電源の変化：blk_hold は動いている転送の全部の終わりを待ち、それからはディスクに届くのは呼んだ thread だけである。
+   ほかの者は blk_release まで blk_read・blk_write で待つ。眠りをまたいで controller の状態と一緒に失われる要求は無く、
+   休止の写しと電源断の間に、写しの知らないことはディスクの上で変わらない。 */
 void blk_hold(void);
 void blk_release(void);
-/* The thread blk_hold let through, NULL when there is none. */
+/* blk_hold が通した thread。居なければ NULL。 */
 struct thread *blk_holder(void);
-/* The device may have started over (it lost its link and maybe its power with it, it stopped
-   answering, its controller failed), with no document saying that its volatile cache outlives that:
-   what that held may be gone, which a flush of what is left cannot tell. If a write command went
-   into it that no blk_persist covers, every blk_persist fails from here on, once it has flushed, so
-   that whoever wrote that finds out, whichever of them comes first. A volume there goes no further,
-   and the medium keeps the last commit that was whole. On a device with no persist this changes
-   nothing; a driver that knows the cache to be off at the time does not call this. A flush that has
-   ended but is not counted yet counts as not done: every persist fails then as well, and nothing is lost. */
+/* 装置が初めからやり直したかもしれない（link と、一緒に電源を失った、答えなくなった、controller が壊れた）。揮発の
+   cache がそれを越えて残るという文書は無い：持っていたものは失われたかもしれず、残りの flush はそれを言えない。
+   どの blk_persist も覆わない書込みの命令が装置に入っていたなら、これからの blk_persist は flush の後に全部失敗し、
+   それを書いた者は、誰が先でも、知る。そこの volume は先へ進まず、媒体は最後の丸ごとの commit を持ち続ける。残しの
+   無い装置では何も変えない。そのとき cache が切れていると知る実装は呼ばない。終わったが数えていない flush は、
+   していないと数える：そのときも残しは全部失敗し、何も失われない。 */
 void blk_cache_lost(struct blkdev *d);
-/* The driver's count of its write commands: before the device can see one, and once that one is
-   over, whether it took it or not, or nothing of it moves any more. Each try of a request counts.
-   Any CPU, under a spinlock too. */
+/* 実装の書込みの命令の数：装置が見る前と、それが終わったとき（受けても受けなくても、もう何も動かないとき）。要求の
+   試しごとに数える。どの CPU でも、spinlock の下でも。 */
 void blk_write_given(struct blkdev *d);
 void blk_write_ended(struct blkdev *d);

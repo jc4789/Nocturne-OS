@@ -1,3 +1,5 @@
+/* block の層（dev/blk.h）：装置の一覧、電源の門、書込みと残しの数、実装に渡す要求の整え（割り、緩衝、装置へ渡す
+   番地）、一度に一つのことをする装置の thread。 */
 #include "kernel.h"
 #include "dev/blk.h"
 #include "hal/hal.h"
@@ -8,11 +10,12 @@
 #include "sys/thread.h"
 #include "sys/wait.h"
 
-/* The devices, in the order their drivers found them (a USB disk at any time), never removed, any
-   number of them. devs_lock (a mutex: an append may allocate) serializes the appends. The table
-   grows by doubling into a new one, published before ndevs counts its new entry; a reader reads
-   ndevs with acquire, then the table, whose every entry below ndevs is there. An old table stays,
-   since a reader may still be in it: all of them together are at most the size of the last. */
+#define BOUNCE_BYTES (128u * 1024) /* 緩衝の大きさ（block がもっと大きければ block） */
+
+/* 装置は実装が見つけた順（USB のディスクはいつでも）に並び、消えず、数に上限は無い。devs_lock（追加は確保するので
+   mutex）が追加を一つずつにする。表は二倍の新しい表へ育ち、ndevs が新しい項を数える前に出す。読む者は ndevs を
+   acquire で読んでから表を読み、ndevs より下の項は全部ある。読む者がまだ中に居るかもしれないので古い表は残す：
+   全部を合わせても最後の表の大きさまで。 */
 static struct mutex devs_lock;
 static struct blkdev **devs;
 static int ndevs, room;
@@ -42,7 +45,7 @@ void blk_register(struct hal_device *hal, struct blkdev *d) {
     mutex_unlock(&devs_lock);
     kprintf("blk: %s: %s, %lu MiB, %u-byte blocks%s\n", d->name, d->model, d->sectors / 2048, d->block,
             d->has_cache ? "" : ", no write cache");
-    if (hal) hal_offer(hal, N_OFFER_DISK, (uint32_t)d->index, d->name);
+    hal_offer(hal, N_OFFER_DISK, (uint32_t)d->index, d->name);
 }
 
 int blk_count(void) { return __atomic_load_n(&ndevs, __ATOMIC_ACQUIRE); }
@@ -51,22 +54,21 @@ struct blkdev *blk_get(int i) {
     return i >= 0 && i < blk_count() ? __atomic_load_n(&devs, __ATOMIC_ACQUIRE)[i] : NULL;
 }
 
-/* The power gate: holder (the one thread that reaches the disks while it is set) and inflight
-   (the requests under way), under gate_lock. A request waits for holder, and blk_hold for
-   inflight, in gate_wq, looking under the lock and enrolled before it is given back. The lock
-   comes before gate_wq's. */
+/* 電源の門：holder（立っている間ディスクに届くただ一つの thread）と inflight（動いている要求）。gate_lock の下。
+   要求は holder を、blk_hold は inflight を gate_wq で待つ：錠の下で見て、錠を返す前に列に入る。錠は gate_wq の錠
+   より先。 */
 static struct spinlock gate_lock;
 static struct wait_queue gate_wq;
 static struct thread *holder;
 static unsigned inflight;
 
-static void enter(unsigned n) {
+static void enter(void) {
     uint64_t f = spin_lock(&gate_lock);
     while (holder && holder != thread_current()) {
         wq_wait_locked(&gate_wq, &gate_lock);
         spin_take(&gate_lock);
     }
-    inflight += n;
+    inflight++;
     spin_unlock(&gate_lock, f);
 }
 
@@ -116,11 +118,11 @@ static void count_up_to(uint64_t *count, uint64_t upto) {
            !__atomic_compare_exchange_n(count, &was, upto, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
 }
 
-/* ---- the end of a request ---- */
+/* ---- 要求の終わり ---- */
 void blk_complete(struct blk_request *r, int status) { r->done(r, status); }
 
-/* A failed request is counted, and the first few are logged: a dying disk must not flood the log.
-   A driver fails with a code of its own; the caller sees N_ERR_IO, N_ERR_TIMEOUT or N_ERR_NO_MEMORY. */
+/* 失敗した要求は数え、初めの幾つかをログに書く：死にかけのディスクがログを溢れさせない。実装は自分の符号で失敗し、
+   呼ぶ者が見るのは N_ERR_IO、N_ERR_TIMEOUT、N_ERR_NO_MEMORY。 */
 static int failed(struct blk_request *r, int status) {
     struct blkdev *d = r->device;
     if (__atomic_fetch_add(&d->errors, 1, __ATOMIC_RELAXED) < 8)
@@ -129,9 +131,9 @@ static int failed(struct blk_request *r, int status) {
     return status == -N_ERR_TIMEOUT || status == -N_ERR_NO_MEMORY ? status : -N_ERR_IO;
 }
 
-/* A request as the caller gave it is over, however many parts it had: a write is counted once the
-   device has it (or gave up on it, which may have changed the medium too); a persist that ended
-   covers the writes counted before it began, and fails if the device lost its cache after. */
+/* 呼ぶ者の渡した要求が、幾つの部分を持っていても終わった：書込みは装置が持ったとき（または諦めたとき。それも媒体を
+   変えたかもしれない）に数える。終わった残しは始まる前に数えた書込みを覆い、その後に装置が cache を失っていれば
+   失敗する。 */
 static void request_over(struct blk_request *r, int status) {
     struct blkdev *d = r->device;
     if (r->op == BLK_WRITE) {
@@ -147,9 +149,8 @@ static void request_over(struct blk_request *r, int status) {
     done(r, status);
 }
 
-/* ---- waiting for a request in a thread ---- */
-/* The word lives on the waiter's stack, which it may leave as soon as the word moves: the wake is
-   on a queue that is always there, picked by the word's address. */
+/* ---- thread で要求を待つ ---- */
+/* 語は待つ者の stack にあり、待つ者は語が動けばすぐ去ってよい：起こしはいつもある列の上で、語の番地で選ぶ。 */
 #define SYNC_QUEUES 64
 static struct wait_queue sync_wq[SYNC_QUEUES];
 
@@ -173,19 +174,31 @@ static int sync_wait(struct sync_wait *w) {
     return w->status;
 }
 
-/* ---- regular requests ---- */
+/* ---- 整った要求 ---- */
 static uint32_t request_bytes(const struct blk_request *r) {
     uint64_t sum = 0;
     for (uint32_t i = 0; i < r->segment_count; i++) sum += r->segments[i].bytes;
     return sum > UINT32_MAX ? UINT32_MAX : (uint32_t)sum;
 }
 
-/* Whole blocks, every segment aligned as the device wants: what a driver can move as it is. */
+/* 区切りの装置が見る番地：DMA の装置には bus、ほかは phys。揃えと境はこれで見る。 */
+static uint64_t seen(const struct blkdev *d, const struct blk_segment *s) { return d->dma ? s->bus : s->phys; }
+
+/* DMA の装置へ渡す番地を区切りごとに HAL に問う。届かない区切りが一つでもあれば false：要求は緩衝を通る。dma の
+   無い装置は物理番地で受ける。 */
+static bool reach(const struct blkdev *d, struct blk_segment *segs, uint32_t count) {
+    if (!d->dma) return true;
+    for (uint32_t i = 0; i < count; i++)
+        if (!hal_dma_reach(d->dma, segs[i].phys, segs[i].bytes, &segs[i].bus)) return false;
+    return true;
+}
+
+/* block の丸ごとで、どの区切りも装置の望むとおりに揃う：実装がそのまま動かせる。 */
 static bool shaped(const struct blkdev *d, const struct blk_request *r) {
     unsigned per = d->block / 512;
     if (r->lba % per || r->sectors % per) return false;
     for (uint32_t i = 0; i < r->segment_count; i++)
-        if (r->segments[i].phys % d->segment_align || r->segments[i].bytes % d->segment_align) return false;
+        if (seen(d, &r->segments[i]) % d->segment_align || r->segments[i].bytes % d->segment_align) return false;
     return true;
 }
 
@@ -197,19 +210,18 @@ static bool fits(const struct blkdev *d, const struct blk_request *r) {
     if (d->max_sectors && r->sectors > d->max_sectors) return false;
     if (d->max_segments && r->segment_count > d->max_segments) return false;
     for (uint32_t i = 1; i < r->segment_count; i++)
-        if (!joined(d, r->segments[i - 1].phys + r->segments[i - 1].bytes, r->segments[i].phys)) return false;
+        if (!joined(d, seen(d, &r->segments[i - 1]) + r->segments[i - 1].bytes, seen(d, &r->segments[i]))) return false;
     return true;
 }
 
-/* A place in a request's segments. */
+/* 要求の区切りの中の位置。 */
 struct cursor {
     uint32_t index;
-    uint32_t used; /* bytes of segments[index] taken */
+    uint32_t used; /* segments[index] の取ったバイト */
 };
 
-/* The next part from c: its bytes, within the device's limits, ending on a block; its segments
-   counted in *count. 0 when no part is possible (a limit is reached inside a block). With out, the
-   segments written there and c moved on. */
+/* c からの次の部分：装置の上限の中で block で終わるそのバイト。区切りの数を *count に。部分が作れない（block の中で
+   上限に着く）なら 0。out があれば区切りをそこに書き、c を進める。 */
 static uint32_t part_cut(const struct blkdev *d, const struct blk_request *r, struct cursor *c, uint32_t *count,
                          struct blk_segment *out) {
     uint64_t limit = d->max_sectors ? (uint64_t)d->max_sectors * 512 / d->block * d->block : UINT32_MAX;
@@ -218,10 +230,10 @@ static uint32_t part_cut(const struct blkdev *d, const struct blk_request *r, st
     uint64_t end = 0;
     while (at.index < r->segment_count && got < limit) {
         const struct blk_segment *s = &r->segments[at.index];
-        uint64_t start = s->phys + at.used;
+        uint64_t start = seen(d, s) + at.used;
         if (n && (n == d->max_segments || !joined(d, end, start))) break;
         uint32_t take = (uint32_t)MIN((uint64_t)s->bytes - at.used, limit - got);
-        if (out) out[n] = (struct blk_segment){start, take};
+        if (out) out[n] = (struct blk_segment){s->phys + at.used, s->bus + at.used, take};
         n++;
         got += take;
         end = start + take;
@@ -231,10 +243,8 @@ static uint32_t part_cut(const struct blkdev *d, const struct blk_request *r, st
             at.used = 0;
         }
     }
-    if (got % d->block) {
-        /* ended inside a block: only the request's own end may */
-        if (at.index < r->segment_count) return 0;
-    }
+    /* block の中で終わってよいのは要求の終わりだけ */
+    if (got % d->block && at.index < r->segment_count) return 0;
     *count = n;
     if (out) *c = at;
     return got;
@@ -254,9 +264,9 @@ static void part_over(struct blk_request *p, int status) {
     whole->done(whole, __atomic_load_n(&whole->status, __ATOMIC_ACQUIRE));
 }
 
-/* r in parts the device takes, put at the end of the chain *tail points to: false, nothing made,
-   when it cannot be cut on blocks, or without memory (*memory). */
-static bool split(const struct blkdev *d, struct blk_request *r, struct blk_request ***tail, bool *memory) {
+/* r を装置の受ける部分の鎖にして *chain に。block で割れないとき、または記憶が無いとき（*memory）は何も作らず
+   false。 */
+static bool split(const struct blkdev *d, struct blk_request *r, struct blk_request **chain, bool *memory) {
     struct cursor c = {0, 0};
     uint32_t parts = 0, count, bytes;
     while (c.index < r->segment_count) {
@@ -283,24 +293,57 @@ static bool split(const struct blkdev *d, struct blk_request *r, struct blk_requ
             return false;
         }
         part_cut(d, r, &c, &count, p->segments);
-        p->request = (struct blk_request){.op = r->op, .lba = lba, .sectors = bytes / 512, .segments = p->segments,
-                                          .segment_count = count, .done = part_over, .device = r->device,
+        p->request = (struct blk_request){.op = r->op,
+                                          .lba = lba,
+                                          .sectors = bytes / 512,
+                                          .segments = p->segments,
+                                          .segment_count = count,
+                                          .device = r->device,
+                                          .done = part_over,
                                           .parent = r};
         lba += bytes / 512;
         made[i] = p;
     }
     r->status = 0;
     __atomic_store_n(&r->parts, parts, __ATOMIC_RELEASE);
+    struct blk_request **tail = chain;
     for (uint32_t i = 0; i < parts; i++) {
-        **tail = &made[i]->request;
-        *tail = &made[i]->request.next;
+        *tail = &made[i]->request;
+        tail = &made[i]->request.next;
     }
+    *tail = NULL;
     kfree(made);
     return true;
 }
 
-/* ---- requests that are not whole blocks, or not aligned ---- */
-/* Bytes between the request's segments, from `skip` bytes in, and buf. */
+/* ---- 整わない要求：block の一部、揃わない区切り、装置の届かない区切り ---- */
+/* 緩衝：装置が届くメモリー。DMA の装置には HAL が装置の幅の中に取り（訳の領域にいる装置にはそこへ写る）、ほかの
+   装置には近い node の頁を。 */
+struct bounce {
+    uint8_t *memory;
+    struct blk_segment segment; /* 緩衝の全部 */
+};
+
+static bool bounce_take(struct blkdev *d, uint32_t bytes, struct bounce *b) {
+    if (d->dma) {
+        uint64_t bus;
+        void *memory = hal_dma_alloc(d->dma, bytes, &bus);
+        if (!memory) return false;
+        *b = (struct bounce){memory, {vmm_kernel_translate((uint64_t)memory), bus, bytes}};
+        return true;
+    }
+    uint64_t phys = pmm_alloc_run(bytes / PAGE_SIZE, (unsigned)MAX(d->node, 0));
+    if (!phys) return false;
+    *b = (struct bounce){phys_to_virt(phys), {phys, 0, bytes}};
+    return true;
+}
+
+static void bounce_give(struct blkdev *d, struct bounce *b) {
+    if (d->dma) hal_dma_free(d->dma, b->memory);
+    else pmm_free_contig(b->segment.phys, b->segment.bytes / PAGE_SIZE);
+}
+
+/* 要求の区切りの skip バイト目からと buf の間でバイトを写す。 */
 static void copy_segments(const struct blk_request *r, uint64_t skip, uint8_t *buf, size_t n, bool into_buf) {
     for (uint32_t i = 0; i < r->segment_count && n; i++) {
         const struct blk_segment *s = &r->segments[i];
@@ -318,106 +361,90 @@ static void copy_segments(const struct blk_request *r, uint64_t skip, uint8_t *b
     }
 }
 
-/* One regular request through the driver and waited for, which has no part in the gate or the
-   counters: its caller's request has those. */
-static int run_inside(struct blkdev *d, enum blk_op op, uint64_t lba, uint32_t sectors, uint64_t phys) {
-    struct blk_segment seg = {phys, sectors * 512};
+/* 緩衝の初めから sectors の分を一つの整った要求として実装へ渡して待つ。門と数には加わらない：呼ぶ者の要求が
+   加わっている。 */
+static int run_inside(struct blkdev *d, enum blk_op op, uint64_t lba, uint32_t sectors, const struct bounce *b) {
+    struct blk_segment seg = {b->segment.phys, b->segment.bus, sectors * 512};
     struct sync_wait w = {0};
-    struct blk_request r = {.op = op, .lba = lba, .sectors = sectors, .segments = &seg, .segment_count = 1,
-                            .done = sync_done, .context = &w, .device = d};
-    struct blk_request *chain = NULL, **tail = &chain;
+    struct blk_request r = {.op = op,
+                            .lba = lba,
+                            .sectors = sectors,
+                            .segments = &seg,
+                            .segment_count = 1,
+                            .device = d,
+                            .done = sync_done,
+                            .context = &w};
+    struct blk_request *chain = &r;
     bool memory = false;
-    if (fits(d, &r)) chain = &r;
-    else if (!split(d, &r, &tail, &memory)) return memory ? -N_ERR_NO_MEMORY : -N_ERR_IO;
+    if (!fits(d, &r) && !split(d, &r, &chain, &memory)) return memory ? -N_ERR_NO_MEMORY : -N_ERR_IO;
     d->ops->submit(d, chain);
     return sync_wait(&w);
 }
 
-/* A write of part of a block, or of memory the device cannot reach as it is, or a read of the same:
-   each stretch of blocks goes through a buffer of our own. Another part of the same block being
-   written is not written back as it was (partial); a write of a whole block beside this one is the
-   caller's to keep apart, as any two that overlap. */
+/* 整わない要求の読み書き：block の続きごとに緩衝を通す。同じ block のほかの部分の書込みを元のまま書き戻さない
+   （partial）。隣の block を丸ごと書く要求との重なりは、重なる二つの要求と同じく呼ぶ者が分ける。 */
 static int bounce_io(struct blkdev *d, struct blk_request *r) {
     unsigned per = d->block / 512;
-    uint64_t pages = MAX((uint64_t)32, (uint64_t)d->block / PAGE_SIZE ? (uint64_t)d->block / PAGE_SIZE : 1);
-    uint64_t bytes = pages * PAGE_SIZE, phys = pmm_alloc_run(pages, (unsigned)MAX(d->node, 0));
-    if (!phys) {
-        pages = MAX((uint64_t)1, (uint64_t)d->block / PAGE_SIZE);
-        bytes = pages * PAGE_SIZE;
-        if (!(phys = pmm_alloc_run(pages, 0))) return -N_ERR_NO_MEMORY;
-    }
-    uint8_t *buf = phys_to_virt(phys);
+    struct bounce b;
+    if (!bounce_take(d, MAX(BOUNCE_BYTES, d->block), &b) && !bounce_take(d, MAX((uint32_t)PAGE_SIZE, d->block), &b))
+        return -N_ERR_NO_MEMORY;
     uint64_t first = r->lba / per, end = (r->lba + r->sectors + per - 1) / per;
     uint64_t want_start = r->lba * 512, want_end = (r->lba + r->sectors) * 512;
     int status = 0;
     for (uint64_t at = first; at < end && !status;) {
-        uint64_t n = MIN(end - at, bytes / d->block);
+        uint64_t n = MIN(end - at, b.segment.bytes / d->block);
         uint64_t from = MAX(at * d->block, want_start), to = MIN((at + n) * d->block, want_end);
         bool whole = from == at * d->block && to == (at + n) * d->block;
+        uint8_t *place = b.memory + (from - at * d->block);
         if (r->op == BLK_READ) {
-            status = run_inside(d, BLK_READ, at * per, (uint32_t)(n * per), phys);
-            if (!status) copy_segments(r, from - want_start, buf + (from - at * d->block), (size_t)(to - from), false);
+            status = run_inside(d, BLK_READ, at * per, (uint32_t)(n * per), &b);
+            if (!status) copy_segments(r, from - want_start, place, (size_t)(to - from), false);
         } else {
             if (!whole) mutex_lock(&d->partial);
-            if (!whole) status = run_inside(d, BLK_READ, at * per, (uint32_t)(n * per), phys);
+            if (!whole) status = run_inside(d, BLK_READ, at * per, (uint32_t)(n * per), &b);
             if (!status) {
-                copy_segments(r, from - want_start, buf + (from - at * d->block), (size_t)(to - from), true);
-                status = run_inside(d, BLK_WRITE, at * per, (uint32_t)(n * per), phys);
+                copy_segments(r, from - want_start, place, (size_t)(to - from), true);
+                status = run_inside(d, BLK_WRITE, at * per, (uint32_t)(n * per), &b);
             }
             if (!whole) mutex_unlock(&d->partial);
         }
         at += n;
     }
-    pmm_free_contig(phys, pages);
+    bounce_give(d, &b);
     return status;
 }
 
-/* ---- submit ---- */
-void blk_submit(struct blkdev *d, struct blk_request *chain) {
-    unsigned n = 0;
-    for (struct blk_request *r = chain; r; r = r->next) n++;
-    if (!n) return;
-    enter(n);
-    struct blk_request *batch = NULL, **tail = &batch, *slow = NULL, **slow_tail = &slow;
-    for (struct blk_request *r = chain, *next; r; r = next) {
-        next = r->next;
-        r->next = NULL;
-        r->device = d;
-        r->done_to = r->done;
-        r->done = request_over;
-        if (__atomic_load_n(&d->gone, __ATOMIC_ACQUIRE)) {
-            request_over(r, -N_ERR_IO);
-        } else if (r->op == BLK_PERSIST) {
-            r->written_at = __atomic_load_n(&d->written, __ATOMIC_SEQ_CST);
-            r->ended_at = __atomic_load_n(&d->ended, __ATOMIC_SEQ_CST);
-            if (!d->has_cache || __atomic_load_n(&d->persisted, __ATOMIC_SEQ_CST) >= r->written_at)
-                request_over(r, d->has_cache || !__atomic_load_n(&d->cache_lost, __ATOMIC_SEQ_CST) ? 0 : -N_ERR_IO);
-            else
-                *tail = r, tail = &r->next;
-        } else if (r->lba + r->sectors > d->sectors || request_bytes(r) != r->sectors * 512 || !r->sectors) {
-            request_over(r, -N_ERR_IO);
-        } else if (!shaped(d, r)) {
-            *slow_tail = r;
-            slow_tail = &r->next;
-        } else if (fits(d, r)) {
-            *tail = r;
-            tail = &r->next;
-        } else {
-            bool memory = false;
-            if (!split(d, r, &tail, &memory)) request_over(r, memory ? -N_ERR_NO_MEMORY : -N_ERR_IO);
-        }
-    }
-    if (batch) d->ops->submit(d, batch);
-    for (struct blk_request *r = slow, *next; r; r = next) {
-        next = r->next;
-        r->next = NULL;
-        request_over(r, __atomic_load_n(&d->gone, __ATOMIC_ACQUIRE) ? -N_ERR_IO : bounce_io(d, r));
+/* ---- 要求を渡す ---- */
+/* 一つの要求を門の中で実装へ。reached：DMA の装置がどの区切りにもそのまま届く（reach）。整わない要求は緩衝を通し、
+   その終わりまで眠る。大きい要求は実装の受ける部分に割り、一度の submit で鎖ごと渡す。 */
+static void request_give(struct blkdev *d, struct blk_request *r, bool reached) {
+    enter();
+    r->device = d;
+    r->done_to = r->done;
+    r->done = request_over;
+    struct blk_request *chain = r;
+    bool memory = false;
+    if (__atomic_load_n(&d->gone, __ATOMIC_ACQUIRE)) {
+        request_over(r, -N_ERR_IO);
+    } else if (r->op == BLK_PERSIST) {
+        r->written_at = __atomic_load_n(&d->written, __ATOMIC_SEQ_CST);
+        r->ended_at = __atomic_load_n(&d->ended, __ATOMIC_SEQ_CST);
+        if (d->has_cache && __atomic_load_n(&d->persisted, __ATOMIC_SEQ_CST) < r->written_at) d->ops->submit(d, r);
+        else request_over(r, d->has_cache || !__atomic_load_n(&d->cache_lost, __ATOMIC_SEQ_CST) ? 0 : -N_ERR_IO);
+    } else if (r->lba + r->sectors > d->sectors || request_bytes(r) != r->sectors * 512 || !r->sectors) {
+        request_over(r, -N_ERR_IO);
+    } else if (!reached || !shaped(d, r)) {
+        request_over(r, bounce_io(d, r));
+    } else if (fits(d, r) || split(d, r, &chain, &memory)) {
+        d->ops->submit(d, chain);
+    } else {
+        request_over(r, memory ? -N_ERR_NO_MEMORY : -N_ERR_IO);
     }
 }
 
-/* ---- a request from one thread ---- */
-/* The physical segments of kernel memory at buf: the pages one after the other, joined where they
-   are one run. segments is stack, or the heap if it holds too few (*heap). */
+/* ---- 一つの thread の要求 ---- */
+/* buf にある核のメモリーの物理の区切り：頁を順に、一続きの所はつないで。区切りは stack に、足りなければ heap に
+   （*heap）。 */
 static struct blk_segment *segments_of(const void *buf, size_t bytes, struct blk_segment *stack, unsigned room,
                                        uint32_t *count, struct blk_segment **heap) {
     uint64_t va = (uint64_t)buf;
@@ -437,7 +464,7 @@ static struct blk_segment *segments_of(const void *buf, size_t bytes, struct blk
             return NULL;
         }
         if (n && out[n - 1].phys + out[n - 1].bytes == phys) out[n - 1].bytes += take;
-        else out[n++] = (struct blk_segment){phys, take};
+        else out[n++] = (struct blk_segment){.phys = phys, .bytes = take};
         va += take;
         bytes -= take;
     }
@@ -446,17 +473,17 @@ static struct blk_segment *segments_of(const void *buf, size_t bytes, struct blk
 }
 
 static int run(struct blkdev *d, enum blk_op op, uint64_t lba, uint32_t n, const void *buf) {
-    struct blk_segment stack[8], *heap;
+    struct blk_segment stack[8], *heap = NULL, *segs = NULL;
     uint32_t count = 0;
-    struct blk_segment *segs = NULL;
     if (op != BLK_PERSIST && !(segs = segments_of(buf, (size_t)n * 512, stack, ARRAY_SIZE(stack), &count, &heap)))
         return -N_ERR_NO_MEMORY;
+    bool reached = reach(d, segs, count);
     struct sync_wait w = {0};
     struct blk_request r = {.op = op, .lba = lba, .sectors = n, .segments = segs, .segment_count = count,
                             .done = sync_done, .context = &w};
-    blk_submit(d, &r);
+    request_give(d, &r, reached);
     int status = sync_wait(&w);
-    if (op != BLK_PERSIST) kfree(heap);
+    kfree(heap);
     return status;
 }
 
@@ -466,7 +493,7 @@ int blk_write(struct blkdev *d, uint64_t lba, uint32_t n, const void *buf) { ret
 
 int blk_persist(struct blkdev *d) { return run(d, BLK_PERSIST, 0, 0, NULL); }
 
-/* ---- a device that does one thing at a time ---- */
+/* ---- 一度に一つのことをする装置 ---- */
 struct blk_serial {
     struct blkdev *d;
     blk_transfer_fn transfer;
