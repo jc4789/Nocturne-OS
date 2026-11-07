@@ -16,8 +16,11 @@
    an adapter that reaches only the first 4 GiB goes through a buffer below it, one request at a time.
 
    Completions arrive by MSI or INTx, or are polled when the platform offers none. A thread for each
-   adapter handles what may wait: a device that came or went (7.3, 6.2.2.3), what the adapter lost
-   in a sleep, a port that went on through an error with requests in it, and the time of each request.
+   adapter handles what may wait: a device that came or went (7.3, 6.2.2.3), what an HBA reset left
+   to look at, a port that went on through an error with requests in it, and the time of each request.
+
+   眠り、休止、電源断は ahci_suspend と ahci_resume（hal/hal.h）：止める前に円盤を standby にし（10.10.3）、戻りは
+   adapter を立ち上げ直して port を見直す。
 
    A failure goes down the steps of 10.4: the command list engine stopped and started again, a
    COMRESET when the device stays busy, a queued command was in it or an overflow came, an HBA reset
@@ -211,10 +214,11 @@ struct port {
        adapter's thread has this port's link change to see to; unverified: who is on the port is not
        known since a link change, an adapter reset or a sleep, and the thread looking alone may give
        it commands until it knows (port_examine: first_look, or the adapter's thread). A caller waiting for room sleeps in room
-       while freed still reads what it read before it looked. */
+       while freed still reads what it read before it looked.
+       asleep：ahci_suspend が port を独りで持ち、止めてから ahci_resume まで。enter は誰も入れない。 */
     struct spinlock lock;
     uint32_t taken, issued, queued, all;
-    bool sole, live, need_reset, resetting, halting, attention, fatal, noted, unverified;
+    bool sole, live, need_reset, resetting, halting, attention, fatal, noted, unverified, asleep;
     unsigned wanting;
     uint32_t error_is, error_tfd; /* what the last failure showed, for its log line */
     struct wait_queue room;
@@ -233,13 +237,12 @@ struct hba {
     uint32_t implemented; /* PI */
     struct irq *irq; /* its message (pci_irq_enable), NULL: polled */
     struct port *ports[PORTS]; /* every implemented one, unless there was no memory for it */
-    /* reset: one thread at a time takes the adapter through its setup or an HBA reset (not taken
-       where nothing may sleep: there is no setup there). lost: its registers need setting up
-       (after a sleep, after an HBA reset). dead: it does not recover, its bus mastering is off. */
+    /* reset：adapter の立ち上げ、HBA reset、port の engine を止めることは一度に一つの thread。lost：registers を
+       立ち上げ直す（眠りの後、HBA reset の後）。dead：戻らない。bus mastering は切れている。 */
     struct mutex reset;
     bool lost, dead;
-    /* The adapter's thread: the ports whose links changed, whether to look at all of them (a
-       sleep), a word that moves on before wq wakes. All atomic. */
+    /* adapter の thread へ：link の変わった port、全部の port を見るか（HBA reset の後）、wq を起こす前に進む語。どれも
+       atomic。 */
     uint32_t changed;
     bool look_all;
     uint64_t kicks;
@@ -255,7 +258,7 @@ static void hba_wr(struct hba *h, unsigned off, uint32_t v) { mmio_write32(h->re
 static uint32_t rd(struct port *p, unsigned off) { return mmio_read32(p->regs + off); }
 static void wr(struct port *p, unsigned off, uint32_t v) { mmio_write32(p->regs + off, v); }
 
-/* Until (register & mask) == want, for up to ns: looked at each millisecond, or spinning. */
+/* (register & mask) == want になるまで、ns まで。1 ms ごとに眠って見る（どの呼ぶ側も spinlock を持たない thread）。 */
 static bool wait_mmio(volatile uint8_t *reg, uint32_t mask, uint32_t want, uint64_t ns) {
     uint64_t deadline = clock_after(ns);
     for (;;) {
@@ -263,6 +266,7 @@ static bool wait_mmio(volatile uint8_t *reg, uint32_t mask, uint32_t want, uint6
         if (v == 0xFFFFFFFFu) return false; /* the adapter is gone */
         if ((v & mask) == want) return true;
         if (clock_now_ns() >= deadline) return false;
+        sleep_until(clock_after(NS_PER_MS));
     }
 }
 
@@ -460,6 +464,7 @@ static bool comreset(struct port *p) {
     wr(p, PxCMD, rd(p, PxCMD) | CMD_SUD);
     uint32_t sctl = (rd(p, PxSCTL) & ~0xF0Fu) | SCTL_NO_POWER_STATES(p->h);
     wr(p, PxSCTL, sctl | 1u);
+    sleep_until(clock_after(NS_PER_MS)); /* DET を 0h に戻すまで少なくとも 1 ms（10.4.2） */
     wr(p, PxSCTL, sctl);
     bool up = wait_reg(p, PxSSTS, 0xF, DET_UP, LINK_NS);
     wr(p, PxSERR, 0xFFFFFFFFu); /* coming up sets the link's diagnostics; PxTFD waits for DIAG.X (10.1.2) */
@@ -500,7 +505,7 @@ static void hba_look_all(struct hba *h) {
 /* The last step (10.4.3): the whole adapter reset, which clears GHC.AE too, the first thing to set
    again (3.1.2); every port lost its commands, and is set up again before the next. PxCI and
    PxSACT read 0 from the reset on (10.4.3), which ends no command: the ports are marked first. h->reset
-   held where a thread may sleep. */
+   held. */
 static void hba_reset(struct hba *h) {
     kprintf("ahci%d: resetting the adapter\n", h->index);
     __atomic_store_n(&h->lost, true, __ATOMIC_RELEASE);
@@ -579,7 +584,7 @@ static bool port_up_failed(struct port *p) {
 
 /* PxCMD.ST set, which needs a working device (10.1.2). After a non-queued command's error the
    engine is stopped alone (6.2.2.1); a COMRESET is for a device that stays busy or has no
-   link, a queued command's error, an overflow, and the start. h->reset held where a thread may sleep, the port
+   link, a queued command's error, an overflow, and the start. h->reset held, the port
    to the caller (sole), no command in it. A reset asked for meanwhile (a link change) is left asked
    for, the port not live. False leaves it not live. */
 static bool port_up(struct port *p) {
@@ -609,9 +614,11 @@ static bool port_up(struct port *p) {
     }
     wr(p, PxCMD, rd(p, PxCMD) | CMD_SUD | CMD_POD | CMD_FRE);
     if (reset && !comreset(p)) return port_up_failed(p);
-    /* The disk's own time, up to READY_NS: the ports beside it have the adapter meanwhile. An adapter
-       reset under it leaves the port to be set up again. */
+    /* 円盤の時間（READY_NS まで）の間、隣の port が adapter を使う。その間に adapter が reset されたら、この port は
+       立ち上げ直しを待つ。 */
+    mutex_unlock(&h->reset);
     bool ready = wait_reg(p, PxTFD, TFD_BSY | TFD_DRQ, 0, READY_NS);
+    mutex_lock(&h->reset);
     if (__atomic_load_n(&h->lost, __ATOMIC_ACQUIRE)) {
         port_want_reset(p);
         return false;
@@ -650,6 +657,7 @@ static void hba_take(struct hba *h) {
             deadline = clock_after(OWNER_BUSY_NS);
         }
         if (clock_now_ns() >= deadline) break;
+        sleep_until(clock_after(NS_PER_MS));
     }
     kprintf("ahci%d: the firmware does not give the adapter up, taken anyway\n", h->index);
 }
@@ -671,7 +679,7 @@ static void port_spin_up(struct port *p) {
 /* The adapter from nothing to minimally set up (10.1.2), every implemented port in it: idle, its
    memory given, FIS receive on, nothing pending, its interrupts on; a disk on it spun up. Before
    its first use, after a sleep (10.6: the firmware may own it again), after an HBA reset. h->reset
-   held where a thread may sleep; nothing is in any port. */
+   held; nothing is in any port. */
 static bool hba_set_up(struct hba *h, bool after_reset) {
     hba_take(h);
     hba_wr(h, GHC, hba_rd(h, GHC) & ~GHC_IE);
@@ -708,44 +716,48 @@ static bool hba_set_up(struct hba *h, bool after_reset) {
     return true;
 }
 
-/* The adapter set up if it needs that. h->reset held where a thread may sleep. */
+/* 要るなら adapter を立ち上げる。h->reset を持って。 */
 static bool hba_ready(struct hba *h) {
     bool ok = !__atomic_load_n(&h->dead, __ATOMIC_ACQUIRE);
     if (ok && __atomic_exchange_n(&h->lost, false, __ATOMIC_ACQ_REL)) ok = hba_set_up(h, false);
     return ok;
 }
 
-/* The port running with its disk ready for commands (10.1.2, 10.3.1): the adapter first, then the
-   port. Where nothing may sleep (a power change, the disks held) it spins, and no other thread is
-   at the adapter. */
+/* port を、命令を受ける円盤とともに動かす（10.1.2、10.3.1）：先に adapter、次に port。 */
 static bool port_start(struct port *p) {
     struct hba *h = p->h;
+    mutex_lock(&h->reset);
     bool ok = hba_ready(h) && port_up(p);
+    mutex_unlock(&h->reset);
     return ok;
 }
 
-/* Wait for leave to free room: it wakes the waiter; in case a wake is lost, the waiter looks again
-   after 10 ms (polled: each ms). With interrupts off it spins. */
+/* leave が場所を空けて起こすのを待つ。起こしが失われても 10 ms（割り込みの無い adapter は 1 ms）で見直す。 */
 static void wait_room(struct port *p, uint64_t seen) {
+    wq_wait_unless(&p->room, &p->freed, seen, clock_after(p->h->irq ? 10 * NS_PER_MS : NS_PER_MS));
 }
 
 static void port_changed(struct port *p);
 
-/* A slot of the live port for a command: a queued one (alone false) beside the other queued ones,
-   or the port to itself (no command in it, no other let in). A port that is not live is set up
-   first, by the caller that finds it so once it is empty. -1 when it cannot be. While who is on the
-   port is not known a caller waits for the look (first_look, or the adapter's thread), which ends in
-   its time. When
-   that look found nothing to go by, or a power change has stopped the thread, it waits as long as
-   a command may take, and then it is -2. The thread that holds the disks finds out itself, the
-   adapter's thread waiting for it, and where nothing may sleep it is -2 at once. examining: the one
-   finding out. */
+/* 動いている port の命令の slot：queued の命令（alone が false）はほかの queued の命令と並び、でなければ port を独りで
+   持つ（中に命令が無く、ほかを入れない）。動いていない port は、空になったときに見つけた者が先に立ち上げる。立ち上げ
+   られなければ -1。眠りの間（asleep：ahci_suspend から ahci_resume まで）は待つ。誰が居るか分からない間は、見る者
+   （first_look か adapter の thread）の答えを待ち、それは自分の時間で終わる。見ても分からなかったとき、またはディスク
+   を持つ thread が居る（blk_hold：adapter の thread は門で待っているかもしれない）ときは、命令の時間まで待って -2。
+   ディスクを持つ thread は自分で見る。examining：見る者。 */
 static int enter(struct port *p, bool alone, bool examining) {
     bool wanted = false, looked = false;
     uint64_t deadline = 0;
     for (;;) {
         uint64_t seen = __atomic_load_n(&p->freed, __ATOMIC_ACQUIRE);
         uint64_t f = spin_lock(&p->lock);
+        if (p->asleep) {
+            if (wanted) p->wanting--;
+            wanted = false;
+            spin_unlock(&p->lock, f);
+            wait_room(p, seen);
+            continue;
+        }
         if (p->unverified && !examining) {
             if (wanted) p->wanting--;
             wanted = false;
@@ -843,10 +855,12 @@ static void halt(struct port *p, uint32_t bit) {
     p->attention = false;
     spin_unlock(&p->lock, f);
     slots_end(p, woken);
-    /* An adapter reset under way ends first: until GHC.HR falls (10.4.3) its engines may still move
-       data. After one they are stopped, and what it set up is not this one's to stop. */
-    /* Its receive engine stays on: the device's last register FIS is what port_up reads (6.2.2.1, 3.3.7). */
+    /* 途中の adapter の reset が先に終わる：GHC.HR が下りるまで engine はデータを動かしうる（10.4.3）。その後は止まって
+       いて、それが立ち上げたものはこの者が止めるものではない。受ける engine は動いたまま：port_up が読むのは装置の
+       最後の register FIS（6.2.2.1、3.3.7）。 */
+    mutex_lock(&p->h->reset);
     if (!__atomic_load_n(&p->h->lost, __ATOMIC_ACQUIRE) && !list_stop(p)) port_force_stop(p);
+    mutex_unlock(&p->h->reset);
     f = spin_lock(&p->lock);
     woken = finish(p, p->issued, FAILED);
     p->halting = false;
@@ -945,10 +959,12 @@ static int command_in(struct port *p, int slot, const uint8_t fis[20], bool queu
     spin_unlock(&p->lock, f);
     if (!live) return -1; /* an error since enter: the next caller sets it up again */
 
+    bool timed_out = false, looked = false;
     uint64_t deadline = clock_after(ns);
     for (;;) {
         uint64_t seen = __atomic_load_n(&s->seq, __ATOMIC_ACQUIRE);
         if (seen != start) break;
+        if (!p->h->irq || looked) reap(p);
         looked = false;
         if (__atomic_load_n(&s->seq, __ATOMIC_ACQUIRE) != start) break;
         if (__atomic_load_n(&p->attention, __ATOMIC_ACQUIRE)) {
@@ -1100,9 +1116,14 @@ static void low_copy(uint8_t *low, const struct blk_request *r, bool into_low) {
     }
 }
 
+/* FLUSH CACHE（EXT）の FIS：write cache を媒体へ。 */
+static void flush_fis(const struct disk *d, uint8_t fis[20]) {
+    fis_make(fis, d->lba48 ? ATA_FLUSH_CACHE_EXT : ATA_FLUSH_CACHE, 0, 0, false, false);
+}
+
 static int flush(struct disk *d) {
     uint8_t fis[20];
-    fis_make(fis, d->lba48 ? ATA_FLUSH_CACHE_EXT : ATA_FLUSH_CACHE, 0, 0, false, false);
+    flush_fis(d, fis);
     return command(d, fis, false, true, false, NULL, 0, IO_NS);
 }
 
@@ -1408,7 +1429,9 @@ static void ahci_worker(void *arg) {
         }
         changed &= h->implemented;
         if (changed) {
+            mutex_lock(&h->reset);
             hba_ready(h);
+            mutex_unlock(&h->reset);
             while (changed) {
                 unsigned pick = (unsigned)__builtin_ctz(changed);
                 for (uint32_t m = changed; m; m &= m - 1) {
@@ -1480,6 +1503,138 @@ static void port_to_listen(struct port *p) {
     wr(p, PxCMD, rd(p, PxCMD) & ~CMD_SUD);
 }
 
+/* ---- 眠り、休止、電源断（hal/hal.h の suspend と resume）----
+   どちらも電源の walk の thread で、割り込みは開き、ほかの CPU も thread も動いている。adapter の thread と最初の見る者
+   は門（hal_busy_begin）で待つので、要求の時間を見るのも、割り込みの無い adapter の完了を読むのもここの仕事。データの
+   道は port ごとの asleep で閉じる。錠の順は examining → h->reset（port_changed と同じ）。 */
+
+/* 眠りの印の後、port の中の命令が全部終わり、port を誰も持たなくなるまで。入った者（enter）の命令は自分の時間で終わる
+   （command_in の halt）。queued の要求には待つ者が居ないので、その時間は requests_late が見る。 */
+static void port_drain(struct port *p) {
+    for (;;) {
+        uint64_t seen = __atomic_load_n(&p->freed, __ATOMIC_ACQUIRE);
+        uint64_t f = spin_lock(&p->lock);
+        bool busy = p->taken || p->sole;
+        spin_unlock(&p->lock, f);
+        if (!busy) return;
+        if (!p->h->irq) reap(p);
+        requests_late(p);
+        wait_room(p, seen);
+    }
+}
+
+/* 電源が去る前の円盤（10.10.3 の 1 と 2、8.3.2）：write cache を媒体へ（FLUSH CACHE）、STANDBY IMMEDIATE で止め（HDD は
+   head を退け、非常の停止に数えない）、interface を Slumber に（port_to_slumber）。port を独りで持ち（slot 0）、動いて
+   いて誰が居るか分かっている port の、去っていない円盤だけ。cache を書けなければ false。STANDBY を断る円盤は書くだけ：
+   cache はもう媒体にある。 */
+static bool disk_to_standby(struct port *p) {
+    struct disk *disk = p->disk;
+    if (!disk || __atomic_load_n(&disk->blk.gone, __ATOMIC_ACQUIRE)) return true;
+    uint8_t fis[20];
+    if (__atomic_load_n(&disk->cache, __ATOMIC_ACQUIRE)) {
+        flush_fis(disk, fis);
+        if (command_in(p, 0, fis, false, false, NULL, 0, IO_NS)) {
+            kprintf("ahci%d: port %u: %s did not write its cache back\n", p->h->index, p->no, disk->blk.name);
+            return false;
+        }
+    }
+    fis_make(fis, ATA_STANDBY_IMMEDIATE, 0, 0, false, false);
+    fis[7] = 0;
+    if (command_in(p, 0, fis, false, false, NULL, 0, READY_NS))
+        kprintf("ahci%d: port %u: %s did not stand by\n", p->h->index, p->no, disk->blk.name);
+    else
+        port_to_slumber(p);
+    return true;
+}
+
+/* port を止める。誰も入れず（asleep）、中の命令の終わりを待ち、port を独りで持つ。電源が去るなら円盤を standby に
+   する。続けて両方の engine を止め（10.1.2：止まった port の記憶には何も届かない）、割り込みを閉じ、電源が去るなら
+   listen にする（10.10.3 の 3）。止まらない engine は 10.4 の段で止める（port_force_stop）。port は立ち上げ直し
+   （COMRESET から）を待つ。見る者（port_changed、port_examine）とは examining で一つずつ。cache を書けなければ
+   false。 */
+static bool port_suspend(struct port *p, bool power_goes) {
+    struct hba *h = p->h;
+    mutex_lock(&p->examining);
+    uint64_t f = spin_lock(&p->lock);
+    p->asleep = true;
+    spin_unlock(&p->lock, f);
+    port_drain(p);
+    f = spin_lock(&p->lock);
+    p->sole = true;
+    p->taken = 1;
+    bool commands = power_goes && p->live && !p->unverified;
+    spin_unlock(&p->lock, f);
+    bool kept = !commands || disk_to_standby(p);
+    wr(p, PxIE, 0);
+    mutex_lock(&h->reset);
+    if (!port_stop(p)) port_force_stop(p);
+    else if (power_goes) port_to_listen(p);
+    mutex_unlock(&h->reset);
+    f = spin_lock(&p->lock);
+    p->live = false;
+    p->need_reset = true;
+    p->sole = false;
+    p->taken = 0;
+    spin_unlock(&p->lock, f);
+    __atomic_add_fetch(&p->freed, 1, __ATOMIC_RELEASE);
+    wq_wake_all(&p->room);
+    mutex_unlock(&p->examining);
+    return kept;
+}
+
+/* 全部の port を止め（port_suspend）、adapter の割り込みを閉じる。電源が去る SLEEP と OFF では円盤を standby と listen
+   にする（10.10.3）。IMAGE では電源も PCI の状態も変わらず、engine の止まった adapter は何も動かさない。死んだ adapter
+   は bus mastering が切れていて何も動かさない。 */
+static bool ahci_suspend(struct hal_device *d, enum hal_power_target target) {
+    struct hba *h = d->driver_data;
+    if (__atomic_load_n(&h->dead, __ATOMIC_ACQUIRE)) return true;
+    bool power_goes = false;
+    switch (target) {
+    case HAL_POWER_SLEEP:
+    case HAL_POWER_OFF: power_goes = true; break;
+    case HAL_POWER_IMAGE: break;
+    }
+    bool kept = true;
+    for (unsigned n = 0; n < PORTS; n++)
+        if (h->ports[n] && !port_suspend(h->ports[n], power_goes)) kept = false;
+    mutex_lock(&h->reset);
+    hba_wr(h, GHC, hba_rd(h, GHC) & ~GHC_IE);
+    mutex_unlock(&h->reset);
+    return kept;
+}
+
+/* suspend の後。adapter は電源を失って初めから始まるか（眠り：D3hot から D0uninitialized でありうる、8.3.3。D3cold）、
+   firmware がまた持っているか（10.6）、engine を止めたまま動いているか（写し、取りやめ）、起動したカーネルが使って
+   止めた後か（休止の写しの戻り）。どれも 10.1.2 の順で立ち上げ（hba_set_up）、円盤が居うる port（装置が見える、
+   円盤を持っていた、見る前だった）を見直す：眠りの間に円盤が替わり、去り、来たかもしれない。見直す間、ほかの者は
+   その答えを待つ。答えない装置は adapter の thread が後で見直す（retry_at）。true なら adapter は動いていて、居ると
+   分かった円盤は命令を受ける。 */
+static bool ahci_resume(struct hal_device *d) {
+    struct hba *h = d->driver_data;
+    mutex_lock(&h->reset);
+    __atomic_store_n(&h->lost, true, __ATOMIC_RELEASE);
+    bool up = hba_ready(h);
+    mutex_unlock(&h->reset);
+    uint32_t look = 0;
+    for (unsigned n = 0; n < PORTS; n++) {
+        struct port *p = h->ports[n];
+        if (!p) continue;
+        struct disk *had = p->disk;
+        bool device = rd(p, PxSSTS) & 0xF, held = had && !__atomic_load_n(&had->blk.gone, __ATOMIC_ACQUIRE);
+        uint64_t f = spin_lock(&p->lock);
+        bool see = up && (p->unverified || device || held);
+        if (see) p->unverified = true;
+        p->asleep = false;
+        spin_unlock(&p->lock, f);
+        __atomic_add_fetch(&p->freed, 1, __ATOMIC_RELEASE);
+        wq_wake_all(&p->room);
+        if (see) look |= 1u << n;
+    }
+    for (uint32_t m = look; m; m &= m - 1) port_changed(h->ports[__builtin_ctz(m)]);
+    if (!up) kprintf("ahci%d: did not come back after the sleep\n", h->index);
+    return up;
+}
+
 static int ahci_attach(struct hal_device *d) {
     struct hba *h = kzalloc(sizeof *h);
     if (!h) {
@@ -1535,5 +1690,8 @@ static const struct hal_driver ahci_driver = {
     .rule_count = ARRAY_SIZE(ahci_rules),
     .attach = ahci_attach,
     .detach = ahci_detach,
+    .suspend = ahci_suspend,
+    .resume = ahci_resume,
+    .after_sleep = HAL_AFTER_SLEEP_RESUME,
 };
 HAL_DRIVER(ahci_driver);

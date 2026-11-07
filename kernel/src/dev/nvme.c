@@ -17,7 +17,10 @@
    completion queues where there is no interrupt, and watches every command's time.
 
    Every active namespace with plain blocks of any size a command can move (no metadata, no
-   protection information) becomes a block device "nvmeC.N". */
+   protection information) becomes a block device "nvmeC.N".
+
+   眠り、休止、電源断は nvme_suspend と nvme_resume（hal/hal.h）：I/O の queue を消し、電源が去るなら正常の shutdown を
+   知らせ（3.6.1）、戻りは Controller Reset から立ち上げ直す。 */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/irq.h"
@@ -183,6 +186,9 @@ struct nvme {
     bool called_off; /* the last stop only gave up, its thread being killed (atomic) */
     bool cut;
     struct mutex reset_lock; /* enable: at start, after a sleep, after a timeout */
+    /* 眠り（nvme_suspend から nvme_resume まで）：データの道は閉じ、誰も立ち上げない。reset_lock の下で書き、錠なしで
+       読む（atomic）。間に来た要求は retry の列で待ち、resume の work_wake で thread が出す。 */
+    bool asleep;
     uint8_t *ident;          /* a page for identify, at start */
     uint64_t ident_bus;
     /* The commands to give again (a failed try, a stop that ended them, a chain the queue could not
@@ -334,10 +340,12 @@ static void done_run(struct blk_request *done) {
     }
 }
 
+/* 割り込みの無い controller の完了を読む。reap は記憶だけを読み、doorbell は queue が上がっているときだけ書くので、
+   下りた queue（止める途中、眠りの前の io_drain）も読んでよい。 */
 static void poll_queue(struct queue *q) {
     struct blk_request *done = NULL;
     uint64_t f = spin_lock(&q->cq_lock);
-    if (queue_up(q)) reap(q, &done);
+    reap(q, &done);
     spin_unlock(&q->cq_lock, f);
     done_run(done);
 }
@@ -888,14 +896,15 @@ static bool enable_recorded(struct nvme *c) {
     return up;
 }
 
-/* After a command failed with FAILED: up now, a reset has been done since. Else the controller reset
-   once by whichever caller comes first (generation still `seen`), the others finding that it did not
-   come up; or, if that caller's thread was killed and gave up on it, going on with it themselves. */
+/* 命令が FAILED で終わった後、または controller が下りているとき。もう上がっていれば true（その間に reset が済んだ）。
+   でなければ最初に来た者（generation がまだ seen）が一度だけ立ち上げ直し、後の者は上がらなかったと知る。立ち上げ
+   直す者の thread が kill で諦めたなら、後の者が続ける。眠りの間（asleep）は立ち上げず false。 */
 static bool recover(struct nvme *c, uint64_t seen) {
     mutex_lock(&c->reset_lock);
     bool moved = __atomic_load_n(&c->generation, __ATOMIC_ACQUIRE) != seen;
     bool ready = __atomic_load_n(&c->ready, __ATOMIC_ACQUIRE);
-    bool ok = ready || (moved && !__atomic_load_n(&c->called_off, __ATOMIC_ACQUIRE) ? false : enable_recorded(c));
+    bool ok = !c->asleep &&
+              (ready || (moved && !__atomic_load_n(&c->called_off, __ATOMIC_ACQUIRE) ? false : enable_recorded(c)));
     mutex_unlock(&c->reset_lock);
     return ok;
 }
@@ -1009,6 +1018,10 @@ static void nvme_submit(struct blkdev *d, struct blk_request *chain) {
         queue_chain(c, chain);
         return;
     }
+    if (__atomic_load_n(&c->asleep, __ATOMIC_ACQUIRE)) { /* resume の後に thread が出す */
+        retry_push(c, chain);
+        return;
+    }
     while (chain) { /* the controller does not come up */
         struct blk_request *next = chain->next;
         chain->next = NULL;
@@ -1018,9 +1031,10 @@ static void nvme_submit(struct blkdev *d, struct blk_request *chain) {
 }
 
 /* ---- the controller's thread ---- */
-/* The commands waiting to be given again: each one that has had its tries, or whose controller is
-   out of use, ends; the rest go to the queue, after a reset where the controller is down. */
+/* 出し直しを待つ命令。試しを使い切ったもの、使えない controller のものは終わり、残りは queue へ（下りた controller は
+   立ち上げ直してから）。眠りの間は待たせ、resume の work_wake で呼び直される。 */
 static void retries_run(struct nvme *c) {
+    if (__atomic_load_n(&c->asleep, __ATOMIC_ACQUIRE)) return;
     uint64_t f = spin_lock(&c->retry_lock);
     struct blk_request *chain = c->retry;
     c->retry = NULL;
@@ -1028,8 +1042,14 @@ static void retries_run(struct nvme *c) {
     spin_unlock(&c->retry_lock, f);
     if (!chain) return;
     bool cut = __atomic_load_n(&c->cut, __ATOMIC_ACQUIRE);
-    if (!cut && !__atomic_load_n(&c->ready, __ATOMIC_ACQUIRE))
-        cut = !recover(c, __atomic_load_n(&c->generation, __ATOMIC_ACQUIRE));
+    if (!cut && !__atomic_load_n(&c->ready, __ATOMIC_ACQUIRE) &&
+        !recover(c, __atomic_load_n(&c->generation, __ATOMIC_ACQUIRE))) {
+        if (__atomic_load_n(&c->asleep, __ATOMIC_ACQUIRE)) { /* 取った後に眠った */
+            retry_push(c, chain);
+            return;
+        }
+        cut = true;
+    }
     struct blk_request *again = NULL, **tail = &again;
     for (struct blk_request *r = chain, *next; r; r = next) {
         next = r->next;
@@ -1193,6 +1213,122 @@ static void nvme_detach(struct hal_device *d) {
     }
 }
 
+/* ---- 眠り、休止、電源断（hal/hal.h の suspend と resume）----
+   どちらも電源の walk の thread で、割り込みは開き、ほかの CPU も thread も動いている。controller の thread は門
+   （hal_busy_begin）で待つので、完了を読むのも時間を見るのもここの仕事。データの道は asleep と ready で閉じる。 */
+
+/* ready を下ろした後、出ている I/O の命令の終わり（3.6.1 の 1a）。割り込みの無い controller は自分で読む。時間の内に
+   終わらない命令は、続く queue の削除か Controller Reset が終える。 */
+static void io_drain(struct nvme *c) {
+    uint64_t deadline = clock_after(IO_NS);
+    while (__atomic_load_n(&c->inflight, __ATOMIC_ACQUIRE) && clock_now_ns() < deadline) {
+        for (unsigned i = 0; !c->nvectors && i < c->nio; i++) poll_queue(&c->io[i]);
+        sleep_until(clock_after(NS_PER_MS));
+    }
+}
+
+/* I/O の queue を消す命令（op は OP_DELETE_SQ か OP_DELETE_CQ）を全部の queue に。一つでも成らなければ false。 */
+static bool queues_delete(struct nvme *c, uint32_t op) {
+    for (unsigned i = 0; i < c->nio; i++) {
+        uint32_t cmd[16] = {op};
+        cmd[10] = c->io[i].qid;
+        int r = run(c, cmd, ADMIN_NS, NULL);
+        if (!r) continue;
+        kprintf("nvme%d: deleting I/O %s queue %u failed (%x)\n", c->index,
+                op == OP_DELETE_SQ ? "submission" : "completion", c->io[i].qid, r);
+        return false;
+    }
+    return true;
+}
+
+/* I/O の命令を止める（3.6.1 の 1）。ready を下ろして各 queue の提出の錠を通れば、新しい命令は入らない（queue_chain は
+   retry の列へ回す）。出ている命令の終わりを待ち、提出の queue を全部、続けて完了の queue を全部消す（5.3.4、5.3.3：
+   完了の queue は、それを使う提出の queue が消えてから）。消えた提出の queue の、完了の項の無い命令は暗に終わった
+   （5.3.4）：queue_clear が retry の列へ回す。消せない queue があれば、Controller Reset が全部の命令を終える（3.7.2）。
+   下りた controller（live でない）の queue は、下ろした stop か立ち上げの失敗の後で、命令を持たない。
+   reset_lock の下。 */
+static void io_stop(struct nvme *c) {
+    __atomic_store_n(&c->ready, false, __ATOMIC_RELEASE);
+    for (unsigned i = 0; i < c->nio; i++) queue_pass(&c->io[i]);
+    io_drain(c);
+    if (!__atomic_load_n(&c->live, __ATOMIC_ACQUIRE)) return;
+    if (queues_delete(c, OP_DELETE_SQ) && queues_delete(c, OP_DELETE_CQ)) {
+        for (unsigned i = 0; i < c->nio; i++) queue_clear(&c->io[i]);
+        return;
+    }
+    /* run が時間切れで止めたなら、もう下りている */
+    if (__atomic_load_n(&c->live, __ATOMIC_ACQUIRE)) controller_stop(c, __atomic_load_n(&c->stops, __ATOMIC_ACQUIRE));
+}
+
+/* 正常の shutdown（3.6.1 の 2）：CC.SHN を 01b にし（EN はそのまま。EN が 0 の controller も shutdown を処理する、
+   Figure 85）、CSTS.SHST が完了（10b）を言うまで待つ。待つのは少なくとも RTD3E（0 なら 1 秒）で、上限は仕様に無い。
+   始まった shutdown は我々の上限まで待つ（cache は時間より重い）。その時までに始まらない、予約の値（Figure 42）、
+   致命の状態、消えた controller は終わらない。CSTS.ST が 1 なら NVM subsystem の shutdown で、その完了も電源を切って
+   よいと言う（3.6.3）。 */
+static bool shutdown_notify(struct nvme *c) {
+    uint32_t csts = rd32(c, CSTS);
+    if (csts == 0xFFFFFFFFu) {
+        kprintf("nvme%d: vanished before its shutdown\n", c->index);
+        return false;
+    }
+    if (CSTS_SHST(csts) == SHST_DONE) return true;
+    wr32(c, CC, (rd32(c, CC) & ~CC_SHN) | CC_SHN_NORMAL);
+    uint64_t least = c->rtd3e ? (uint64_t)c->rtd3e * NS_PER_US : NS_PER_S;
+    uint64_t begun_by = clock_after(least), last = clock_after(MAX(least, (uint64_t)SHUTDOWN_MOST_NS));
+    for (;;) {
+        csts = rd32(c, CSTS);
+        if (csts == 0xFFFFFFFFu || csts & CSTS_CFS) break;
+        unsigned shst = CSTS_SHST(csts);
+        if (shst == SHST_DONE) return true;
+        uint64_t now = clock_now_ns();
+        if (shst == SHST_RESERVED || now >= last || (shst == SHST_NONE && now >= begun_by)) break;
+        sleep_until(clock_after(NS_PER_MS));
+    }
+    kprintf("nvme%d: its shutdown did not complete (status %x)\n", c->index, csts);
+    return false;
+}
+
+/* データの道を閉じ（asleep）、I/O の queue を消す（io_stop）。電源が去る SLEEP と OFF では続けて正常の shutdown を
+   知らせる（CC.SHN は電源が去る前と PCI の電源の状態が変わる前に書く、Figure 41。D3 に入る前も、3.6.1）。IMAGE では
+   電源も PCI の状態も変わらず、I/O の queue の無い controller は何も動かさない。止めた controller（cut）は BME が
+   切れて何も動かさないが、別の装置（stranger）には電源が去ることを知らせる。終わっていない FLR の機能には次の
+   pci_function_reset のほかは触れない（dev/pci.h）。false は shutdown が完了しない（電源を切ってよいと言わない）。 */
+static bool nvme_suspend(struct hal_device *d, enum hal_power_target target) {
+    struct nvme *c = d->driver_data;
+    bool power_goes = false;
+    switch (target) {
+    case HAL_POWER_SLEEP:
+    case HAL_POWER_OFF: power_goes = true; break;
+    case HAL_POWER_IMAGE: break;
+    }
+    mutex_lock(&c->reset_lock);
+    __atomic_store_n(&c->asleep, true, __ATOMIC_RELEASE);
+    bool cut = __atomic_load_n(&c->cut, __ATOMIC_ACQUIRE), stranger = cut && c->stranger, stopped = true;
+    if (!pci_reset_left(c->pci) && (!cut || stranger)) {
+        io_stop(c);
+        controller_down(c);
+        if (power_goes) stopped = shutdown_notify(c) || stranger;
+    }
+    mutex_unlock(&c->reset_lock);
+    return stopped;
+}
+
+/* suspend の後。controller は電源を失って初めから始まるか（眠りの D3hot から D0 の内の reset、D3cold）、shutdown を
+   終えたままか（休止の写しの戻り：起動したカーネルが電源断の walk で shutdown した）、I/O の queue を消したまま動いて
+   いる（写し、取りやめ）。どれも enable の Controller Reset から 3.5.1 の順で立ち上げる（shutdown の後に命令を出すには
+   CLR が要る、3.6.1）。Identify が同じ装置かを確かめ、別の装置なら使わない。眠りの間に来た要求は retry の列から出る。
+   true なら I/O の queue は命令を受ける。 */
+static bool nvme_resume(struct hal_device *d) {
+    struct nvme *c = d->driver_data;
+    mutex_lock(&c->reset_lock);
+    __atomic_store_n(&c->asleep, false, __ATOMIC_RELEASE);
+    bool up = enable_recorded(c);
+    mutex_unlock(&c->reset_lock);
+    work_wake(c);
+    if (!up) kprintf("nvme%d: did not come back after the sleep\n", c->index);
+    return up;
+}
+
 static const struct n_hal_rule nvme_rules[] = {N_PCI_CLASS_PROGIF(0x01, 0x08, 0x02)};
 static const struct hal_driver nvme_driver = {
     .name = "nvme",
@@ -1200,5 +1336,8 @@ static const struct hal_driver nvme_driver = {
     .rule_count = ARRAY_SIZE(nvme_rules),
     .attach = nvme_attach,
     .detach = nvme_detach,
+    .suspend = nvme_suspend,
+    .resume = nvme_resume,
+    .after_sleep = HAL_AFTER_SLEEP_RESUME,
 };
 HAL_DRIVER(nvme_driver);
