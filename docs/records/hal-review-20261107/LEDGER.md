@@ -250,6 +250,46 @@
 - 種類の層の口（block の要求と DMA の写し、網の送受の輪）。
 - ACPI の像と電源の管理者の口（`_TTS`・`_PTS`・`_WAK`・SLP_TYP、GPE と SCI）。
 
+## 3.5 段 F の設計
+
+**像の形式**（`common/image_format.h`）
+- プログラム、利用者の像、カーネルの実装の像は一つの形式で、頭の kind で分ける。表は区画、基底の再配置、輸入、型つきの注記、名の文字列。輸出の表は像に無い：どの像も入口を一つ持ち、カーネルの輸出の表は DDK の一覧から生成する。
+- 区画の中身はファイルの頁の境から：読み取り専用で slot の無い区画は文書の頁を共有して写す（今の `program_map`）。
+- 利用者の像の再配置はカーネルが写すときに当てる。`user/libc/driver_image.c` は TLS（`struct n_image` で受ける）と構築子だけを行う。
+- 変換が ELF の再配置を解く：`RELATIVE` と自分の記号への `64` は基底の再配置、未定義の記号への `GLOB_DAT`・`JUMP_SLOT`・`64` は輸入（実装の像だけ）、`DTPMOD64` は 1（C ライブラリーの写し一つが TLS の module 一つ）、`DTPOFF64` は addend。知らない型、ほかの kind の未定義の記号は変換の失敗。
+- 規則は実装の C の表（`.nocturne.rules` の区画）に書き、変換が再配置で指を辿って `N_IMAGE_NOTE_RULE` にする。装置の管理者は像を写さずに注記だけを読む。
+
+**変換と道具の鎖**
+- `common/image_write.c`：ELF64 の ET_EXEC（プログラム、base は link の番地）と ET_DYN（像、base 0）から像を書く。ホストの道具 `host/image/` とゲストのプログラム `image` が同じ部品を組む。
+- ホストの組み：Makefile のプログラム、試験、利用者の像、実装の像の link のあとに変換。`build/programs/` と `build/drivers/` に入るのは像だけ。
+- ゲストの clang（`ports/llvm/nocturne.patch` の Nocturne の toolchain）はリンクのあとに変換の段を持ち、`-o` の名に像を書く。tcc は出力の段で変換の部品を呼ぶ。Go と Rust の移植の link も同じ。
+- カーネルは ELF を読まない：`proc_launch`・`proc_image_map` の ELF の読み手と、tcc の古い組みを許す道（「entry point is not executable」）を消す。ELF が残るのは組みの中間物と、Limine が読む `kernel.elf` だけ。
+
+**DDK**（`ddk/`）
+- 見出し：`ddk.h`（版 `N_DDK_MAJOR`・`N_DDK_MINOR`、入口 `n_driver_entry`、規則の表の宣言）、`core.h`（メモリー、錠、待ち、thread、仕事の列、期限、時計、ログ、乱数、CPU と node）、`device.h`（装置、性質、資源、写し、ポート、割り込み、DMA、電源の段、子を出す、装置の間の口、失敗と回復、レジスターを期限つきで待つ）、バスの口（`pci.h`、`usb.h`、`acpi.h`）、種類の口（`block.h`、`net.h`、`audio.h`、`input.h`、`screen.h`）。形は 3.4 の「DDK の口」。
+- 型：中身を見せない handle と、頭に大きさの欄を持つ構造体。錠と待ちは大きさを決めた不透明な物で、カーネルの側が `_Static_assert` で大きさを合わせる。実装はカーネルの見出しを include しない（`check_boundaries` が `drivers/` の include を `ddk/` だけに縛る）。
+- 輸出の一覧 `ddk/exports.list`（名、一行に一つ）が宣言。`scripts/build_ddk.py` が `build/ddk/exports.c`（カーネルの表、名で並べ、DDK の見出しを include して `&名` を取る：一覧にあって見出しに無い名は組みの誤り）と `build/ddk/libnocturne_kernel.so`（名だけを持つ共有 object：見出しにあって一覧に無い名は、実装の `-z defs` の link の誤り）を作る。
+- カーネルの側：DDK の関数は装置の管理者（`io/ddk_*.c`）と核の上に置く。DDK は ABI の境なので本物の継ぎ目で、包みの禁止に当たらない。
+- 版：同じ major で、像の minor がカーネルの minor 以下なら読む。major を上げたら全部の実装を組み直す。
+
+**読み込み**（`kernel/src/io/load.c`）
+- 起動の束（`N_IMAGE_BUNDLE_MAGIC`、Limine の module `drivers`、`limine.conf` に一行）：装置の管理者が始まるときに全部の注記を読み、規則を登録する。束を作るのは `scripts/layout.py`（`N_IMAGE_DRIVER_BOOT` の像を集める）。
+- C: が開いたら `C:\Nocturne\Drivers` の実装の像の注記を読み、残りの規則を登録する。同じ名の像は C: の方が新しい版なら替える。
+- 合う装置が出たら：像を核の番地（`mm/vmalloc.c`）へ写し、再配置と輸入を当て、区画に権限を付け（text は RX、rodata は R、data は RW で NX）、`n_driver_entry` を呼ぶ。像は結んだ装置が無く参照が 0 で外す。読めない像（版、解けない名、壊れた表）は台帳に理由を出す。
+- 起動の束に入る像：起動の媒体を読むまでの全部（PCI、ACPI、NVMe、AHCI、xHCI と USB の核と hub と usbmsc、VMBus と storvsc、画面）。
+
+**組みの置き場所**
+- 実装の像のソースは `drivers/<名>/`。`ddk/` だけを include し、`-fPIC -fvisibility=hidden`、`-shared -z defs -z now -Bsymbolic` で `libnocturne_kernel.so` に結ぶ。
+- バスも像（D14）：PCI は構成の空間を機械の HAL から DDK の `n_platform_*`（バスの実装だけが使う部分）で受ける。ACPI の像は uACPI を持ち、名前空間・評価・Notify・電源の資源・眠りの値・GPE と SCI を、電源の管理者と装置の管理者へ型つきの口で渡す。機械の HAL は静的な表（MADT など）を自分で読む。VMBus の像は Hyper-V の機械の装置が置く口（hypercall、SynIC）を引く。
+
+**段 F の分け方**
+- F1：像の形式の読み手、変換、道具の鎖（ホスト、ゲストの clang・tcc、Go、Rust）、カーネルのプログラムと利用者の像の読み込み。ELF の読み手を消す。
+- F2：DDK の見出しと輸出の一覧と生成、カーネルの側の DDK、`io/load.c`、起動の束、`C:\Nocturne\Drivers` の走査。`struct io_driver` と区画 `.io_drivers` を消す。
+- F3：実装を `drivers/<名>/` の像に（block、網、音、入力と USB の装置、画面、VM の装置）。
+- F4：バスを像に（PCI、VMBus、ACPI）。USB の核は段 G。
+- F5：導入の形式（宣言と中身。実装の像、任意の機能、アプリを同じ形で入れる）。
+- F1 と E は別のファイルを触るので並べる。F2 は E の後。F3 と F4 は F2 の後に実装の組ごとに並べる。
+
 ## 4. 段
 
 | 段 | 中身 | 状態 |
