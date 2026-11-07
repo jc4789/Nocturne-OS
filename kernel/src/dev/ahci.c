@@ -13,7 +13,6 @@
    given again alone where a failure is its own, run one at a time on the disk's own thread
    (blk_serial_start). A disk without queuing takes one command at a time on that thread. The data
    goes straight between the disk and the caller's memory, a PRD for each segment of the request;
-   an adapter that reaches only the first 4 GiB goes through a buffer below it, one request at a time.
 
    Completions arrive by MSI or INTx, or are polled when the platform offers none. A thread for each
    adapter handles what may wait: a device that came or went (7.3, 6.2.2.3), what an HBA reset left
@@ -195,10 +194,6 @@ struct port {
     struct disk *disks; /* atomic: every one it has seen, newest first */
     uint64_t retry_at, retry_ns; /* a device that did not answer: its next look (the examiner's) */
     bool looking; /* atomic: it counts in hal_settled until a look has said who is there (port_looked) */
-    /* An adapter that reaches only the first 4 GiB: every transfer through this buffer below it, one
-       at a time (the disk's thread). NULL for every other. */
-    uint8_t *low;
-    uint64_t low_phys;
     unsigned requests; /* atomic: the slots issued that have a request */
 
     /* Under lock, with the interrupt handler: the slots taken (a command being put together or in
@@ -875,8 +870,6 @@ static unsigned prds(struct port *p, uint8_t *table, const struct blk_segment *s
     uint32_t *prd = (uint32_t *)(table + PRDT_AT);
     if (count > PRDS) return 0;
     for (unsigned i = 0; i < count; i++) {
-        uint64_t bus = hal_dma_address(p->h->hal, segs[i].phys);
-        if (!p->h->s64 && bus + segs[i].bytes > 1ull << 32) return 0;
         uint32_t *e = &prd[4 * i];
         e[0] = (uint32_t)bus;
         e[1] = (uint32_t)(bus >> 32);
@@ -1106,16 +1099,6 @@ static void ahci_submit(struct blkdev *b, struct blk_request *chain) {
 
 static const struct blk_ops ahci_ops = {.submit = ahci_submit};
 
-/* r's data between the request's memory and the port's low buffer. */
-static void low_copy(uint8_t *low, const struct blk_request *r, bool into_low) {
-    for (uint32_t i = 0; i < r->segment_count; i++) {
-        uint8_t *memory = phys_to_virt(r->segments[i].phys);
-        if (into_low) memcpy(low, memory, r->segments[i].bytes);
-        else memcpy(memory, low, r->segments[i].bytes);
-        low += r->segments[i].bytes;
-    }
-}
-
 /* FLUSH CACHE（EXT）の FIS：write cache を媒体へ。 */
 static void flush_fis(const struct disk *d, uint8_t fis[20]) {
     fis_make(fis, d->lba48 ? ATA_FLUSH_CACHE_EXT : ATA_FLUSH_CACHE, 0, 0, false, false);
@@ -1138,15 +1121,8 @@ static int transfer(struct blkdev *b, const struct blk_request *r) {
     struct port *p = d->p;
     if (r->op == BLK_PERSIST) return __atomic_load_n(&d->cache, __ATOMIC_ACQUIRE) && flush(d) < 0 ? -N_ERR_IO : 0;
     bool write = r->op == BLK_WRITE;
-    unsigned bytes = r->sectors * 512;
-    struct blk_segment low = {p->low_phys, bytes};
     const struct blk_segment *segs = r->segments;
     unsigned count = r->segment_count;
-    if (p->low) {
-        if (write) low_copy(p->low, r, true);
-        segs = &low;
-        count = 1;
-    }
     uint8_t fis[20];
     request_fis(d, r, fis);
     bool alone = !d->ncq;
@@ -1154,7 +1130,6 @@ static int transfer(struct blkdev *b, const struct blk_request *r) {
         int rc = command(d, fis, d->ncq, alone, write, segs, count, IO_NS);
         if (rc != -1) {
             if (rc) return -N_ERR_IO;
-            if (p->low && !write) low_copy(p->low, r, false);
             return 0;
         }
         if (alone) failed_alone++;
@@ -1176,7 +1151,6 @@ static bool identify(struct port *p, int slot, struct disk *d, char model[41], b
     uint8_t fis[20];
     fis_make(fis, ATA_IDENTIFY, 0, 0, false, false);
     fis[7] = 0;
-    const struct blk_segment page = {bus - p->h->hal->dma_offset, 512};
     if (command_in(p, slot, fis, false, false, &page, 1, IO_NS)) {
         hal_dma_free(p->h->hal, id);
         *again = true;
@@ -1264,16 +1238,6 @@ static void port_examine(struct port *p) {
         else if (!sig || sig == 0xFFFFFFFFu) again = true; /* no signature: its first FIS is to come (3.3.9) */
         else kprintf("ahci%d: port %u: %s, skipped\n", h->index, p->no,
                      sig == 0xEB140101u ? "an ATAPI drive" : sig == 0x96690101u ? "a port multiplier" : "not a disk");
-    }
-    if (is_disk && !h->s64 && !p->low) {
-        uint64_t bus;
-        if ((p->low = hal_dma_alloc(h->hal, XFER_PAGES * PAGE_SIZE, 32, &bus))) {
-            p->low_phys = bus - h->hal->dma_offset;
-        } else {
-            kprintf("ahci%d: port %u: no memory below 4 GiB for its transfers\n", h->index, p->no);
-            is_disk = false;
-            again = true;
-        }
     }
     if (again) {
         uint64_t wait = p->retry_ns ? MIN(2 * p->retry_ns, (uint64_t)RETRY_MOST_NS) : RETRY_NS;

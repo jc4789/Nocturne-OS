@@ -26,21 +26,6 @@ struct iommu_id {
     uint16_t segment, requester;
 };
 
-/* A function the kernel drives that may share a group with one an app claims (a graphics card's sound
-   function with its display function): its driver lets go of the group's isolation changing and comes
-   back into the claim's domain, so the claim is not refused for it.
-   stop: before its group joins a domain or a claim of it ends: nothing it sends goes out any more, and
-   its interrupts are off. It may sleep, and nothing it holds waits for the claim.
-   start: once the claim is formed, dom being its domain, in which the function's memory is then to be
-   mapped (iommu_map, at its own addresses), and whose interrupt messages are the claimed function's: it
-   uses its INTx or none. NULL: the domain did not come about, and its group is as it was.
-   A group whose claim ended stays blocked, so the function stays stopped until the next claim. */
-struct iommu_guest {
-    void (*stop)(void *ctx);
-    void (*start)(struct iommu_domain *dom, void *ctx);
-    void *ctx;
-};
-
 void iommu_init(void); /* after pci_init, before a driver enables an interrupt */
 bool iommu_active(void); /* the units translate DMA: claims can be isolated */
 /* false: unconfirmed hardware state, or units that did not come back from a sleep, forbid
@@ -59,10 +44,6 @@ bool iommu_power_ready(void);
    which only its reset may access: the group is formed once that is done. ACS controls the
    attempt turned on are put back as they were when no domain comes of it. */
 int iommu_attach(struct pci_device *d, struct iommu_domain **out, struct pci_device **resetting);
-/* The guests among dom's members: stopped before a claim of them ends (iommu_attach stops them before
-   the domain is attached); started with dom once the claim is formed (formed), or NULL. */
-void iommu_guests_stop(const struct iommu_domain *dom);
-void iommu_guests_start(struct iommu_domain *dom, bool formed);
 /* Whether d is in a domain: attached, or blocked without the units' confirmation. */
 bool iommu_in_use(const struct pci_device *d);
 /* Whether d is a member of dom (its claimed function or the rest of its group). */
@@ -236,7 +217,6 @@ void iommu_entry_write(volatile uint64_t *e, uint64_t v);
    half done, as both formats ask of an entry in use (VT-d 5.1.4, AMD-Vi 2.3.2), then flushed the
    same way. */
 void iommu_entry_write16(volatile uint64_t *e, uint64_t lo, uint64_t hi);
-void iommu_cache_flush(const volatile void *p, size_t bytes);
 /* Zeroed physically contiguous pages for hardware tables/queues. Addresses fit every unit's
    physical width and the page-table format; freed with pmm_free_contig. */
 uint64_t iommu_alloc_pages(size_t count);

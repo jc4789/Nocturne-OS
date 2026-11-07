@@ -148,10 +148,6 @@ static void disk_register(struct hal_device *hal, int i) {
 
 static int ata_attach(struct hal_device *d) {
     if (ndisks) return -N_ERR_EXISTS;
-    probe(0x1F0, 0x3F6, false);
-    probe(0x1F0, 0x3F6, true);
-    probe(0x170, 0x376, false);
-    probe(0x170, 0x376, true);
     if (!ndisks) return HAL_DECLINE;
     for (int i = 0; i < ndisks; i++) disk_register(d, i);
     return 0;

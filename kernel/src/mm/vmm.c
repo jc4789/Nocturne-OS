@@ -585,12 +585,6 @@ bool vmm_direct_type(const uint64_t *frames, uint64_t base, size_t pages, uint64
             spin_unlock(&kernel_space.lock, f);
         }
     vmm_gather_finish(&g);
-    if (type)
-        for (size_t i = 0; i < pages; i++) {
-            uint8_t *p = phys_to_virt(frames ? frames[i] : base + i * PAGE_SIZE);
-            for (size_t at = 0; at < PAGE_SIZE; at += cpu_features.clflush_bytes)
-                __asm__ volatile("clflush (%0)" ::"r"(p + at) : "memory");
-        }
     __asm__ volatile("mfence" ::: "memory");
     return true;
 }

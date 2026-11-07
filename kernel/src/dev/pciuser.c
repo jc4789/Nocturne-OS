@@ -262,7 +262,6 @@ static int claim_form(struct pci_claim *c) {
     guards_init(c); /* pending FLR is complete: capability offsets/control now describe the claim */
     /* BAR sizes come from enumeration (pci_bar_size): measuring them here would switch memory
        decoding off under a running function, and the boot screen may be drawn through it. */
-    if (c->domain) iommu_guests_start(c->domain, true);
     return 0;
 }
 
@@ -428,7 +427,6 @@ static bool pci_end(struct hal_claim *hc) {
     struct pci_claim *c = hal_claim_bus(hc);
     struct pci_device *d = c->d;
     mutex_lock(&claim_mutex); /* no claim forms a group with these functions meanwhile */
-    if (c->domain) iommu_guests_stop(c->domain);
     bool left_running;
     bool stopped = pci_disable_busmaster(d, &left_running);
     if (c->domain && c->domain->nmembers > 1) {

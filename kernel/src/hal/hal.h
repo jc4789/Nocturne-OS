@@ -39,7 +39,6 @@ struct hal_claim;
 struct hal_claim_ops;
 struct hal_offer_entry;
 struct hal_depend_entry;
-struct hal_dma_block;
 struct firmware_node;
 struct irq;
 struct irq_spec;
@@ -144,7 +143,6 @@ struct hal_device {
     uint32_t bus;
     const struct hal_bus_ops *ops;
     int node;            /* 近い NUMA node。-1：知らない */
-    uint64_t dma_offset; /* バスから見た番地 - 物理番地 */
     struct n_hal_prop *props;
     uint8_t *prop_bytes;
     uint32_t prop_count, prop_bytes_used;
@@ -169,7 +167,6 @@ struct hal_device {
     uint32_t power_level;          /* その段 */
     struct hal_offer_entry *offers;
     struct hal_depend_entry *depends;
-    struct hal_dma_block *dma;
     struct mutex bind; /* attach、detach、claim の始まり、hal_remove を一度に一つにする */
     uint32_t holds;    /* 記録を読んでいる attach の thread、claim、呼出しの数。hal_remove は 0 を待つ。hal_lock の下 */
     uint32_t offer_count, depend_count;
@@ -216,12 +213,6 @@ void hal_enable(struct hal_device *d, unsigned what); /* HAL_ENABLE_* */
 unsigned hal_irq_enable(struct hal_device *d, const struct irq_spec *specs, unsigned count, struct irq **irqs);
 void hal_irq_disable(struct hal_device *d);
 unsigned hal_irq_max(struct hal_device *d);
-/* DMA のメモリー：装置に近い node から、ゼロで埋めて、連続で。bits は装置が読める番地の幅（0：制限なし）。*bus は
-   装置へ渡す番地。実装が手放さなければ、detach の後に HAL が返す。 */
-void *hal_dma_alloc(struct hal_device *d, size_t bytes, unsigned bits, uint64_t *bus);
-void hal_dma_free(struct hal_device *d, void *memory);
-/* 実装が別の道で得た物理番地を、装置へ渡す番地にする。データの道で呼んでよい。 */
-static inline uint64_t hal_dma_address(const struct hal_device *d, uint64_t phys) { return phys + d->dma_offset; }
 
 /* 実装の状態。どの文脈からでも呼べる。 */
 void hal_name(struct hal_device *d, const char *name);

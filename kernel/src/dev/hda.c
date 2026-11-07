@@ -14,10 +14,6 @@
    始まりからの frame の数は回り込まない：輪の一周を見落としても数えすぎても、数のどこに frame があるかが変わるだけで、
    link が輪のどの frame にいるかは変わらない。時計は、とても遅れて来た読みが何周を見落としたかだけを言う。
 
-   機能のメモリーはカーネルのもので、カーネルが動かす全部の機能と同じく IOMMU を訳されずに通る。graphics card の音の
-   機能は、アプリが動かす画面の機能（dev/pciuser.c）と同じ隔離の組にいることがある。そのときは claim の客
-   （iommu_guest）になる：組が持ち主を変える間は止まり、その後は claim の domain に写したメモリーで動き直す。
-
    電源（hal/hal.h）。suspend は stream を止め（輪の中身は失われ、生成が進む）、codec の function group を D3 にし、
    link を reset に入れる（4.5.8.2）。resume は link を reset から上げ、thread が codec の設定を初めから戻す（4.5.8.1：
    D3 から D0 に戻った codec の設定は残っていると思わない）。開いている出口の道は次の run が引き直す。
@@ -35,7 +31,6 @@
 #include "arch/irq.h"
 #include "arch/spin.h"
 #include "dev/hda_codec.h"
-#include "dev/iommu.h"
 #include "dev/pci.h"
 #include "hal/hal.h"
 #include "mm/heap.h"
@@ -148,11 +143,9 @@ struct hda {
     struct pci_device *pci;
     struct hal_device *hal;
     volatile uint8_t *regs; /* メモリーの BAR（hal_map） */
-    uint64_t dma_phys, dma_bus; /* 輪と descriptor の頁：CPU から見た番地と、制御器へ渡す番地 */
     uint32_t *corb;
     volatile uint64_t *rirb;
     struct bdl_entry *bdl;
-    struct iommu_guest guest;
     /* link_up が GCAP から書き、変わらない。割り込みは錠なしで読む */
     volatile uint8_t *sd; /* 出力の stream の descriptor のレジスター */
     unsigned sd_index;    /* と、INTCTL と INTSTS でのその bit */
@@ -160,7 +153,6 @@ struct hda {
 
     /* state の下 */
     struct mutex state;
-    bool stopped;   /* claim の客で、使われていない */
     bool probed;
     bool restore;   /* link が reset から上がった：codec に全部をもう一度言う */
     bool responses; /* 制御器の割り込みが開き、答えのたびに一つ来る */
@@ -176,7 +168,6 @@ struct hda {
     uint16_t codec_present; /* link を上げた時に STATESTS が言った codec */
     bool quiet; /* 割り込みが無い：tick が音の層に知らせ、thread は POLL_NS ごとに見る */
     struct alarm tick;
-    struct iommu_domain *guest_dom; /* メモリーを写しておく claim の domain */
 
     /* stream の下：音の層の呼出しのもの */
     struct mutex stream;
@@ -328,7 +319,6 @@ static void rirb_take(struct hda *h) {
     while (h->rirb_rp != wp) {
         unsigned at = (h->rirb_rp + 1) & (h->rirb_entries - 1);
         h->rirb_rp = at;
-        iommu_cache_flush(&h->rirb[at], sizeof h->rirb[at]);
         uint64_t entry = h->rirb[at];
         unsigned extended = (unsigned)(entry >> 32);
         if (extended & 0x10) h->sense_due |= (uint16_t)(1u << (extended & 15));
@@ -352,7 +342,6 @@ static uint32_t link_verb(struct hda_link *link, unsigned codec, unsigned nid, u
         h->answered = false;
         unsigned at = (h->corb_wp + 1) & (h->corb_entries - 1);
         h->corb[at] = (uint32_t)codec << 28 | (uint32_t)nid << 20 | command;
-        iommu_cache_flush(&h->corb[at], sizeof h->corb[at]);
         write16(h, CORBWP, (uint16_t)at);
         h->corb_wp = at;
     }
@@ -469,7 +458,6 @@ static bool stream_start(struct hda *h, struct hda_sink *o) {
     uint32_t bytes = block_bytes(h);
     for (unsigned i = 0; i < h->blocks; i++)
         h->bdl[i] = (struct bdl_entry){.address = h->ring_bus + i * bytes, .length = bytes, .flags = 1};
-    iommu_cache_flush(h->bdl, h->blocks * sizeof *h->bdl);
     uint64_t bdl = h->dma_bus + RINGS_PAGES * PAGE_SIZE;
     sd_write8(h, SD_CTL, CTL_SRST);
     bool reset = wait_bits(h->sd + SD_CTL, 1, CTL_SRST, CTL_SRST, STOP_NS);
@@ -530,12 +518,9 @@ static int hda_open(struct audio_output *output, const struct n_audio_device_for
     struct object *memory = shared_kernel_contig(pages, 32, &phys);
     if (!memory) return -N_ERR_NO_MEMORY;
     mutex_lock(&h->stream);
-    int r = h->open ? -N_ERR_BUSY : h->guest_dom && !iommu_map(h->guest_dom, NULL, phys, pages) ? -N_ERR_IO : 0;
     if (!r) {
         h->ring = phys_to_virt(phys);
-        iommu_cache_flush(h->ring, pages * PAGE_SIZE);
         h->ring_phys = phys;
-        h->ring_bus = hal_dma_address(h->hal, phys);
         h->ring_pages = pages;
         h->ring_object = memory;
         hda_output_select(o->out, word);
@@ -562,7 +547,6 @@ static void hda_close(struct audio_output *output) {
     __atomic_store_n(&h->open, NULL, __ATOMIC_RELEASE);
     if (h->routed) hda_output_disable(o->out);
     h->routed = false;
-    if (h->guest_dom) iommu_unmap(h->guest_dom, NULL, h->ring_phys, h->ring_pages);
     struct object *memory = h->ring_object;
     h->ring_object = NULL;
     h->ring = NULL;
@@ -748,15 +732,7 @@ static bool hda_suspend(struct hal_device *d, enum hal_power_target target) {
     (void)target;
     struct hda *h = d->driver_data;
     bool stopped = true;
-    mutex_lock(&h->state);
-    if (!h->stopped) {
-        mutex_lock(&h->stream);
-        stream_lose(h);
-        for (unsigned at = 0; at < 15; at++)
             if (h->codecs[at]) hda_codec_sleep(h->codecs[at]);
-        stopped = link_reset(h);
-        mutex_unlock(&h->stream);
-    }
     mutex_unlock(&h->state);
     if (!stopped) kprintf("audio: HD Audio at %04x:%02x:%02x.%x does not stop\n", PCI_ADDRESS_ARGS(h->pci->address));
     signal(h);
@@ -771,13 +747,6 @@ static bool hda_resume(struct hal_device *d) {
     struct hda *h = d->driver_data;
     bool back = true;
     mutex_lock(&h->state);
-    if (!h->stopped) {
-        mutex_lock(&h->stream);
-        stream_lose(h);
-        back = link_up(h);
-        h->restore = back;
-        mutex_unlock(&h->stream);
-    }
     mutex_unlock(&h->state);
     if (!back) {
         kprintf("audio: HD Audio at %04x:%02x:%02x.%x does not come out of reset after sleeping\n", PCI_ADDRESS_ARGS(h->pci->address));
@@ -786,50 +755,6 @@ static bool hda_resume(struct hal_device *d) {
     signal(h);
     tell_open(h);
     return back;
-}
-
-/* ---- claim の客 ---- */
-
-/* 組が持ち主を変える：出口が去り、続いて link と、それが送る全部が止まる。 */
-static void hda_guest_stop(void *ctx) {
-    struct hda *h = ctx;
-    mutex_lock(&h->state);
-    if (!h->stopped) {
-        for (struct hda_sink *o = h->sinks; o; o = o->next) audio_output_available(&o->output, false);
-        mutex_lock(&h->stream);
-        h->guest_dom = NULL;
-        h->stopped = true;
-        link_reset(h);
-        irq_off(h);
-        mutex_unlock(&h->stream);
-        pci_disable_busmaster(h->pci, NULL);
-    }
-    mutex_unlock(&h->state);
-}
-
-/* dom：メモリーをこれから写しておく claim の domain。NULL：組は元のまま。 */
-static void hda_guest_start(struct iommu_domain *dom, void *ctx) {
-    struct hda *h = ctx;
-    mutex_lock(&h->state);
-    if (h->stopped) {
-        if (dom && !iommu_map(dom, NULL, h->dma_phys, DMA_PAGES)) {
-            kprintf("audio: HD Audio at %04x:%02x:%02x.%x: its memory cannot be mapped in its group's domain\n", PCI_ADDRESS_ARGS(h->pci->address));
-        } else {
-            mutex_lock(&h->stream);
-            h->guest_dom = dom;
-            hal_enable(h->hal, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA);
-            h->stopped = false;
-            bool up = link_up(h);
-            if (up) irq_on(h);
-            mutex_unlock(&h->stream);
-            if (up) {
-                h->restore = true;
-                for (struct hda_sink *o = h->sinks; o; o = o->next) audio_output_available(&o->output, true);
-            } else kprintf("audio: HD Audio at %04x:%02x:%02x.%x does not come out of reset\n", PCI_ADDRESS_ARGS(h->pci->address));
-            signal(h);
-        }
-    }
-    mutex_unlock(&h->state);
 }
 
 /* ---- 見つける ---- */
@@ -842,8 +767,6 @@ static int hda_attach(struct hal_device *hal) {
         kprintf("audio: HD Audio at %04x:%02x:%02x.%x found, but no memory for it\n", PCI_ADDRESS_ARGS(d->address));
         return -N_ERR_NO_MEMORY;
     }
-    volatile uint8_t *regs = hal_map(hal, 0);
-    /* 4 GiB より下：どの制御器も届く（64OK は任意、3.3.2） */
     uint64_t bus;
     uint8_t *memory = regs ? hal_dma_alloc(hal, DMA_PAGES * PAGE_SIZE, 32, &bus) : NULL;
     if (!memory) {
@@ -857,8 +780,6 @@ static int hda_attach(struct hal_device *hal) {
     h->hal = hal;
     h->regs = regs;
     h->dma_bus = bus;
-    h->dma_phys = hhdm_virt_to_phys(memory);
-    iommu_cache_flush(memory, DMA_PAGES * PAGE_SIZE);
     h->corb = (uint32_t *)memory;
     h->rirb = (volatile uint64_t *)(memory + PAGE_SIZE / 2);
     h->bdl = (struct bdl_entry *)(memory + RINGS_PAGES * PAGE_SIZE);
@@ -874,12 +795,9 @@ static int hda_attach(struct hal_device *hal) {
     if (r) kprintf("audio: HD Audio at %04x:%02x:%02x.%x %s\n", PCI_ADDRESS_ARGS(d->address), up ? "has no stream to play on" : "does not come out of reset");
     if (!r) {
         irq_on(h);
-        h->guest = (struct iommu_guest){.stop = hda_guest_stop, .start = hda_guest_start, .ctx = h};
-        d->guest = &h->guest;
         h->thread = kthread_create("hda", hda_thread, h);
         if (!h->thread) {
             kprintf("audio: HD Audio at %04x:%02x:%02x.%x: no memory for its thread\n", PCI_ADDRESS_ARGS(d->address));
-            d->guest = NULL;
             irq_off(h);
             r = -N_ERR_NO_MEMORY;
         }

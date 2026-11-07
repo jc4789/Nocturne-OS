@@ -65,7 +65,6 @@ struct header { uint32_t type, flags; uint64_t fence; uint32_t ctx; uint8_t ring
 
 /* The one device this file drives (gpu_attach), and its bus addresses for what the device reads. */
 static struct hal_device *gpu_device;
-static uint64_t bus(uint64_t phys) { return hal_dma_address(gpu_device, phys); }
 static struct virtio_common *common;
 static volatile uint16_t *notify;
 /* ISR status (virtio 1.x 4.1.4.5), read by the handler on INTx alone: bit 0 says the queue raised
@@ -139,7 +138,6 @@ static void *cap_map(struct hal_device *d, unsigned cap, uint32_t *length) {
     /* Fixed caps only, not a guest-mappable host-memory aperture. */
     if (!base || !len || len > 65536 || off > (64u << 20) || base + off < base) return NULL;
     *length = len;
-    return vmm_map_mmio(base + off, len);
 }
 
 static bool transport_init(struct hal_device *d) {

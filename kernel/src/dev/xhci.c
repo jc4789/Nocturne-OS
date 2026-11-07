@@ -312,10 +312,6 @@ static inline void wr32(volatile uint8_t *b, unsigned off, uint32_t v) { mmio_wr
 static inline void wr64(volatile uint8_t *b, unsigned off, uint64_t v) { mmio_write64(b + off, v); } /* 5.1.1 */
 #define barrier() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 
-/* The address the controller is told for memory at a physical address, and back (hal_dma_address). */
-static uint64_t bus_of(const struct usb_hc *hc, uint64_t phys) { return hal_dma_address(hc->hal, phys); }
-static uint64_t phys_of(const struct usb_hc *hc, uint64_t bus) { return bus - hc->hal->dma_offset; }
-
 static bool hc_running(const struct usb_hc *hc) { return __atomic_load_n(&hc->running, __ATOMIC_ACQUIRE); }
 static bool removed(const struct usb_device *d) { return __atomic_load_n(&d->removed, __ATOMIC_ACQUIRE); }
 
@@ -363,29 +359,6 @@ static bool sleep_locked(struct wait_queue *wq, struct spinlock *lock, uint64_t 
     bool woke = wq_wait_locked_until(wq, lock, deadline);
     spin_take(lock);
     return woke;
-}
-
-static void *dma_page(uint64_t *phys) {
-    uint64_t p = pmm_alloc_zeroed();
-    if (!p) return NULL;
-    *phys = p;
-    return phys_to_virt(p);
-}
-
-/* `pages` (at most 16) contiguous zeroed pages inside one 64 KiB block: no xHCI structure of up
- * to 64 KiB may span such a boundary (6.0, Table 6-1). A run starts at a multiple of the power of
- * two at or above its size, so one of at most 16 pages never crosses one. */
-static void *dma_block(unsigned pages, uint64_t *phys) {
-    ASSERT(pages <= 16);
-    uint64_t base = pmm_alloc_contig(pages, 64);
-    if (!base) return NULL;
-    memset(phys_to_virt(base), 0, pages * 4096ull);
-    *phys = base;
-    return phys_to_virt(base);
-}
-
-static void dma_free(uint64_t phys, unsigned pages) {
-    for (unsigned i = 0; i < pages; i++) pmm_free(phys + i * 4096ull);
 }
 
 static void ring_reset(struct ring *r) {
@@ -2308,10 +2281,6 @@ static bool hc_start(struct usb_hc *hc) {
     hc->lec = rd32(hc->cap, 0x1C) & HCC2_LEC;
     hc->db = (volatile uint32_t *)(hc->cap + (rd32(hc->cap, 0x14) & ~3u));
     hc->rt = hc->cap + (rd32(hc->cap, 0x18) & ~0x1Fu);
-    if (!(hcc1 & 1)) {
-        kprintf("usb: controller %d lacks 64-bit addressing, skipped\n", hc->index);
-        return false;
-    }
     /* extended capabilities: take the controller from the firmware, learn each port's USB revision */
     hc_take_ownership(hc);
     for (unsigned x = cap_first(hc); x && x + 16 <= hc->bar_size; x = cap_next(hc, x)) {

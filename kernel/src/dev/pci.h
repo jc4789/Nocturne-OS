@@ -7,7 +7,6 @@
 struct pci_reset;
 struct pci_saved;
 struct irq;
-struct iommu_guest;
 struct iommu_irt;
 /* Where a function answers. A segment group has buses of its own, so a bus, device and function
    say nothing without it (ACPI MCFG, _SEG). */
@@ -65,7 +64,6 @@ struct pci_device {
     struct irq *intx;   /* its INTx line where hal_irq_enable found no message (pci.c) */
     bool no_messages;   /* hal_irq_enable gives INTx, not a message: set by whoever has the function in a
                            claim's domain, whose interrupt table is the claimed function's (dev/iommu.h) */
-    const struct iommu_guest *guest; /* that driver's way out of a claim of its group (dev/iommu.h), or NULL */
     bool claimed;      /* an app drives it (dev/pciuser.c) */
     bool iommu_blocked; /* in an ended claim's group: the IOMMU drops what it sends (dev/iommu.c) */
     bool needs_reset; /* stopped state unconfirmed, or residual state from an ended multi-function group */
