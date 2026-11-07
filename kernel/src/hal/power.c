@@ -5,14 +5,6 @@
 #include "kernel.h"
 #include "hal/internal.h"
 
-struct hal_depend_entry {
-    struct hal_depend_entry *next;
-    struct hal_device *on;
-};
-
-void hal_gate_close(void);
-void hal_gate_open(void);
-
 static struct hal_device *order_first, *order_last;
 
 static void order_clear(struct hal_device *d) {

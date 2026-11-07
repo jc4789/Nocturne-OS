@@ -173,8 +173,6 @@ static uacpi_iteration_decision walk_down(void *user, uacpi_namespace_node *node
     hal_device_init(&a->hal, N_BUS_ACPI, &acpi_bus_ops);
     a->node = node;
     if (!add_identity(a)) {
-        kfree(a->hal.props);
-        kfree(a->hal.prop_bytes);
         kfree(a);
         return UACPI_ITERATION_DECISION_CONTINUE;
     }
@@ -220,17 +218,3 @@ void acpi_devices_publish(void) {
                                    NULL);
     for (struct acpi_device *a = published; a; a = a->next) add_depends(a);
 }
-
-/* カーネルがすでに持っているもの：電源のボタンと蓋と割り込みの線（dev/acpi.c）、PCI のホスト（dev/pci.c）、HPET と RTC
-   （dev/refclock.c）、シリアルのポート（dev/serial.c）。これらの種類の持ち主は別にあり、ここは台帳に持ち主を見せる。 */
-static int system_attach(struct hal_device *d) { return 0; }
-static void system_detach(struct hal_device *d) {}
-static bool system_resume(struct hal_device *d) { return true; }
-static const struct n_hal_rule system_rules[] = {
-    N_ACPI_ID("PNP0C0C"), N_ACPI_ID("PNP0C0D"), N_ACPI_ID("PNP0C0F"), N_ACPI_ID("PNP0A03"), N_ACPI_ID("PNP0A08"),
-    N_ACPI_ID("PNP0103"), N_ACPI_ID("PNP0B00"), N_ACPI_ID("PNP0501"),
-};
-static const struct hal_driver acpi_system_driver = {.name = "system", .rules = system_rules,
-                                                     .rule_count = ARRAY_SIZE(system_rules), .attach = system_attach,
-                                                     .detach = system_detach, .resume = system_resume};
-HAL_DRIVER(acpi_system_driver);
