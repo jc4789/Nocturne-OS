@@ -8,6 +8,7 @@ struct pci_reset;
 struct pci_saved;
 struct irq;
 struct iommu_irt;
+struct iommu_domain;
 /* Where a function answers. A segment group has buses of its own, so a bus, device and function
    say nothing without it (ACPI MCFG, _SEG). */
 struct pci_address {
@@ -64,6 +65,9 @@ struct pci_device {
     struct irq *intx;   /* its INTx line where hal_irq_enable found no message (pci.c) */
     bool no_messages;   /* hal_irq_enable gives INTx, not a message: set by whoever has the function in a
                            claim's domain, whose interrupt table is the claimed function's (dev/iommu.h) */
+    /* claim の組の客として動く domain（dev/iommu.c の iommu_guests_start）：DMA のメモリーはそこに写る（pci.c の
+       dma_map）。NULL：訳されずに通る */
+    struct iommu_domain *claim_domain;
     bool claimed;      /* an app drives it (dev/pciuser.c) */
     bool iommu_blocked; /* in an ended claim's group: the IOMMU drops what it sends (dev/iommu.c) */
     bool needs_reset; /* stopped state unconfirmed, or residual state from an ended multi-function group */

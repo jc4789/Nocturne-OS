@@ -128,7 +128,9 @@ bool hal_power_up(struct hal_device *d) {
 static bool device_suspend(struct hal_device *d, enum hal_power_target target) {
     /* 止められなかった実装も道を半ば閉じている：suspend を呼んだ装置は全部 resume で戻す */
     d->power_suspended = true;
-    bool stopped = d->claim ? hal_claim_suspend(d->claim) : !d->driver->suspend || d->driver->suspend(d, target);
+    /* DMA の道の変わる間に止めてある装置（hal_dma_pause）は止まっている：始めるのは hal_dma_restart */
+    bool stopped = d->dma_paused || (d->claim ? hal_claim_suspend(d->claim)
+                                              : !d->driver->suspend || d->driver->suspend(d, target));
     if (!stopped) {
         kprintf("pm: %s at %s did not stop\n", d->driver_name, d->location);
         return false;
@@ -156,7 +158,7 @@ static bool device_resume(struct hal_device *d) {
     d->power_suspended = false;
     bool back = up;
     if (d->claim) hal_claim_resume(d->claim);
-    else if (d->driver->resume && !d->driver->resume(d)) back = false;
+    else if (!d->dma_paused && d->driver->resume && !d->driver->resume(d)) back = false;
     if (!back) kprintf("pm: %s at %s did not come back\n", d->driver_name, d->location);
     return back;
 }

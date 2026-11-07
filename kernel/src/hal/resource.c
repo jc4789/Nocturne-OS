@@ -1,10 +1,8 @@
 /* 実装が attach で受け取る資源（hal/hal.h）。ここを通るのは立ち上げと片づけだけで、データの道は通らない。 */
 #include "kernel.h"
 #include "arch/irq.h"
-#include "arch/topology.h"
 #include "hal/internal.h"
 #include "mm/heap.h"
-#include "mm/pmm.h"
 #include "mm/vmm.h"
 
 void hal_resource_add(struct hal_device *d, enum n_hal_resource_kind kind, uint32_t slot, uint32_t flags, uint64_t base,
@@ -69,4 +67,5 @@ unsigned hal_irq_max(struct hal_device *d) { return d->ops && d->ops->irq_max ? 
 void hal_release(struct hal_device *d) {
     if (d->irqs_on) hal_irq_disable(d);
     bool stopped = !d->ops || !d->ops->stop || d->ops->stop(d);
+    hal_dma_release(d, stopped);
 }

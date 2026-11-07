@@ -552,7 +552,7 @@ static void command(struct unit *u, unsigned op, uint32_t a, uint32_t b, uint32_
     slot[1] = b | (uint32_t)op << 28;
     slot[2] = c;
     slot[3] = d;
-    if (!amd.coherent) iommu_cache_flush(slot, 16);
+    if (!amd.coherent) cpu_cache_flush(slot, 16);
     u->cmd_tail = (u->cmd_tail + 16) % RING_BYTES;
     wr(u, R_CMD_TAIL, u->cmd_tail);
 }
@@ -710,7 +710,7 @@ static void dte_write(struct iommu_id id, uint64_t q0, uint64_t q1, uint64_t q2)
     e[2] = q2;
     e[1] = q1;
     e[0] = q0; /* valid last */
-    if (!amd.coherent) iommu_cache_flush(e, 32);
+    if (!amd.coherent) cpu_cache_flush(e, 32);
 }
 
 /* The batches' commands. The device table and interrupt remapping caches keep the IDs' entries
@@ -1175,7 +1175,7 @@ static bool amd_start(bool translate) {
         tables_free();
         return false;
     }
-    for (size_t i = 0; !amd.coherent && i < ndevice_tables; i++) iommu_cache_flush(phys_to_virt(device_tables[i].phys), DT_BYTES);
+    for (size_t i = 0; !amd.coherent && i < ndevice_tables; i++) cpu_cache_flush(phys_to_virt(device_tables[i].phys), DT_BYTES);
     for (size_t i = 0; i < nunits; i++) {
         units[i].word_at = sems + i * sizeof(uint64_t);
         units[i].word = phys_to_virt(units[i].word_at); /* zero: no token is */

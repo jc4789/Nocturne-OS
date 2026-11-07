@@ -207,7 +207,7 @@ bool iommu_fault_report(void) {
 
 void iommu_entry_write(volatile uint64_t *e, uint64_t v) {
     *e = v;
-    if (!hw->coherent) iommu_cache_flush(e, sizeof *e);
+    if (!hw->coherent) cpu_cache_flush(e, sizeof *e);
 }
 
 void iommu_entry_write16(volatile uint64_t *e, uint64_t lo, uint64_t hi) {
@@ -219,7 +219,7 @@ void iommu_entry_write16(volatile uint64_t *e, uint64_t lo, uint64_t hi) {
                         : "b"(lo), "c"(hi)
                         : "memory");
     while (!stored);
-    if (!hw->coherent) iommu_cache_flush(e, 16);
+    if (!hw->coherent) cpu_cache_flush(e, 16);
 }
 
 /* ---- interrupt remapping tables ---- */
@@ -236,7 +236,7 @@ bool iommu_irt_make(struct iommu_irt *t, unsigned size, unsigned entry_bytes) {
         kfree(used);
         return false;
     }
-    if (!hw->coherent) iommu_cache_flush(phys_to_virt(phys), bytes);
+    if (!hw->coherent) cpu_cache_flush(phys_to_virt(phys), bytes);
     *t = (struct iommu_irt){.phys = phys, .size = size, .entry_bytes = entry_bytes, .used = used};
     return true;
 }
@@ -369,7 +369,7 @@ static bool pages_fit(const struct iommu_domain *dom, const uint64_t *frames, ui
 
 static uint64_t table_new(void) {
     uint64_t t = iommu_alloc_pages(1);
-    if (t && !hw->coherent) iommu_cache_flush(phys_to_virt(t), PAGE_SIZE);
+    if (t && !hw->coherent) cpu_cache_flush(phys_to_virt(t), PAGE_SIZE);
     return t;
 }
 
@@ -769,10 +769,16 @@ static void cannot_isolate(const struct pci_device *d, const struct pci_device *
    the kernel drives, every ID seen by a unit and none the platform's own; an error then with
    *fixed set, as no later attempt finds it otherwise. Then the members' claims: -N_ERR_BUSY
    while one is claimed or still in a domain. */
+static bool guest(const struct pci_device *m) { return m->kernel_owned && hal_dma_pausable(&m->hal); }
+
 static int group_check(const struct pci_device *d, const struct fns *g, struct ids *ids, bool *fixed) {
     *fixed = true;
     for (size_t i = 0; i < g->n; i++) {
         const struct pci_device *m = g->at[i];
+        if (m->kernel_owned && !guest(m)) {
+            cannot_isolate(d, m, "a kernel driver runs it");
+            return -N_ERR_BUSY;
+        }
         struct ids own = {0};
         bool ok = ids_of(m, &own, false);
         for (size_t k = 0; ok && k < own.n; k++)
@@ -966,6 +972,24 @@ static int unisolated(const struct pci_device *d, const struct fns *g, int r) {
     return r;
 }
 
+void iommu_guests_stop(const struct iommu_domain *dom) {
+    for (unsigned i = 0; i < dom->nmembers; i++) {
+        struct pci_device *m = dom->members[i];
+        if (guest(m)) hal_dma_pause(&m->hal);
+        m->claim_domain = NULL;
+    }
+}
+
+void iommu_guests_start(struct iommu_domain *dom, bool formed) {
+    for (unsigned i = 0; i < dom->nmembers; i++) {
+        struct pci_device *m = dom->members[i];
+        if (!guest(m)) continue;
+        m->no_messages = formed;
+        m->claim_domain = formed ? dom : NULL;
+        if (!hal_dma_restart(&m->hal, formed)) m->claim_domain = NULL;
+    }
+}
+
 static int attach(struct pci_device *d, struct iommu_domain **out, struct pci_device **resetting);
 
 int iommu_attach(struct pci_device *d, struct iommu_domain **out, struct pci_device **resetting) {
@@ -1029,10 +1053,12 @@ static int attach(struct pci_device *d, struct iommu_domain **out, struct pci_de
         }
     }
     if (r && fixed) r = unisolated(d, &g, r);
+    if (dom) iommu_guests_stop(dom);
     if (dom && !hw->attach(dom)) {
         kprintf("iommu: %04x:%02x:%02x.%x: the units did not confirm its domain\n", PCI_ADDRESS_ARGS(d->address));
         if (!dom->written) {
             acs_undo(&acs);
+            iommu_guests_start(dom, false);
         }
         iommu_domain_free(dom); /* what was written is blocked first, its guests staying stopped */
         dom = NULL;

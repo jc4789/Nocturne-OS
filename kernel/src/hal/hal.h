@@ -1,7 +1,8 @@
 /* HAL：機械の全部の装置の木と、それを動かす実装の結びつき（docs/hal.md）。
 
    HAL が持つのは制御の道だけである。実装は attach で番地、割り込み、DMA の番地を受け取り、その後のデータの道は
-   HAL を通らない。HAL は装置の種類もバスも知らない。装置の身元は性質で、規則で実装に結ぶ。
+   HAL を通らない（区間が装置に届くかの問い hal_dma_reach だけは、データの道で錠なしに答える）。HAL は装置の種類も
+   バスも知らない。装置の身元は性質で、規則で実装に結ぶ。
 
    どのバスも同じ形で装置を出す：
        hal_device_init(&x->hal, N_BUS_..., &x_bus_ops);
@@ -39,6 +40,7 @@ struct hal_claim;
 struct hal_claim_ops;
 struct hal_offer_entry;
 struct hal_depend_entry;
+struct hal_dma_block;
 struct firmware_node;
 struct irq;
 struct irq_spec;
@@ -61,6 +63,11 @@ struct hal_bus_ops {
     void (*enable)(struct hal_device *d, unsigned what);
     /* 装置の DMA と割り込みを止める。止まったと確かめられなければ false で、HAL はその DMA のメモリーを返さない。 */
     bool (*stop)(struct hal_device *d);
+    /* 装置が訳の領域にいる間（hal_dma_restart の translated）、HAL を通るメモリーを領域へ同じ番地で写す・外す。眠って
+       よい。dma_unmap の false：装置の要求がもう届かないと確かめられない（HAL はその頁を返さない）。NULL：バスに訳の
+       領域が無い。 */
+    bool (*dma_map)(struct hal_device *d, uint64_t phys, uint64_t pages);
+    bool (*dma_unmap)(struct hal_device *d, uint64_t phys, uint64_t pages);
     /* プロセスの実装の口（hal/claim.c）。claim が NULL のバスはプロセスの実装を持てない。 */
     const struct hal_claim_ops *claim;
     /* 装置の電源の状態をバスの方法で変える（PCI は PMCSR）。眠ってよい。NULL：バスに電源の状態が無い。
@@ -110,7 +117,13 @@ enum hal_after_sleep {
    にする。false は戻らなかった（実装は持ち続け、hal_failed で言う）。眠る前から使えなかった装置（hal_failed で言って
    ある）は、そのままで true。NULL はすることが無い。
    refuse：今は眠れない理由（ログのため）か NULL。眠りと休止のたびに聞く。
-   after_sleep：enum hal_after_sleep。 */
+   after_sleep：enum hal_after_sleep。
+   dma_pause：装置の DMA の道が変わる（PCI の機能が、アプリの claim の隔離の組に入る、dev/iommu.h）。装置が何も送らない
+   ようにし、割り込みを hal_irq_disable で返し、自分のデータの道を閉じる。この後バスが DMA を止める。
+   dma_restart：道が変わった。attach と同じく hal_enable と hal_irq_enable から始める（訳の領域ではメッセージの割り込み
+   が無く、バスは INTx を渡すか何も渡さない）。装置は止めた間に電源を失っていてもよい。始まらなければ hal_failed で言う。
+   二つを持つ実装の装置だけが、アプリの claim と同じ組にいられる（持たなければ claim は断られる）。止めた装置に電源の
+   walk は suspend と resume を呼ばない。どちらも眠ってよく、電源の walk と並ばない。 */
 #define HAL_DECLINE 1
 struct hal_driver {
     const char *name;
@@ -122,6 +135,8 @@ struct hal_driver {
     bool (*resume)(struct hal_device *d);
     const char *(*refuse)(struct hal_device *d);
     enum hal_after_sleep after_sleep;
+    void (*dma_pause)(struct hal_device *d);
+    void (*dma_restart)(struct hal_device *d);
 };
 #define HAL_DRIVER(driver) \
     static const struct hal_driver *const driver##_entry __attribute__((used, section(".hal_drivers"))) = &driver
@@ -167,6 +182,12 @@ struct hal_device {
     uint32_t power_level;          /* その段 */
     struct hal_offer_entry *offers;
     struct hal_depend_entry *depends;
+    /* DMA（hal/resource.c）。dma_bits は実装が attach の中で書き、データの道が錠なしで読む。一覧と止めは dma_lock の
+       下。dma_translated は dma_lock の下で書き、錠なしで読む */
+    unsigned dma_bits;
+    struct hal_dma_block *dma;
+    bool dma_translated, dma_paused;
+    struct mutex dma_lock;
     struct mutex bind; /* attach、detach、claim の始まり、hal_remove を一度に一つにする */
     uint32_t holds;    /* 記録を読んでいる attach の thread、claim、呼出しの数。hal_remove は 0 を待つ。hal_lock の下 */
     uint32_t offer_count, depend_count;
@@ -187,6 +208,16 @@ void hal_resource_add(struct hal_device *d, enum n_hal_resource_kind kind, uint3
 void hal_location(struct hal_device *d, const char *text);
 void hal_publish(struct hal_device *parent, struct hal_device *d);
 void hal_remove(struct hal_device *d);
+/* 装置が訳の領域に入る・出る（PCI の機能が claim の組の客になる、dev/iommu.c）。呼ぶ側は hal_busy_begin の中：電源の
+   walk と並ばない。
+   hal_dma_pausable：実装が dma_pause と dma_restart を持つ。
+   hal_dma_pause：実装に止めさせ（dma_pause）、バスに DMA を止めさせ（stop）、訳の領域にいたなら HAL を通したメモリー
+   を全部外させる。止めてあれば何もしない。
+   hal_dma_restart：translated なら HAL を通したメモリーを全部バスに写させ（dma_map）、実装に始めさせる（dma_restart）。
+   写せなければ止めたままで false。止めていなければ何もしない。 */
+bool hal_dma_pausable(const struct hal_device *d);
+void hal_dma_pause(struct hal_device *d);
+bool hal_dma_restart(struct hal_device *d, bool translated);
 /* hal_device_init の後、hal_publish の前に出さないと決めた記録の性質と資源を返す。この後、バスは記録を消してよい。 */
 void hal_device_discard(struct hal_device *d);
 /* firmware の節 f が記述する装置。見つかれば記録を hold する（hal_put で放す）。去っている装置は見つからない。眠らない。 */
@@ -207,6 +238,29 @@ void *hal_map(struct hal_device *d, uint32_t slot);
 /* ポートの資源の最初の番地。無ければ 0。 */
 uint16_t hal_port(const struct hal_device *d, uint32_t slot);
 void hal_enable(struct hal_device *d, unsigned what); /* HAL_ENABLE_* */
+/* DMA。装置へ渡す番地（bus）は HAL が決める：実装は物理番地から番地を作らない。番地は頁の中の位置を物理番地と同じに
+   保つ。装置が訳の領域にいる間（アプリの claim の組の客、hal_dma_restart）、装置が届くのは HAL を通したメモリーだけ。
+   hal_dma_bits：装置が届く番地の bit の数（装置の register が言う）。attach の中、DMA のメモリーを取る前に。言わな
+   ければ 32（PCI の機能はどれも 32 bit の番地を持つ）。
+   hal_dma_alloc：長く使うメモリー（輪、記述子、装置の文脈、送受の緩衝）。幅の中、装置の node の近く、連続、0 埋め。
+   番地は頁の数以上の 2 の冪の頁に揃う（16 頁までなら 64 KiB の境を跨がない）。眠ってよい thread から。手放さなければ
+   detach の後に HAL が返す（装置が止まったと確かめられた時だけ）。
+   hal_dma_map：ほかの持ち主のメモリー（共有 object の音の輪）を長く装置に渡す。幅の外なら false で、呼ぶ側は幅の中で
+   取り直す。持ち主が返す前に hal_dma_unmap。眠ってよい thread から。
+   hal_dma_reach：データの道（どの文脈からでも）。phys から bytes（1 以上）の区間に装置がそのまま届くなら番地。訳の
+   領域にいる装置には false（区間は緩衝を通る）。 */
+void hal_dma_bits(struct hal_device *d, unsigned bits);
+void *hal_dma_alloc(struct hal_device *d, size_t bytes, uint64_t *bus);
+void hal_dma_free(struct hal_device *d, void *memory);
+bool hal_dma_map(struct hal_device *d, uint64_t phys, uint64_t pages, uint64_t *bus);
+void hal_dma_unmap(struct hal_device *d, uint64_t phys, uint64_t pages);
+static inline bool hal_dma_reach(const struct hal_device *d, uint64_t phys, uint64_t bytes, uint64_t *bus) {
+    if (__atomic_load_n(&d->dma_translated, __ATOMIC_ACQUIRE)) return false;
+    if (d->dma_bits < 64 && (phys + bytes - 1) >> d->dma_bits) return false;
+    *bus = phys;
+    return true;
+}
+
 /* 割り込みを count まで、specs[i] が i 番目。バスが選ぶ形（PCI は MSI-X、MSI、INTx の順、ACPI は _CRS の GSI）で、
    向かう CPU は装置の node の中から選ぶ（spec の node は装置の node に置き換わる）。立てた数を返し、irqs があれば
    それぞれの irq を入れる。 */

@@ -535,7 +535,7 @@ static bool submit(struct unit *u, uint64_t lo, uint64_t hi) {
     volatile uint64_t *slot = (volatile uint64_t *)((uint8_t *)phys_to_virt(u->queue) + u->tail);
     slot[0] = lo;
     slot[1] = hi;
-    if (!intel.coherent) iommu_cache_flush(slot, 16);
+    if (!intel.coherent) cpu_cache_flush(slot, 16);
     __asm__ volatile("sfence" ::: "memory"); /* descriptor contents before the MMIO tail publication */
     u->tail = (u->tail + 16) % PAGE_SIZE;
     wr64(u, R_IQT, u->tail);
@@ -714,7 +714,7 @@ static bool queue_recover(struct unit *u, uint32_t errors, uint64_t record) {
             slot[0] = INV_FENCE;
             slot[1] = 0;
         }
-        if (!intel.coherent) iommu_cache_flush(phys_to_virt(u->queue), PAGE_SIZE);
+        if (!intel.coherent) cpu_cache_flush(phys_to_virt(u->queue), PAGE_SIZE);
         __asm__ volatile("sfence" ::: "memory"); /* the fences before the unit fetches them */
         wr64(u, R_IQT, u->tail); /* no descriptor beyond the ones above */
     }
@@ -746,7 +746,7 @@ static volatile uint64_t *context_entry(struct unit *u, uint16_t id, bool create
     if (table == u->pass && create) {
         if (!(table = iommu_alloc_pages(1))) return NULL;
         memcpy(phys_to_virt(table), phys_to_virt(u->pass), PAGE_SIZE);
-        if (!intel.coherent) iommu_cache_flush(phys_to_virt(table), PAGE_SIZE);
+        if (!intel.coherent) cpu_cache_flush(phys_to_virt(table), PAGE_SIZE);
         iommu_entry_write(root, table | CTX_P);
     }
     return (volatile uint64_t *)phys_to_virt(table) + (id & 0xFF) * 2;
@@ -756,7 +756,7 @@ static void context_write(volatile uint64_t *e, uint64_t lo, uint64_t hi) {
     e[0] = 0; /* present last */
     e[1] = hi;
     e[0] = lo;
-    if (!intel.coherent) iommu_cache_flush(e, 16);
+    if (!intel.coherent) cpu_cache_flush(e, 16);
 }
 
 /* u->lock held: the domain's entries in the unit, then the unit's context caches. */
@@ -1064,7 +1064,7 @@ static bool queue_quiet(struct unit *u) {
     u->handoff_token = token_next(u);
     slot[0] = INV_WAIT(u->handoff_token);
     slot[1] = u->handoff + bytes;
-    if (!intel.coherent) iommu_cache_flush(queue, bytes + sizeof *word);
+    if (!intel.coherent) cpu_cache_flush(queue, bytes + sizeof *word);
     __asm__ volatile("sfence" ::: "memory");
     wr64(u, R_IQA, u->handoff | u->handoff_config);
     if (rd64(u, R_IQA) != (u->handoff | u->handoff_config)) {
@@ -1338,8 +1338,8 @@ static bool intel_start(bool translate) {
             root[e * 2] = u->pass | CTX_P;
         }
         if (!intel.coherent) {
-            iommu_cache_flush(pass, PAGE_SIZE);
-            iommu_cache_flush(root, PAGE_SIZE);
+            cpu_cache_flush(pass, PAGE_SIZE);
+            cpu_cache_flush(root, PAGE_SIZE);
         }
     }
     /* any CPU the unit's message can name: a 32-bit destination in Extended Interrupt Mode (unit_tables) */

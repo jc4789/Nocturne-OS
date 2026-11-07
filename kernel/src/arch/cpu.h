@@ -1,5 +1,6 @@
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "arch/percpu.h"
 
@@ -162,6 +163,14 @@ bool cpu_setup(unsigned index);
    (APM vol. 2 3.2.9, PRED_CMD). mm/vmm.c, where an app's space replaces another's. */
 static inline void cpu_ibpb(void) {
     if (cpu_features.ibpb) wrmsr(MSR_PRED_CMD, PRED_CMD_IBPB);
+}
+
+/* p から bytes を全部のキャッシュから書き戻して捨て（CLFLUSH、SDM vol. 2A）、mfence で並べる。キャッシュを見ない読み手
+   （装置、IOMMU の unit）が CPU の書いたものを読む前と、CPU がそれの書いたものを読む前に。どの文脈からでも。 */
+static inline void cpu_cache_flush(const volatile void *p, size_t bytes) {
+    uintptr_t line = cpu_features.clflush_bytes, at = (uintptr_t)p / line * line, end = (uintptr_t)p + bytes;
+    for (; at < end; at += line) __asm__ volatile("clflush (%0)" ::"r"(at) : "memory");
+    __asm__ volatile("mfence" ::: "memory");
 }
 static inline uint64_t read_cr0(void) { uint64_t v; __asm__ volatile("mov %%cr0, %0" : "=r"(v)); return v; }
 static inline void write_cr0(uint64_t v) { __asm__ volatile("mov %0, %%cr0" : : "r"(v) : "memory"); }

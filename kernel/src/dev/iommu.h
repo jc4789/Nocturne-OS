@@ -6,7 +6,7 @@
    its interrupt messages reach only the vectors the claim was given. The functions that could
    reach it, or that it could reach, without passing the units (its group: a shared requester ID,
    a device or switch without ACS between them) join the domain, and none of them may be the
-   kernel's unless it can be a guest (below), claimed, or in another domain. Every other function
+   kernel's unless it can be a guest (iommu_guests_stop), claimed, or in another domain. Every other function
    passes through untranslated, as on a machine without an IOMMU. When the claim ends its group is
    blocked: nothing they send reaches memory or a CPU until one is claimed again. That holds for the
    other members too: the driver reached them through the claimed function's peer-to-peer requests,
@@ -44,6 +44,14 @@ bool iommu_power_ready(void);
    which only its reset may access: the group is formed once that is done. ACS controls the
    attempt turned on are put back as they were when no domain comes of it. */
 int iommu_attach(struct pci_device *d, struct iommu_domain **out, struct pci_device **resetting);
+/* 客：組の中でカーネルの実装が動かし、その実装が DMA を手放せる機能（hal_dma_pausable）。組が持ち主を変える前
+   （iommu_attach が domain を付ける前、claim の終わり）に止まり、claim の domain の表から外れる（hal_dma_pause）。
+   start は claim ができた（formed）なら、客の DMA のメモリーを dom に写して動き直させ（hal_dma_restart）、客は INTx か
+   割り込み無しで動く（domain の割り込みの再割り当ての表は claim の機能のもの。AMD-Vi は組の全部の ID で一つの表）。
+   formed でなければ domain はできず、組は元のまま動き直す。claim の終わった組は塞がれたままなので、客は次の claim
+   まで止まっている。眠る。電源の walk と並ばない（claim の始まりと終わりは hal_busy_begin の中）。 */
+void iommu_guests_stop(const struct iommu_domain *dom);
+void iommu_guests_start(struct iommu_domain *dom, bool formed);
 /* Whether d is in a domain: attached, or blocked without the units' confirmation. */
 bool iommu_in_use(const struct pci_device *d);
 /* Whether d is a member of dom (its claimed function or the rest of its group). */

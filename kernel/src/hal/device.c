@@ -19,6 +19,7 @@ void hal_device_init(struct hal_device *d, uint32_t bus, const struct hal_bus_op
     d->bus = bus;
     d->ops = ops;
     d->node = -1;
+    d->dma_bits = 32;
     hal_prop_number(d, N_HAL_PROP_BUS, bus);
 }
 

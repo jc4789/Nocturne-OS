@@ -853,12 +853,23 @@ static bool bus_stop(struct hal_device *h) {
     return pci_disable_busmaster(d, NULL) && pci_requests_done(d);
 }
 
+/* 客の DMA のメモリーを claim の domain へ同じ番地で（dev/iommu.h）。HAL が、訳の領域にいる間だけ呼ぶ。 */
+static bool bus_dma_map(struct hal_device *h, uint64_t phys, uint64_t pages) {
+    return iommu_map(pci_device_of(h)->claim_domain, NULL, phys, pages);
+}
+
+static bool bus_dma_unmap(struct hal_device *h, uint64_t phys, uint64_t pages) {
+    return iommu_unmap(pci_device_of(h)->claim_domain, NULL, phys, pages);
+}
+
 const struct hal_bus_ops pci_bus_ops = {
     .irq_enable = bus_irq_enable,
     .irq_disable = bus_irq_disable,
     .irq_max = bus_irq_max,
     .enable = bus_enable,
     .stop = bus_stop,
+    .dma_map = bus_dma_map,
+    .dma_unmap = bus_dma_unmap,
     .claim = &pci_claim_ops,
     .power = bus_power,
 };

@@ -23,6 +23,9 @@ void hal_ledger_changed(void);
 void hal_bind_request(struct hal_device *d); /* hal/bind.c：結ぶ先を探す */
 void pending_forget(struct hal_device *d);   /* hal/bind.c：結ぶのを待つ列から外す。hal_lock の下 */
 void hal_release(struct hal_device *d);      /* hal/resource.c：実装が手放した後の片づけ */
+/* hal/dma.c：hal_release の中で、HAL を通した DMA のメモリーを外し、stopped（装置が止まったと確かめた）なら取った頁を
+   返す。幅を 32 に戻す */
+void hal_dma_release(struct hal_device *d, bool stopped);
 /* hal/bind.c の門：closing の間は新しい attach を起こさず、進行中のものの終わりを待つ。open で開き、待つ列を流す */
 void hal_gate_close(void);
 void hal_gate_open(void);
