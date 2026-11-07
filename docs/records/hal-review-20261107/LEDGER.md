@@ -52,7 +52,7 @@
 | H35 | `pcitest` の画面の印の数の確かめが 5 件落ちる（refresh の分からない画面での合成の振る舞い）。段 B で範囲の外とした | §5 の段 B | 未 |
 | H36 | 機械の検査：訂正の誤りを拾う道は UC と PCC の bank を飛ばす。#MC の道と分けた理由が SDM と照らしてない | `kernel/src/arch/mca.c:43`、`:85` | 未 |
 | H37 | TSC：AMD は family（19h、1Ah）だけで P-state の欄を読む。`HWCR[LockTscToCurrentP0]` を読まずに 0 と仮定する | `kernel/src/arch/tsc_rate.h:24-45` | 未 |
-| H38 | HD Audio：link を落とす手順の結果を捨てて DMA の頁を返す（`docs/open.md` にあった行。今の名で確かめる） | `kernel/src/dev/hda.c` | 未 |
+| H38 | HD Audio：link を落とす手順の結果を捨てて DMA の頁を返す。段 D の後、hda は DMA の頁を自分で返さない：装置の管理者の `io_release` が、PCI のバスの stop（Bus Master Enable を 0 にし、Device Status の Transactions Pending が 0、PCIe 6.0 7.5.1.1.3・7.5.3.5）が止まりを確かめた時だけ返す | `kernel/src/dev/hda.c`、`kernel/src/dev/pci.c` の `bus_stop`、`kernel/src/io/resource.c` | 直 |
 | H39 | 共通の CPU のコードに hypervisor の判定がある（`vm_cpu_guest`）。VM の処理は `vm/` の後ろに置く約束 | `kernel/src/arch/cpu.c:137`、`:163` | 未 |
 | H40 | IBPB：`cpu_ibpb` に呼ぶ者が無いのに、起動の行が「IBPB between apps」と書く | `kernel/src/arch/cpu.h:164`、`kernel/src/arch/cpu.c:261` | 未 |
 | H41 | PCI に抜き差し（PCIe の Hot-Plug、ACPI の Notify）と AER が無い | `kernel/src/dev/pci.c` | 未 |
@@ -262,7 +262,7 @@
 | F | 実装の ABI と像（D12、D13、D16）：像の形式、DDK、輸出、読み込み、組み、起動の module（NVMe、SATA、USB のどれからでも起動する）、DMA の層、全部の実装とバスを像に（D14）、プログラムも同じ形式に、導入の形式（宣言と中身。ドライバーと任意の機能とアプリを同じ形で入れる）。H26、H27、H31、H39、H42、H47〜H51 | 未 |
 | G | USB を本物のバスに（D14、H29、H45）、USB のプロセスの実装 | 未 |
 | H | 接続の資源と提供者（D15、H22）、GPIO・I2C・SMBus の制御器の実装、I2C の HID、i8042、光学ドライブ（H52、H53） | 未 |
-| I | 電源と寿命（D17、H20、H21、H23〜H25、H32、H38、H43、H44、H46）、H35、H56 | 未 |
+| I | 電源と寿命（D17、H20、H21、H23〜H25、H32、H43、H44、H46）、H35、H56 | 未 |
 | J | 利用者の ABI の名（D18、H34）、文書（`docs/hal.md`、ABI の §9、地図）、利用者に見える英語（H55）、H57、全体の確かめ、台帳を閉じる | 未 |
 
 ## 5. 確かめの記録
