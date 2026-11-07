@@ -12,8 +12,6 @@
 #include "hal/hal.h"
 #include "arch/cpu.h"
 #include "arch/irq.h"
-#include "mm/pmm.h"
-#include "mm/vmm.h"
 #include "sys/clock.h"
 #include "sys/thread.h"
 #include "sys/wait.h"
@@ -21,6 +19,7 @@
 #define SIDE target_width
 #define QSIZE 8
 #define VERSION_1 (1u << 0) /* high feature dword, bit 32 overall */
+#define ACCESS_PLATFORM (1u << 1) /* 上の dword の bit 1：VIRTIO_F_ACCESS_PLATFORM（33、virtio 1.2 6） */
 #define VIRGL_FEATURE 1u
 #define CMD_CTX_CREATE 0x200
 #define CMD_CTX_ATTACH 0x202
@@ -63,7 +62,8 @@ struct used_entry { volatile uint32_t id, len; } PACKED;
 struct used { volatile uint16_t flags, idx; struct used_entry ring[QSIZE]; } PACKED;
 struct header { uint32_t type, flags; uint64_t fence; uint32_t ctx; uint8_t ring, pad[3]; } PACKED;
 
-/* The one device this file drives (gpu_attach), and its bus addresses for what the device reads. */
+/* この file が動かす一つの装置（gpu_attach）。装置が読み書きするメモリーは全部 hal_dma_alloc で取り、装置へ書く番地は
+   その bus だけ。CPU はその指（packets、target、vertices、source_pixels）で触る。 */
 static struct hal_device *gpu_device;
 static struct virtio_common *common;
 static volatile uint16_t *notify;
@@ -73,7 +73,7 @@ static volatile uint8_t *isr_status;
 static struct descriptor *desc;
 static struct avail *avail;
 static struct used *used;
-static uint64_t packets_phys, target_phys, vertex_phys, source_phys;
+static uint64_t packets_bus;
 static uint8_t *packets;
 static uint32_t *target, *vertices, *source_pixels;
 static uint32_t target_width,target_height,source_width,source_height;
@@ -130,21 +130,28 @@ static uint32_t config32(struct hal_device *d, unsigned off) {
 static uint8_t config8(struct hal_device *d, unsigned off) {
     return (uint8_t)(config32(d, off & ~3u) >> ((off & 3u) * 8));
 }
-static void *cap_map(struct hal_device *d, unsigned cap, uint32_t *length) {
+/* virtio の PCI の capability が指す構造（virtio 1.2 4.1.4）を、それが居る BAR を写した所から求める。bars は BAR
+   ごとの写し（hal_map）で、一つの BAR は一度だけ写す。NULL：使えない capability（4.1.4.1 の予約の bar の値、I/O の
+   空間の BAR、BAR に収まらない構造）。呼ぶ側は同じ種類の次の capability を見る。 */
+static void *cap_map(struct hal_device *d, uint8_t *bars[6], unsigned cap, uint32_t *length) {
     unsigned bar = config8(d, cap + 4);
+    if (bar > 5) return NULL;
     const struct n_hal_resource *memory = hal_resource(d, N_HAL_MEMORY, bar);
-    uint64_t base = memory ? memory->base : 0;
     uint32_t off = config32(d, cap + 8), len = config32(d, cap + 12);
-    /* Fixed caps only, not a guest-mappable host-memory aperture. */
-    if (!base || !len || len > 65536 || off > (64u << 20) || base + off < base) return NULL;
+    if (!memory || !len || off > memory->size || len > memory->size - off) return NULL;
+    if (!bars[bar] && !(bars[bar] = hal_map(d, bar))) return NULL;
     *length = len;
+    return bars[bar] + off;
 }
 
 static bool transport_init(struct hal_device *d) {
     uint8_t cap = config8(d, 0x34) & ~3u;
+    uint8_t *bars[6] = {0};
     volatile uint8_t *notify_base = NULL;
+    volatile uint32_t *device_config = NULL;
     uint32_t notify_length = 0, notify_multiplier = 0;
     uint32_t visited[8] = {0};
+    /* 種類ごとに、使える最初の capability を使う（4.1.4：並びは装置の勧める順） */
     for (unsigned count = 0; cap && count < 48; count++) {
         if (cap < 0x40 || cap > 0xFC || (visited[cap >> 5] & (1u << (cap & 31)))) return false;
         visited[cap >> 5] |= 1u << (cap & 31);
@@ -154,17 +161,17 @@ static bool transport_init(struct hal_device *d) {
             if (len < 16 || (unsigned)cap + len > 256) return false;
             uint32_t length = 0;
             if (type == 1 && !common) {
-                common = cap_map(d, cap, &length);
-                if (!common || length < sizeof *common) return false;
+                struct virtio_common *at = cap_map(d, bars, cap, &length);
+                if (at && length >= sizeof *common) common = at;
             } else if (type == 3 && !isr_status) {
-                isr_status = cap_map(d, cap, &length);
-            } else if (type == 2 && !notify_base) {
-                if (len < 20) return false;
-                notify_base = cap_map(d, cap, &notify_length);
-                notify_multiplier = config32(d, cap + 16);
-            } else if (type == 4) {
-                volatile uint32_t *config=cap_map(d,cap,&length);
-                if (config && length>=16) capset_count=mmio_read32(config + 3);
+                isr_status = cap_map(d, bars, cap, &length);
+            } else if (type == 2 && !notify_base && len >= 20) {
+                notify_base = cap_map(d, bars, cap, &notify_length);
+                if (notify_base) notify_multiplier = config32(d, cap + 16);
+            } else if (type == 4 && !device_config) {
+                /* struct virtio_gpu_config の num_capsets は 4 番目の le32 */
+                volatile uint32_t *at = cap_map(d, bars, cap, &length);
+                if (at && length >= 16) device_config = at;
             }
         }
         cap = (uint8_t)next;
@@ -181,19 +188,24 @@ static bool transport_init(struct hal_device *d) {
     mmio_write32(&common->device_feature_select, 0);
     if (!(mmio_read32(&common->device_feature) & VIRGL_FEATURE)) return false;
     mmio_write32(&common->device_feature_select, 1);
-    if (!(mmio_read32(&common->device_feature) & VERSION_1)) return false;
+    uint32_t offered = mmio_read32(&common->device_feature);
+    if (!(offered & VERSION_1)) return false;
     mmio_write32(&common->driver_feature_select, 0);
     mmio_write32(&common->driver_feature, VIRGL_FEATURE);
     mmio_write32(&common->driver_feature_select, 1);
-    mmio_write32(&common->driver_feature, VERSION_1);
+    /* VIRTIO_F_ACCESS_PLATFORM は申告があれば受ける（6.1）：装置は HAL が返す bus の番地で読み書きする */
+    mmio_write32(&common->driver_feature, VERSION_1 | (offered & ACCESS_PLATFORM));
     mmio_write8(&common->device_status, 1 | 2 | 8);
     if (!(mmio_read8(&common->device_status) & 8)) return false;
+    if (device_config) capset_count = mmio_read32(device_config + 3); /* FEATURES_OK の後（3.1.1） */
 
-    uint64_t ring_phys = pmm_alloc_zeroed();
-    packets_phys = pmm_alloc_contig(2, 64);
-    if (!ring_phys || !packets_phys) return false;
-    packets = phys_to_virt(packets_phys); memset(packets, 0, PAGE_SIZE * 2);
-    desc = phys_to_virt(ring_phys);
+    /* 輪の番地（4.1.4.3 の queue_desc・queue_driver・queue_device）、記述子の addr（2.7.5）、資源の backing の addr
+       （5.7 の struct virtio_gpu_mem_entry）は、どれも le64 */
+    hal_dma_bits(d, 64);
+    uint64_t ring_bus;
+    desc = hal_dma_alloc(d, PAGE_SIZE, &ring_bus);
+    packets = hal_dma_alloc(d, 2 * PAGE_SIZE, &packets_bus);
+    if (!desc || !packets) return false;
     avail = (struct avail *)((uint8_t *)desc + 256);
     used = (struct used *)((uint8_t *)desc + 512);
     avail->flags = 1;
@@ -202,7 +214,7 @@ static bool transport_init(struct hal_device *d) {
     if (mmio_read16(&common->queue_size) < QSIZE || mmio_read16(&common->queue_enable)) return false;
     mmio_write16(&common->queue_size, QSIZE);
     mmio_write16(&common->queue_msix_vector, 0xFFFF);
-    const uint64_t rings[3] = {bus(ring_phys), bus(ring_phys) + 256, bus(ring_phys) + 512};
+    const uint64_t rings[3] = {ring_bus, ring_bus + 256, ring_bus + 512};
     volatile uint32_t *ring_regs[3] = {common->queue_desc, common->queue_driver, common->queue_device};
     for (unsigned i = 0; i < 3; i++) {
         mmio_write32(ring_regs[i], (uint32_t)rings[i]);
@@ -229,21 +241,22 @@ static bool transport_init(struct hal_device *d) {
     mmio_write16(&common->queue_enable, 1);
     mmio_write8(&common->device_status, 1 | 2 | 8 | 4);
     unsigned status = mmio_read8(&common->device_status);
-    kprintf("gpu: queue desc=%lx avail=%lx used=%lx notify=%p off=%lu mult=%u size=%u status=%x\n",
-        ring_phys,ring_phys+256,ring_phys+512,notify,notify_off,notify_multiplier,QSIZE,status);
+    kprintf("gpu: queue desc=%lx avail=%lx used=%lx notify=%p off=%lu mult=%u size=%u status=%x\n", rings[0], rings[1],
+            rings[2], notify, notify_off, notify_multiplier, QSIZE, status);
     return true;
 }
 
-/* All requests are driver-authored and physically contiguous; a timed-out DMA
- * buffer is deliberately retained forever and the device is no longer used. */
+/* 要求は全部この file が書き、packets の連続の二頁（要求と答え）を通る。時間切れか誤りの後は装置をもう使わず、
+   DMA のメモリーも返さない（装置がまだ読み書きするかもしれない）。attach の中の失敗なら、HAL が装置の止まりを
+   確かめてから返す（hal/hal.h）。 */
 static bool exchange(const void *request, size_t len, uint32_t response_type) {
     if (broken || !packets || len > PAGE_SIZE) return false;
     memcpy(packets, request, len);
     struct header *h = (struct header *)packets;
     h->flags = FENCE; h->fence = next_fence++;
     memset(packets + PAGE_SIZE, 0, PAGE_SIZE);
-    desc[0] = (struct descriptor){bus(packets_phys), (uint32_t)len, 1, 1};
-    desc[1] = (struct descriptor){bus(packets_phys) + PAGE_SIZE, PAGE_SIZE, 2, 0};
+    desc[0] = (struct descriptor){packets_bus, (uint32_t)len, 1, 1};
+    desc[1] = (struct descriptor){packets_bus + PAGE_SIZE, PAGE_SIZE, 2, 0};
     unsigned at = avail->idx % QSIZE;
     avail->ring[at] = 0;
     barrier();
@@ -297,7 +310,7 @@ static struct header hdr(uint32_t type, bool context) {
     return (struct header){.type = type, .ctx = context ? CTX_ID : 0};
 }
 static bool resource(uint32_t id, uint32_t target_kind, uint32_t format, uint32_t bind,
-                     uint32_t w, uint32_t h, uint64_t phys, uint32_t bytes) {
+                     uint32_t w, uint32_t h, uint64_t backing, uint32_t bytes) {
     struct { struct header h; uint32_t id, target, format, bind, w, height, depth,
         arrays, level, samples, flags, pad; } PACKED create = {
         .h = hdr(CMD_CREATE_3D, false), .id=id, .target=target_kind, .format=format, .bind=bind,
@@ -307,10 +320,10 @@ static bool resource(uint32_t id, uint32_t target_kind, uint32_t format, uint32_
        the renderer to invert only some of those operations. The native
        top-origin drawing convention is expressed by the viewport instead. */
     kprintf("gpu: resource id=%u target=%u format=%u bind=%x flags=%x size=%ux%u backing=%lx bytes=%u\n",
-        id,target_kind,format,bind,create.flags,w,h,phys,bytes);
+        id,target_kind,format,bind,create.flags,w,h,backing,bytes);
     if (!exchange(&create, sizeof create, OK_NODATA)) return false;
-    struct { struct header h; uint32_t id, n; uint64_t phys; uint32_t len, pad; } PACKED attach = {
-        .h=hdr(CMD_ATTACH,false), .id=id, .n=1, .phys=bus(phys), .len=bytes};
+    struct { struct header h; uint32_t id, n; uint64_t addr; uint32_t len, pad; } PACKED attach = {
+        .h=hdr(CMD_ATTACH,false), .id=id, .n=1, .addr=backing, .len=bytes};
     if (!exchange(&attach, sizeof attach, OK_NODATA)) return false;
     struct { struct header h; uint32_t id, pad; } PACKED ctx = {.h=hdr(CMD_CTX_ATTACH,true), .id=id};
     return exchange(&ctx, sizeof ctx, OK_NODATA);
@@ -350,10 +363,6 @@ static bool submit(struct stream *s) {
     memcpy(p.data,s->data,p.size);
     return exchange(&p,32+p.size,OK_NODATA);
 }
-static void free_backing(uint64_t phys,uint32_t w,uint32_t h) {
-    size_t pages=ALIGN_UP(n_gpu_frame_bytes(w,h),PAGE_SIZE)/PAGE_SIZE;
-    pmm_free_contig(phys,pages);
-}
 static bool retire_resource(uint32_t id) {
     struct {struct header h;uint32_t id,pad;} PACKED p={.h=hdr(0x203,true),.id=id};
     if(!exchange(&p,sizeof p,OK_NODATA))return false;
@@ -362,61 +371,61 @@ static bool retire_resource(uint32_t id) {
     p.h=hdr(0x102,false);
     return exchange(&p,sizeof p,OK_NODATA);
 }
-/* Allocate only the requested image. The protocol's backing entry length is
- * uint32_t; actual contiguous RAM and host allocation may fail below it.
- * Old backing is freed only after detach/unref fences complete. Any timeout
- * keeps both old and new backing out of the allocator. */
-static bool image_resource(bool input,uint32_t w,uint32_t h) {
-    uint32_t *cw=input?&source_width:&target_width,*ch=input?&source_height:&target_height;
-    uint64_t *phys=input?&source_phys:&target_phys;
-    uint32_t *id=input?&source_id:&target_id;
-    if(*phys && *cw>=w && *ch>=h)return true;
-    uint32_t requested_w=w,requested_h=h;
-    if(w>statistics.max_width || h>statistics.max_height)return false;
-    w=MAX(w,*cw);h=MAX(h,*ch); /* keep capacity for smaller subsequent frames */
-    size_t bytes=n_gpu_frame_bytes(w,h);
-    size_t pages=bytes && bytes<=UINT32_MAX?ALIGN_UP(bytes,PAGE_SIZE)/PAGE_SIZE:0;
-    uint64_t fresh=pages && pages<=pmm_free_pages()?pmm_alloc_contig(pages,64):0;
-    if(!fresh && (w!=requested_w || h!=requested_h)){
-        /* Orthogonal image shapes must not inherit a huge cross-product
-           allocation from unrelated earlier requests. Retry the exact shape
-           when keeping both dimensions would exceed real available memory. */
-        w=requested_w;h=requested_h;bytes=n_gpu_frame_bytes(w,h);
-        pages=bytes && bytes<=UINT32_MAX?ALIGN_UP(bytes,PAGE_SIZE)/PAGE_SIZE:0;
-        fresh=pages && pages<=pmm_free_pages()?pmm_alloc_contig(pages,64):0;
+/* 絵の backing（hal_dma_alloc、0 埋め）。backing の記述の長さは le32 で、それより小さくても連続のメモリーと
+   ホストの確保は断りうる。backing を取り替えるときは、新しい資源を作ってから古い資源を外し（detach と unref の
+   fence の後）、古い backing を返す。途中で装置が失敗したら、新旧どちらの backing も返さない（exchange）。 */
+static uint32_t *image_backing(size_t bytes, uint64_t *bus) {
+    return bytes && bytes <= UINT32_MAX ? hal_dma_alloc(gpu_device, bytes, bus) : NULL;
+}
+static bool image_resource(bool input, uint32_t w, uint32_t h) {
+    uint32_t *cw = input ? &source_width : &target_width, *ch = input ? &source_height : &target_height;
+    uint32_t **pixels = input ? &source_pixels : &target;
+    uint32_t *id = input ? &source_id : &target_id;
+    if (*pixels && *cw >= w && *ch >= h) return true;
+    uint32_t requested_w = w, requested_h = h;
+    if (w > statistics.max_width || h > statistics.max_height) return false;
+    w = MAX(w, *cw); /* 続く小さな絵のために大きさを保つ */
+    h = MAX(h, *ch);
+    uint64_t fresh_bus;
+    size_t bytes = n_gpu_frame_bytes(w, h);
+    uint32_t *fresh = image_backing(bytes, &fresh_bus);
+    if (!fresh && (w != requested_w || h != requested_h)) {
+        /* 縦長と横長の絵が続いても、両方の大きさを合わせた backing は取らない：取れなければ求めた大きさで取り直す */
+        w = requested_w;
+        h = requested_h;
+        bytes = n_gpu_frame_bytes(w, h);
+        fresh = image_backing(bytes, &fresh_bus);
     }
-    if(!fresh)return false;
-    uint32_t fresh_id=*phys?(input?(*id==3?5:3):(*id==1?4:1)):*id;
-    for(size_t at=0;at<bytes;at+=PAGE_SIZE){
-        memset((uint8_t *)phys_to_virt(fresh)+at,0,MIN(bytes-at,PAGE_SIZE));
-        if(!gpu_checkpoint()){free_backing(fresh,w,h);return false;}
-    }
-    if(!resource(fresh_id,2,FORMAT_BGRA,2|8,w,h,fresh,(uint32_t)bytes))return false;
+    if (!fresh) return false;
+    uint32_t fresh_id = *pixels ? (input ? (*id == 3 ? 5 : 3) : (*id == 1 ? 4 : 1)) : *id;
+    if (!resource(fresh_id, 2, FORMAT_BGRA, 2 | 8, w, h, fresh_bus, (uint32_t)bytes)) return false;
     if(!input){
         struct stream s={0};
-        if(*phys)command(&s,3,8,(uint32_t[]){1},1); /* DESTROY_OBJECT, not BIND_OBJECT */
+        if(*pixels)command(&s,3,8,(uint32_t[]){1},1); /* DESTROY_OBJECT, not BIND_OBJECT */
         command(&s,1,8,(uint32_t[]){1,fresh_id,FORMAT_BGRA,0,0},5);
         command(&s,5,0,(uint32_t[]){1,0,1},3);
         if(!submit(&s))return false;
     }
-    if(*phys){
-        if(!retire_resource(*id))return false;
-        free_backing(*phys,*cw,*ch);
+    if (*pixels) {
+        if (!retire_resource(*id)) return false;
+        hal_dma_free(gpu_device, *pixels);
     }
-    *phys=fresh;*id=fresh_id;*cw=w;*ch=h;
-    if(input)source_pixels=phys_to_virt(fresh);else target=phys_to_virt(fresh);
+    *pixels = fresh;
+    *id = fresh_id;
+    *cw = w;
+    *ch = h;
     return true;
 }
 static bool pipeline_init(void) {
     struct { struct header h; uint32_t len,init; char name[64]; } PACKED ctx = {
         .h=hdr(CMD_CTX_CREATE,true), .len=8, .name="Nocturne"};
     if (!exchange(&ctx,sizeof ctx,OK_NODATA)) return false;
-    vertex_phys=pmm_alloc_zeroed();
-    if (!vertex_phys) return false;
-    vertices=phys_to_virt(vertex_phys);
+    uint64_t vertex_bus;
+    vertices = hal_dma_alloc(gpu_device, PAGE_SIZE, &vertex_bus);
+    if (!vertices) return false;
     /* PIPE_TEXTURE_2D=2, RENDER_TARGET|SAMPLER_VIEW; PIPE_BUFFER=0. */
     if (!image_resource(false,32,32) ||
-        !resource(VERTEX_ID,0,64,16,VERTEX_BYTES,1,vertex_phys,PAGE_SIZE)) return false;
+        !resource(VERTEX_ID,0,64,16,VERTEX_BYTES,1,vertex_bus,PAGE_SIZE)) return false;
     struct stream s={0};
     shader(&s,2,0,"VERT\nDCL IN[0]\nDCL IN[1]\nDCL OUT[0], POSITION\nDCL OUT[1], COLOR\nMOV OUT[0], IN[0]\nMOV OUT[1], IN[1]\nEND\n");
     shader(&s,3,1,"FRAG\nDCL IN[0], COLOR, PERSPECTIVE\nDCL OUT[0], COLOR\nMOV OUT[0], IN[0]\nEND\n");

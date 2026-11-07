@@ -1,8 +1,9 @@
 /* 従来の IDE のポートの上の ATA の hard disk。PIO で、割り込みは使わず（nIEN）見て待つ。Hyper-V の第 1 世代の VM と
    QEMU の「pc」の機械にはこれで足りる。ATAPI（DVD）の drive は飛ばす。固定の節「ide-ports」の実装（vm/vm.c が節を
-   出し、実装を足す）：attach は drive の居うる四か所を見て、見つけた drive ごとに block 装置にし、その要求は自分の
-   thread が一つずつ行う（blk_serial_ops）。master と slave は channel の登録を分ける：channel の命令は setup から
-   終わりまで channel の錠を持つ。
+   出し、実装を足す）。ポートは節の資源から取る：channel c の命令の block（8 ポート）が slot 2c、制御の block が
+   slot 2c+1。attach は資源のある channel ごとに master と slave を見て、見つけた drive ごとに block 装置にし、その
+   要求は自分の thread が一つずつ行う（blk_serial_ops）。master と slave は channel の登録を分ける：channel の命令は
+   setup から終わりまで channel の錠を持つ。
 
    電源。DMA も割り込みも無いので、止めるのは要求の道だけ：suspend から resume まで、来た要求は channel の錠の下で
    待つ。ディスクの揮発の cache の書き戻しは機械の段取り（dev/pm.c の flush_disks、blk_persist）が walk の前に行い、
@@ -21,6 +22,7 @@
 struct ata_disk {
     struct blkdev blk;
     uint16_t io, ctl;
+    uint8_t channel; /* channels の番号 */
     bool slave, lba48;
     bool lost; /* resume で同じ drive が見つからなかった：要求は失敗する */
     uint64_t sectors;
@@ -48,11 +50,21 @@ struct ata_channel {
 #define ST_DF  0x20
 #define ST_BSY 0x80
 
-static struct ata_disk disks[4];
+static struct ata_channel channels[2]; /* 節の channel ごとの登録 */
+static struct ata_disk disks[2 * ARRAY_SIZE(channels)];
 static int ndisks;
-static struct ata_channel channels[2]; /* primary（0x1F0）と secondary の登録 */
 
-static struct ata_channel *channel_of(const struct ata_disk *d) { return &channels[d->io == 0x1F0 ? 0 : 1]; }
+static struct ata_channel *channel_of(const struct ata_disk *d) { return &channels[d->channel]; }
+
+/* 節の channel c のポート。命令の block と制御の block のどちらかの資源が無ければ false。 */
+static bool channel_ports(const struct hal_device *d, unsigned c, uint16_t *io, uint16_t *ctl) {
+    const struct n_hal_resource *command = hal_resource(d, N_HAL_PORT, 2 * c);
+    const struct n_hal_resource *control = hal_resource(d, N_HAL_PORT, 2 * c + 1);
+    if (!command || command->size < 8 || !control || !control->size) return false;
+    *io = (uint16_t)command->base;
+    *ctl = (uint16_t)control->base;
+    return true;
+}
 
 /* DRQ の 512 バイトの sector をちょうど一つ運ぶ。256 個の一語の命令でなく、限りのある一つの文字列の I/O で。 */
 static void pio_read_sector(uint16_t port, void *buffer) {
@@ -124,12 +136,13 @@ static bool identify(uint16_t io, uint16_t ctl, bool slave, struct ata_disk *out
     return true;
 }
 
-static void probe(uint16_t io, uint16_t ctl, bool slave) {
+static void probe(unsigned channel, uint16_t io, uint16_t ctl, bool slave) {
     struct ata_disk d;
     if (!identify(io, ctl, slave, &d)) return;
+    d.channel = (uint8_t)channel;
     disks[ndisks++] = d;
-    kprintf("ata: %s %s: %s, %lu MiB%s\n", io == 0x1F0 ? "primary" : "secondary", slave ? "slave" : "master",
-            d.model, d.sectors / 2048, d.lba48 ? ", LBA48" : "");
+    kprintf("ata: channel %u %s: %s, %lu MiB%s\n", channel, slave ? "slave" : "master", d.model, d.sectors / 2048,
+            d.lba48 ? ", LBA48" : "");
 }
 
 static int transfer(struct blkdev *b, const struct blk_request *r);
@@ -148,6 +161,13 @@ static void disk_register(struct hal_device *hal, int i) {
 
 static int ata_attach(struct hal_device *d) {
     if (ndisks) return -N_ERR_EXISTS;
+    for (unsigned c = 0; c < ARRAY_SIZE(channels); c++) {
+        uint16_t io, ctl;
+        if (!channel_ports(d, c, &io, &ctl)) continue;
+        hal_enable(d, HAL_ENABLE_PORTS);
+        probe(c, io, ctl, false);
+        probe(c, io, ctl, true);
+    }
     if (!ndisks) return HAL_DECLINE;
     for (int i = 0; i < ndisks; i++) disk_register(d, i);
     return 0;
@@ -157,7 +177,7 @@ static int ata_attach(struct hal_device *d) {
 static bool ata_suspend(struct hal_device *d, enum hal_power_target target) {
     (void)d;
     (void)target;
-    for (int c = 0; c < 2; c++) {
+    for (unsigned c = 0; c < ARRAY_SIZE(channels); c++) {
         mutex_lock(&channels[c].lock);
         channels[c].asleep = true;
         mutex_unlock(&channels[c].lock);
@@ -174,7 +194,7 @@ static bool same_drive(const struct ata_disk *disk) {
 
 static bool ata_resume(struct hal_device *d) {
     bool all = true;
-    for (int c = 0; c < 2; c++) {
+    for (unsigned c = 0; c < ARRAY_SIZE(channels); c++) {
         mutex_lock(&channels[c].lock);
         for (int i = 0; i < ndisks; i++) {
             struct ata_disk *disk = &disks[i];
