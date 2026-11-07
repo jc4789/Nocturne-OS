@@ -15,9 +15,9 @@
 
 | # | 所見 | 場所 | 状態 |
 |---|---|---|---|
-| H1 | 実装が装置を止める道（`quiesce`）は、割り込みを切り、ほかの CPU を止めた後にだけ走る。実装は眠れず、自分の装置の完了の割り込みも待てない。電源を切る道（`finish`）も同じ。眠り・休止・電源断の装置の段取りが、割り込みの無い一つの段に押し込まれている | `kernel/src/dev/pm.c:177-189`、`:258-264`、`kernel/src/hal/power.c:51-62`、`hal.h:15` | 未 |
-| H2 | 眠りの前に装置を D 状態へ移さない。ACPI 6.5 16.1.6 の 4（起こしに使わない装置は D3）、7.3 の `_PSx`・`_PRx`（電源資源）、PCIe 6.0 5.9 の遷移の時間のどれも行わない。HAL に装置の電源の状態という考えが無い。`rtl8125` だけが自分で PMCSR を読んで D0 にする（バスの仕事をドライバーが持つ） | `kernel/src/hal/*`、`kernel/src/net/rtl8125.c:581` | 未 |
-| H3 | `\_TTS` を呼ばない（ACPI 6.5 7.4.4：眠りの始めに Sx、終わりと取りやめで S0）。uACPI の `uacpi_prepare_for_sleep_state` は `_PTS` と `_SST` だけ | `kernel/src/dev/acpi.c:885`、`third_party/uacpi/source/sleep.c:364` | 未 |
+| H1 | 実装が装置を止める道（`quiesce`）は、割り込みを切り、ほかの CPU を止めた後にだけ走る。実装は眠れず、自分の装置の完了の割り込みも待てない。電源を切る道（`finish`）も同じ。眠り・休止・電源断の装置の段取りが、割り込みの無い一つの段に押し込まれている | `kernel/src/dev/pm.c:177-189`、`:258-264`、`kernel/src/hal/power.c:51-62`、`hal.h:15` | 直 |
+| H2 | 眠りの前に装置を D 状態へ移さない。ACPI 6.5 16.1.6 の 4（起こしに使わない装置は D3）、7.3 の `_PSx`・`_PRx`（電源資源）、PCIe 6.0 5.9 の遷移の時間のどれも行わない。HAL に装置の電源の状態という考えが無い。`rtl8125` だけが自分で PMCSR を読んで D0 にする（バスの仕事をドライバーが持つ） | `kernel/src/hal/*`、`kernel/src/net/rtl8125.c:581` | 直 |
+| H3 | `\_TTS` を呼ばない（ACPI 6.5 7.4.4：眠りの始めに Sx、終わりと取りやめで S0）。uACPI の `uacpi_prepare_for_sleep_state` は `_PTS` と `_SST` だけ | `kernel/src/dev/acpi.c:885`、`third_party/uacpi/source/sleep.c:364` | 直 |
 | H4 | 装置の firmware の節（ACPI の node）が HAL の考えに無い。評価と Notify はプロセスの実装の PCI のバスの呼出し（`N_PCI_CALL_ACPI_EVAL`・`_NOTIFY_TAKE`）だけにあり、ACPI の装置や他のバスの装置のドライバーは使えない。画面の保持（`N_PCI_CALL_HOLD_SCREEN`）も PCI のバスの呼出しにある（監査 K4） | `common/hal_buses.h:34-36`、`kernel/src/dev/pciuser.c:342-437`、`:632-637` | 直 |
 | H5 | ACPI の「system」実装は何もしない attach で、電源のボタン・蓋・割り込みの link・PCI のホスト・HPET・RTC・シリアルを「持つ」ように台帳に見せる。本当の持ち主（`dev/acpi.c`、`dev/pci.c`、`dev/refclock.c`、`dev/serial.c`）は HAL を通らずに自分で見つける（shim） | `kernel/src/dev/acpi_devices.c:224-236` | 直 |
 | H6 | PCI の機能が ACPI のホストブリッジ（PNP0A03・PNP0A08）の下でなく、根の下に並ぶ。木の順の眠りにホストブリッジが入らず、機能と firmware の節のつながりが木に無い | `kernel/src/dev/pci.c:269` | 直 |
@@ -26,9 +26,9 @@
 | H9 | DMA のメモリーを HAL の外で取る実装がある（`pmm_*` を直接、`hhdm_virt_to_phys`）。HAL の「止まったと確かめてから返す」の約束が届かない。`ahci` は `dma_offset` を直接読む | §2 | 未 |
 | H10 | `struct hal_depend_entry` が `device.c` と `power.c` に二つある。`hal_gate_close`・`hal_gate_open` の宣言が `power.c` の中にある | `kernel/src/hal/device.c:12`、`power.c:8-14` | 直 |
 | H11 | 出す前に捨てる装置の記録を、バスが HAL の中身（`props`・`prop_bytes`）を直接 `kfree` して捨てる | `kernel/src/dev/acpi_devices.c:175-179` | 直 |
-| H12 | `pm_sleep_check` は「全部の実装が登録した」と書くが、結びつけは装置ごとの thread で、その時に終わっている保証は無い | `kernel/src/init.c:55` | 未 |
+| H12 | `pm_sleep_check` は「全部の実装が登録した」と書くが、結びつけは装置ごとの thread で、その時に終わっている保証は無い | `kernel/src/init.c:55` | 直 |
 | H13 | claim の能力（`N_CAP_HAL_CLAIM`）は装置を指さない。持つプロセスは実装の無いどの装置でも claim できる（TPM、EC、GPIO の制御器など）。「ドライバーは自分の装置だけを claim する」はプロセスの約束で、カーネルは確かめない。H5 の shim はこの穴を台帳の上で塞ぐためにある | `kernel/src/sys/syscall.c:235`、`kernel/src/hal/claim.c:635`、`ports/nvidia/nvrm.c:398` | 直 |
-| H14 | 眠りの手順の順が ACPI 6.5 16.1.6 と違う。`_PTS`（5）が装置を止める前（4 の前）に走る | `kernel/src/dev/pm.c:368-371` | 未 |
+| H14 | 眠りの手順の順が ACPI 6.5 16.1.6 と違う。`_PTS`（5）が装置を止める前（4 の前）に走る | `kernel/src/dev/pm.c:368-371` | 直 |
 | H15 | IOMMU の実装 `iommu_driver` も、attach が 0 を返し resume が true を返すだけの shim（H5 と同じ形）。AMD の IOMMU の PCI の機能を「持つ」ように見せる | `kernel/src/dev/iommu.c:1171-1189` | 直 |
 | H16 | `dma_offset` を書く所が無い（いつも 0）。読み手（`ahci`・`xhci` の `bus - dma_offset`）だけがある | `kernel/src/hal/hal.h:80` | 未 |
 | H17 | `hda` が自分の DMA の頁を IOMMU の domain へ `iommu_map` で直に写す（guest の道）。装置が domain に入る・出ることを HAL が知らないので、実装が IOMMU を知っている | `kernel/src/dev/hda.c:566`、`:601`、`:828` | 未 |
@@ -109,6 +109,14 @@
 - 休止からの戻し（起動した側のカーネル）：`OFF` の walk → CPU を止める → 写しへ跳ぶ。
 - H12：`pm_sleep_check` は起動で一度、機械の部分（IOMMU、S3、起こしの頁、休止の置き場）だけを決める。文を事実に直す。
 
+**書くときに決めたこと**
+- 電源の状態は三つ：`HAL_D0`、`HAL_D3HOT`、`HAL_D3COLD`。バスの `power(d, to)` の D3COLD は「電源が切れた」の知らせで、PCI は D0 へ戻すときに link と準備を待つ（PCIe 6.0 6.6.1、5.3.1.4 の No_Soft_Reset が無ければ構成は失われている）。
+- firmware の口は節ごと：`hal_firmware_ops.power(node, to, &cold)`。cold は「この節の電源資源を切った（または入れた）」。walk はそれでバスへ D3COLD を知らせる。ACPI の持ち主は一つの mutex で `_PSx` と資源の評価を並べる（7.3.15 の `_IRC` の順を壊さない）。
+- 段の中の並びは仕事の列：walk の thread が段の装置を列に置き、助けの thread（`kthread_create` が失敗しても並びが減るだけ）と一緒に取る。段の終わりで全部を待ち、失敗があれば次の段へ進まない（`OFF` を除く）。
+- 結ぶ前の D0：`bind_thread` の attach と `claim_begin` の前に `hal_power_up`（firmware の D0 → cold なら D3COLD の知らせ → バスの D0）。D0 に戻らない装置は結ばない（`-N_ERR_IO`）。
+- claim は門の中：`hal_claim_open` と claim の終わりは `hal_busy_begin` の中で走り、walk と重ならない。walk の中の claim は `hal_claim_suspend` が SUSPEND を渡して答えを待ち、`hal_claim_resume` が RESUME を渡す。
+- 眠れるかの問い：`hal_power_cannot(hibernate)` が結んでいる実装の `after_sleep` と claim の加わりを見る。`pm_can_sleep`・`pm_can_hibernate` は機械の部分とこれの両方。
+
 **確かめ方**
 - WHPX は S3 から戻れない（`qemu-visual.md`）。TCG で必須の CPU の機能が揃うかを見る。揃わなければ、S3 の戻りは未確認と書く。
 - QEMU の表には電源資源が無い。試験の SSDT（`-acpitable`）で電源資源と `_PS0`・`_PS3` を持つ装置を作り、試験のプログラムが claim する。浅い段の claim が断ると取りやめになるので、深い段の装置の D3 と D0、同じ段の NVMe・e1000・xHCI の D3hot から D0 と構成の戻りを、眠らずに見られる。
@@ -120,6 +128,9 @@
 |---|---|---|
 | A | 機械の装置（D4）、木（D8）、H10、H11 | 済：宣言 `struct hal_machine`（`.hal_machine`）、firmware の節 `struct firmware_node`、ACPI の二度の出し方、QEMU で木を確かめた |
 | B | firmware の口（D3）、claim の渡し方（D5）、台帳の見張り（D6） | 済：`dev/acpi_claim.c`（`SYS_HAL_ACPI_EVAL`・`_NOTIFY_TAKE`、`N_ACPI_PARENT`）、`SYS_SCREEN_HOLD`、`n_hal_claim` の実装の名、管理者が claim を取って `N_SERVICE_HANDLE_DEVICE` で渡す、台帳の見張りで実例を作り・消す、見張りの相手へ一覧の全部。確かめは下の 5 |
+| C | 電源（D1、D2、H3、H12、H14） | HAL の側は建てた：`hal/power.c` の walk、`dev/acpi_power.c`、PCI の `power`、`dev/pm.c` の機械の順、claim の段。実装ごとの suspend・resume は 3.2。確かめは下の 5 |
+| D | DMA（D7）、H19 | 未 |
+| E | 文書（`docs/hal.md`、ABI の §9、地図、`docs/open.md`）と全体の確かめ | 未 |
 
 ## 5. 確かめの記録
 
@@ -129,6 +140,3 @@
 - 前提の食い違い：`-device VGA` ではカーネルの `vbe` が VGA を持つので、pcitest の VGA の場合は claim できない（busy）。AMD の IOMMU は QEMU で x2APIC に要る形式（XTSup）を持たず使われない。WHPX は split の irqchip を持たないので、Intel の IOMMU は割り込みの再割り当てなしで使う。
 - `C:\Tests` で tcc で組んだプログラムは公開の呼出ししか持たず、claim の能力を引けない。pcitest と nvrmtest はホストで組み（`build/tests/pcitest`、`build/tests/nvrmtest`）、試験の媒体の `C:\Nocturne\System` に置く。
 - 確かめていないこと：管理者が台帳の見張りで装置ごとの実例を作り・消す道（QEMU に宣言に合う装置が無い）。
-| C | 電源（D1、D2、H3、H12、H14） | 未 |
-| D | DMA（D7）、H19 | 未 |
-| E | 文書（`docs/hal.md`、ABI の §9、地図、`docs/open.md`）と全体の確かめ | 未 |

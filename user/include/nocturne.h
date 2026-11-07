@@ -166,7 +166,9 @@ n_result n_hal_offer(n_handle claim, uint32_t kind, uint32_t instance, const cha
 n_result n_hal_offer_withdraw(n_handle claim, uint32_t kind, uint32_t instance);
 /* 眠りの知らせ。一度でも呼んだ claim は眠りに加わる：次の知らせ（N_HAL_POWER_SUSPEND か N_HAL_POWER_RESUME）を
    deadline まで待って返す。SUSPEND には装置を止めてから n_hal_power_done(claim, true) で答え、止められなければ
-   false で答える（眠りは取りやめになる）。答えない、または呼ばない claim を持つ装置がある間、機械は眠らない。 */
+   false で答える（眠りは取りやめになる）。眠りでは答えた後に装置が D3 になる。RESUME の前に装置は D0 に戻り、バスの
+   構成も戻っている（装置そのものは初めから始まっていることがある）。呼ばない claim を持つ装置がある間、機械は眠らない
+   （docs/nocturne-native-abi.md §9）。 */
 n_result n_hal_power_wait(n_handle claim, uint64_t deadline);
 n_result n_hal_power_done(n_handle claim, bool ok);
 /* 装置の ACPI の記述（firmware の書いたまま。どのバスの装置でも）：装置の節（N_ACPI_SELF）、その節の device の子

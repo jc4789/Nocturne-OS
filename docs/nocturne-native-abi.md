@@ -575,10 +575,20 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     - `n_hal_offer(claim, kind, instance, label)`・`n_hal_offer_withdraw(claim, kind, instance)`：この権利の実装が
       装置で提供するもの（`N_OFFER_GPU`、`N_OFFER_SCREEN` など）を台帳に載せ、外す。同じ `kind` と `instance` は
       `N_ERR_EXISTS`。権利が終わると全部外れる。
-    - `n_hal_power_wait(claim, deadline)`・`n_hal_power_done(claim, ok)`：眠りと休止（dev/pm.c）の前に、権利を持つ
-      アプリへ止める時を知らせる。`n_hal_power_wait` は眠りの手順が始まるまで待ち（期限は §8）、`N_HAL_POWER_SUSPEND`
-      か `N_HAL_POWER_RESUME` を返す。アプリは装置を止め終えたら `n_hal_power_done` で知らせる。止めない実装は
-      `n_hal_power_wait` を呼ばず、その権利がある間、眠りと休止は始まらない（NVIDIA の `nvrm` は呼ばない）。
+    - `n_hal_power_wait(claim, deadline)`・`n_hal_power_done(claim, ok)`：眠り、休止、電源断の装置の段（HAL の電源の
+      walk、hal/power.c）で、権利を持つアプリへ止める時と戻す時を知らせる。`n_hal_power_wait` は次の知らせまで待ち
+      （期限は §8）、`N_HAL_POWER_SUSPEND` か `N_HAL_POWER_RESUME` を返す。walk はカーネルの実装と同じ順で権利を
+      回る：木で下の装置と依存する装置が先に止まり、後に戻る。同じ段の装置は同時に知らされる。
+      - `N_HAL_POWER_SUSPEND`：装置の DMA と割り込みを止め、戻すのに要る状態を持ってから `n_hal_power_done(claim,
+        true)` で答える。止められなければ `false` で答え、眠りと休止は取りやめになる（電源断は進む）。10 秒答えなけ
+        れば止まらなかったとみなす。眠り（S3）なら、答えた後にカーネルが装置を D3 にする（PCI は PMCSR の D3hot、
+        firmware が記述する装置は `_PS3` と電源資源）。その後、装置は電源を失うことがある。
+      - `N_HAL_POWER_RESUME`：`SUSPEND` を受けた権利に、取りやめでも眠りの後でも来る。来る前にカーネルは装置を D0 に
+        し、バスの構成（BAR、命令、MSI と MSI-X、PCIe の制御）を戻してある。装置そのものは初めから始まっていることが
+        ある（眠り、休止の後）。アプリは装置を立て直す。答えは要らない。
+      - 止めない実装は `n_hal_power_wait` を呼ばず、その権利がある間、眠りと休止は始まらない（NVIDIA の `nvrm` は
+        呼ばない）。電源断の walk では、その権利は止まらなかったとみなされ、walk は進む。
+      - 装置は権利に D0 で渡る（`n_hal_claim` の中で、firmware の D0 とバスの D0）。
   - `n_hal_pci_info`（`N_PCI_CALL_INFO`）は ID、BAR、MSI／MSI-X の数、上流のブリッジ、起動時の画面がその機能の BAR に
     あるならその位置（ドライバーはそこを壊さない）を返す（`struct n_hal_pci_info`）。
   - 構成空間：読みはホストから自分までの経路だけ。自分と同じ装置の他の機能、上流の各ブリッジと
@@ -591,7 +601,7 @@ ISO Cの標準ライブラリ（`stdio.h`、`stdlib.h`、`string.h`、`math.h`�
     BAR へ、カーネルが起動時に見た値をそのまま 32 ビットで書き戻すことだけ（戻せるが、動かせない）。
     一部のビットだけがカーネルのものであるレジスターは、そのビットを変える書込みを `N_ERR_DENIED`
     にする（読んで一部を変えて書き戻すなら通る）：Command の MSE・BME・パリティ応答以外（I/O、
-    INTx 無効化など）、BIST の開始、Interrupt Line、PMCSR の電源状態（D0 へ戻すことは可）、
+    INTx 無効化など）、BIST の開始、Interrupt Line、PMCSR の電源状態（D 状態はカーネルのもの）、
     PCIe Device Control の Max_Payload_Size・Phantom Functions・FLR、Link Control の Link Disable、
     Link Control 2 の Compliance、拡張機能の Resizable BAR（VF 用も）の大きさ、SR-IOV の制御と
     NumVFs、ACS・ATS・PRI・PASID の制御。ブリッジ（クラス 06h）は claim できない。
