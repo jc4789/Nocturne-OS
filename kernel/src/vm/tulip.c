@@ -281,9 +281,10 @@ static int tulip_attach(struct hal_device *d) {
         memcpy(c->nif.mac, fallback, 6);
     }
 
-    /* 記述子とそれが指す緩衝を、4 GiB より下の一つの塊に：記述子と緩衝の指は 32 bit しかない */
+    /* 記述子とそれが指す緩衝を一つの塊に。記述子の緩衝の指と CSR3・CSR4 は 32 bit しかない */
+    hal_dma_bits(d, 32);
     uint64_t bus;
-    uint8_t *block = hal_dma_alloc(d, PAGE_SIZE + (NRX + NTX) * BUFSZ, 32, &bus);
+    uint8_t *block = hal_dma_alloc(d, PAGE_SIZE + (NRX + NTX) * BUFSZ, &bus);
     if (!block) {
         kprintf("net: tulip DMA allocation failed\n");
         goto fail;

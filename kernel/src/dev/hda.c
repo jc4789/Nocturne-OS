@@ -14,14 +14,21 @@
    始まりからの frame の数は回り込まない：輪の一周を見落としても数えすぎても、数のどこに frame があるかが変わるだけで、
    link が輪のどの frame にいるかは変わらない。時計は、とても遅れて来た読みが何周を見落としたかだけを言う。
 
+   DMA（hal/hal.h）。制御器が届く番地の幅は GCAP の 64OK が言う（3.1.3）。CORB、RIRB、descriptor の頁は HAL から取り、
+   出口の輪（音の層の共有 object）は開いている間 HAL を通して渡す。制御器はキャッシュを覗かずに読み書きしてよい（4.4.1.1、
+   4.4.2）：CPU が書いた CORB の項、descriptor、輪の 0 埋めは cpu_cache_flush で書き出し、RIRB の項は読む前に捨てる。
+   輪にサービスが書くものは、サービスが書き出す（flush_bytes）。graphics card の音の機能は、アプリが動かす画面の機能と
+   同じ隔離の組にいることがある（dev/iommu.h の客）。組が持ち主を変える間（dma_pause から dma_restart まで）、出口は
+   去り、link は reset に入る。始め直すと link を初めから上げ、codec の設定を戻す。
+
    電源（hal/hal.h）。suspend は stream を止め（輪の中身は失われ、生成が進む）、codec の function group を D3 にし、
    link を reset に入れる（4.5.8.2）。resume は link を reset から上げ、thread が codec の設定を初めから戻す（4.5.8.1：
    D3 から D0 に戻った codec の設定は残っていると思わない）。開いている出口の道は次の run が引き直す。
 
-   錠の順：claim と IOMMU の mutex → state → 音の層の mutex → stream → verb_lock → engine。
-   state：制御器の全体（probe、claim の客で止まっていること、感知）。制御器の thread、claim の客の stop と start、
-   suspend と resume が持つ。
-   stream：開いている出口と stream。音の層の呼出し（audio_output_ops）、claim の客の stop と start、suspend と resume が
+   錠の順：claim と IOMMU の mutex（dma_pause と dma_restart を呼ぶ者が持つ）→ state → 音の層の mutex → stream →
+   verb_lock → engine。HAL の DMA の錠（hal_dma_map・hal_dma_unmap、眠る）は state と音の層の mutex の後に取る。
+   state：制御器の全体（probe、感知）。制御器の thread、dma_pause と dma_restart、suspend と resume が持つ。
+   stream：開いている出口と stream。音の層の呼出し（audio_output_ops）、dma_pause と dma_restart、suspend と resume が
    持つ。link を上げ下げするのは state と stream の両方を持つ者だけなので、どちらか一つを持つ者の間は link は変わらない。
    命令を送るのも、どちらか一つを持つ者だけである。
    engine：CORB と RIRB の位置、命令の答え、pin の告げ、LPIB と時計の対。葉で、下ではレジスターにしか触れない。 */
@@ -67,6 +74,7 @@
 #define GCAP_OSS(g) (((g) >> 12) & 15)
 #define GCAP_ISS(g) (((g) >> 8) & 15)
 #define GCAP_BSS(g) (((g) >> 3) & 31)
+#define GCAP_64OK   (1u << 0)
 #define GCTL_CRST   (1u << 0)
 #define GCTL_UNSOL  (1u << 8)
 #define INT_GLOBAL  (1u << 31)
@@ -143,6 +151,9 @@ struct hda {
     struct pci_device *pci;
     struct hal_device *hal;
     volatile uint8_t *regs; /* メモリーの BAR（hal_map） */
+    /* attach が書き、変わらない */
+    unsigned address_bits; /* 制御器が届く番地の bit（GCAP の 64OK） */
+    uint64_t dma_bus;      /* 輪と descriptor の頁を制御器へ渡す番地（hal_dma_alloc） */
     uint32_t *corb;
     volatile uint64_t *rirb;
     struct bdl_entry *bdl;
@@ -172,9 +183,7 @@ struct hda {
     /* stream の下：音の層の呼出しのもの */
     struct mutex stream;
     struct hda_sink *open; /* 開いている出口。割り込みは錠なしで読む */
-    uint8_t *ring;
-    uint64_t ring_phys, ring_bus;
-    size_t ring_pages;
+    uint64_t ring_phys, ring_bus, ring_pages;
     struct object *ring_object;
     uint32_t generation; /* 輪の中身の世代：電源の変化が中身を失わせると進む */
     bool routed, running;
@@ -274,9 +283,9 @@ static bool link_reset(struct hda *h) {
     return wait_bits(h->regs + GCTL, 4, GCTL_CRST, 0, RESET_NS) && stopped;
 }
 
-/* state と stream を持って：link を reset に入れてから出し、codec を数え、輪を回す（4.2.2、4.3、4.4）。最初、claim の
-   後、電源の変化の後に通る。false は link が上がらなかった。 */
-static bool link_up(struct hda *h) {
+/* state と stream を持って：link を reset に入れてから出し、codec を数える（4.2.2、4.3）。CRST が 1 を読んでから
+   ほかのレジスターに触る（3.3.7）。false は制御器が reset を出入りしなかった。 */
+static bool link_start(struct hda *h) {
     if (!link_reset(h)) return false;
     sleep_until(clock_after(RESET_PULSE_NS));
     write32(h, GCTL, GCTL_CRST);
@@ -291,6 +300,12 @@ static bool link_up(struct hda *h) {
     /* codec の状態の変化で機械も制御器の割り込みも起こさない。値は思い込まずに書く（3.3.8） */
     write16(h, WAKEEN, 0);
     write32(h, GCTL, GCTL_CRST | GCTL_UNSOL);
+    return true;
+}
+
+/* state と stream を持って、link_start の後：輪を置いて回し、割り込みの元を開く（4.4）。false は CORB の読みの位置が
+   reset から戻らなかった。 */
+static bool rings_start(struct hda *h) {
     uint64_t f = spin_lock(&h->engine);
     rings_place(h);
     spin_unlock(&h->engine, f);
@@ -310,6 +325,9 @@ static bool link_up(struct hda *h) {
     return true;
 }
 
+/* state と stream を持って：link を初めから上げる。dma_restart と resume が通る。 */
+static bool link_up(struct hda *h) { return link_start(h) && rings_start(h); }
+
 /* engine を持って：RIRB にあるもの。読むのは答えを待つ命令でも、pin の告げを探す thread でもよい：命令の答えは命令の
    ために取っておき、pin の告げは印を付ける。 */
 static void rirb_take(struct hda *h) {
@@ -319,6 +337,7 @@ static void rirb_take(struct hda *h) {
     while (h->rirb_rp != wp) {
         unsigned at = (h->rirb_rp + 1) & (h->rirb_entries - 1);
         h->rirb_rp = at;
+        cpu_cache_flush(&h->rirb[at], sizeof h->rirb[at]);
         uint64_t entry = h->rirb[at];
         unsigned extended = (unsigned)(entry >> 32);
         if (extended & 0x10) h->sense_due |= (uint16_t)(1u << (extended & 15));
@@ -342,6 +361,7 @@ static uint32_t link_verb(struct hda_link *link, unsigned codec, unsigned nid, u
         h->answered = false;
         unsigned at = (h->corb_wp + 1) & (h->corb_entries - 1);
         h->corb[at] = (uint32_t)codec << 28 | (uint32_t)nid << 20 | command;
+        cpu_cache_flush(&h->corb[at], sizeof h->corb[at]);
         write16(h, CORBWP, (uint16_t)at);
         h->corb_wp = at;
     }
@@ -398,7 +418,7 @@ static void hda_tick(struct alarm *a, struct regs *r) {
 }
 
 /* state と stream を持って：割り込みを、バスが渡す形で開く（hal_irq_enable：機能が message を送れるならそれ。claim の
-   domain の客は送れない）。無ければ tick と thread が代わりに見る。 */
+   組で始め直した機能は送れない、hal.h の dma_restart）。無ければ tick と thread が代わりに見る。 */
 static void irq_on(struct hda *h) {
     ASSERT(mutex_held(&h->state) && mutex_held(&h->stream));
     struct irq_spec spec = {.name = "HD Audio", .handler = hda_irq, .context = h};
@@ -458,6 +478,7 @@ static bool stream_start(struct hda *h, struct hda_sink *o) {
     uint32_t bytes = block_bytes(h);
     for (unsigned i = 0; i < h->blocks; i++)
         h->bdl[i] = (struct bdl_entry){.address = h->ring_bus + i * bytes, .length = bytes, .flags = 1};
+    cpu_cache_flush(h->bdl, h->blocks * sizeof *h->bdl);
     uint64_t bdl = h->dma_bus + RINGS_PAGES * PAGE_SIZE;
     sd_write8(h, SD_CTL, CTL_SRST);
     bool reset = wait_bits(h->sd + SD_CTL, 1, CTL_SRST, CTL_SRST, STOP_NS);
@@ -512,15 +533,21 @@ static int hda_open(struct audio_output *output, const struct n_audio_device_for
     uint32_t blocks = MAX(MIN(ring->blocks, BDL_HIGH), BDL_LOW);
     uint64_t bytes = frames * frame_bytes * blocks;
     if (bytes > UINT32_MAX) return -N_ERR_TOO_LARGE; /* 輪の長さの欄（3.3.37） */
-    size_t pages = ALIGN_UP(bytes, PAGE_SIZE) / PAGE_SIZE;
-    /* 4 GiB より下：どの制御器も届く（64OK は任意、3.3.2） */
-    uint64_t phys;
-    struct object *memory = shared_kernel_contig(pages, 32, &phys);
+    uint64_t pages = ALIGN_UP(bytes, PAGE_SIZE) / PAGE_SIZE;
+    /* 輪は音の層とサービスも持つ共有 object：制御器が届く番地の中に取り、開いている間 HAL を通して渡す */
+    uint64_t phys, bus;
+    struct object *memory = shared_kernel_contig(pages, h->address_bits, &phys);
     if (!memory) return -N_ERR_NO_MEMORY;
+    if (!hal_dma_map(h->hal, phys, pages, &bus)) {
+        object_unref(memory);
+        return -N_ERR_NO_MEMORY;
+    }
+    cpu_cache_flush(phys_to_virt(phys), pages * PAGE_SIZE); /* 0 埋めの無音 */
     mutex_lock(&h->stream);
+    int r = h->open ? -N_ERR_BUSY : 0;
     if (!r) {
-        h->ring = phys_to_virt(phys);
         h->ring_phys = phys;
+        h->ring_bus = bus;
         h->ring_pages = pages;
         h->ring_object = memory;
         hda_output_select(o->out, word);
@@ -535,7 +562,10 @@ static int hda_open(struct audio_output *output, const struct n_audio_device_for
                                     .flush_bytes = cpu_features.clflush_bytes};
     }
     mutex_unlock(&h->stream);
-    if (r) object_unref(memory);
+    if (r) {
+        hal_dma_unmap(h->hal, phys, pages);
+        object_unref(memory);
+    }
     return r;
 }
 
@@ -548,9 +578,10 @@ static void hda_close(struct audio_output *output) {
     if (h->routed) hda_output_disable(o->out);
     h->routed = false;
     struct object *memory = h->ring_object;
+    uint64_t phys = h->ring_phys, pages = h->ring_pages;
     h->ring_object = NULL;
-    h->ring = NULL;
     mutex_unlock(&h->stream);
+    hal_dma_unmap(h->hal, phys, pages); /* stream は止まり、制御器はもう輪を歩かない */
     object_unref(memory);
 }
 
@@ -560,7 +591,7 @@ static int hda_run(struct audio_output *output, bool run) {
     int r = 0;
     mutex_lock(&h->stream);
     if (!run) stream_stop(h);
-    else if (!stream_route(h, o)) r = -N_ERR_NOT_READY; /* 電源の変化か claim の間：resume が period で知らせる */
+    else if (!stream_route(h, o)) r = -N_ERR_NOT_READY; /* 電源の変化の間：resume が period で知らせる */
     else if (!h->running) {
         if (!stream_start(h, o)) r = -N_ERR_IO;
         else if (h->quiet) alarm_set(&h->tick, clock_after(block_ns(h)));
@@ -684,7 +715,8 @@ static void sense(struct hda *h, uint16_t codecs, bool look) {
 }
 
 /* codec を読み、その後は codec が告げることに答え、link が reset から上がったら codec に全部をもう一度言う。自分の
-   thread で走る：codec を読むには数千の命令が要る。link が下りている間（claim の客、電源の変化）は何もしない。 */
+   thread で走る：codec を読むには数千の命令が要る。link が下りている間（dma_pause から dma_restart まで、電源の変化）は
+   何もしない。 */
 static void hda_thread(void *arg) {
     struct hda *h = arg;
     for (;;) {
@@ -725,14 +757,18 @@ static void hda_thread(void *arg) {
 
 /* hal.h の suspend。止め方は目標によらず同じ：link の reset が DMA と割り込みを止め、resume はどの場合も link の
    reset から codec を戻す。function group は link の clock を止める前に D3 にする（7.3.3.10：codec は D0 から D3 へ
-   移る音の乱れを自分で抑える。clock の止まった codec は完全な reset から始め直し、resume はそうする）。claim の客で
-   止まっていれば、link はもう下りている。
+   移る音の乱れを自分で抑える。clock の止まった codec は完全な reset から始め直し、resume はそうする）。
    止まらなければ false：眠りと休止の取りやめで resume が続き、link を上げ直す。 */
 static bool hda_suspend(struct hal_device *d, enum hal_power_target target) {
     (void)target;
     struct hda *h = d->driver_data;
-    bool stopped = true;
-            if (h->codecs[at]) hda_codec_sleep(h->codecs[at]);
+    mutex_lock(&h->state);
+    mutex_lock(&h->stream);
+    stream_lose(h);
+    for (unsigned at = 0; at < 15; at++)
+        if (h->codecs[at]) hda_codec_sleep(h->codecs[at]);
+    bool stopped = link_reset(h);
+    mutex_unlock(&h->stream);
     mutex_unlock(&h->state);
     if (!stopped) kprintf("audio: HD Audio at %04x:%02x:%02x.%x does not stop\n", PCI_ADDRESS_ARGS(h->pci->address));
     signal(h);
@@ -745,8 +781,12 @@ static bool hda_suspend(struct hal_device *d, enum hal_power_target target) {
    新しい生成で run し直す。 */
 static bool hda_resume(struct hal_device *d) {
     struct hda *h = d->driver_data;
-    bool back = true;
     mutex_lock(&h->state);
+    mutex_lock(&h->stream);
+    stream_lose(h);
+    bool back = link_up(h);
+    h->restore = back;
+    mutex_unlock(&h->stream);
     mutex_unlock(&h->state);
     if (!back) {
         kprintf("audio: HD Audio at %04x:%02x:%02x.%x does not come out of reset after sleeping\n", PCI_ADDRESS_ARGS(h->pci->address));
@@ -757,19 +797,90 @@ static bool hda_resume(struct hal_device *d) {
     return back;
 }
 
+/* ---- DMA の道が変わる（hal.h の dma_pause と dma_restart） ---- */
+
+/* 出口が去り（開いていれば閉じ、輪は HAL から外れる）、続いて link と、それが送る全部が止まり、割り込みを返す。この後
+   バスが DMA を止める。 */
+static void hda_dma_pause(struct hal_device *d) {
+    struct hda *h = d->driver_data;
+    mutex_lock(&h->state);
+    for (struct hda_sink *o = h->sinks; o; o = o->next) audio_output_available(&o->output, false);
+    mutex_lock(&h->stream);
+    if (!link_reset(h)) kprintf("audio: HD Audio at %04x:%02x:%02x.%x does not stop\n", PCI_ADDRESS_ARGS(h->pci->address));
+    irq_off(h);
+    mutex_unlock(&h->stream);
+    mutex_unlock(&h->state);
+}
+
+/* 新しい道で link を初めから上げ（止めた間に電源を失っていてもよい）、出口を戻す。codec の設定は thread が戻す。 */
+static void hda_dma_restart(struct hal_device *d) {
+    struct hda *h = d->driver_data;
+    mutex_lock(&h->state);
+    mutex_lock(&h->stream);
+    hal_enable(d, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA);
+    bool up = link_up(h);
+    if (up) irq_on(h);
+    h->restore = up;
+    mutex_unlock(&h->stream);
+    for (struct hda_sink *o = h->sinks; up && o; o = o->next) audio_output_available(&o->output, true);
+    mutex_unlock(&h->state);
+    if (!up) {
+        kprintf("audio: HD Audio at %04x:%02x:%02x.%x does not come out of reset\n", PCI_ADDRESS_ARGS(h->pci->address));
+        hal_failed(d, -N_ERR_IO);
+    }
+    signal(h);
+}
+
 /* ---- 見つける ---- */
+
+/* link が上がって：制御器が届く番地の幅を HAL に言い（3.1.3、3.3.2）、CORB と RIRB と descriptor の頁を取る。 */
+static bool dma_take(struct hda *h, uint32_t caps) {
+    h->address_bits = caps & GCAP_64OK ? 64 : 32;
+    hal_dma_bits(h->hal, h->address_bits);
+    uint8_t *memory = hal_dma_alloc(h->hal, DMA_PAGES * PAGE_SIZE, &h->dma_bus);
+    if (!memory) return false;
+    cpu_cache_flush(memory, DMA_PAGES * PAGE_SIZE); /* 0 埋め */
+    h->corb = (uint32_t *)memory;
+    h->rirb = (volatile uint64_t *)(memory + PAGE_SIZE / 2);
+    h->bdl = (struct bdl_entry *)(memory + RINGS_PAGES * PAGE_SIZE);
+    return true;
+}
+
+/* state と stream を持って：link を上げ、鳴らす stream があれば DMA のメモリーを取って輪を回し、割り込みと thread を
+   立てる。attach の戻り。 */
+static int controller_start(struct hda *h) {
+    struct pci_address address = h->pci->address;
+    if (!link_start(h)) {
+        kprintf("audio: HD Audio at %04x:%02x:%02x.%x does not come out of reset\n", PCI_ADDRESS_ARGS(address));
+        return -N_ERR_IO;
+    }
+    uint32_t caps = read16(h, GCAP);
+    if (!GCAP_OSS(caps) && !GCAP_BSS(caps)) { /* driver は動かさない：アプリが動かしてよい */
+        kprintf("audio: HD Audio at %04x:%02x:%02x.%x has no stream to play on\n", PCI_ADDRESS_ARGS(address));
+        return HAL_DECLINE;
+    }
+    if (!dma_take(h, caps)) {
+        kprintf("audio: HD Audio at %04x:%02x:%02x.%x found, but no memory for it\n", PCI_ADDRESS_ARGS(address));
+        return -N_ERR_NO_MEMORY;
+    }
+    if (!rings_start(h)) {
+        kprintf("audio: HD Audio at %04x:%02x:%02x.%x: its command ring does not come out of reset\n", PCI_ADDRESS_ARGS(address));
+        return -N_ERR_IO;
+    }
+    irq_on(h);
+    h->thread = kthread_create("hda", hda_thread, h);
+    if (h->thread) return 0;
+    kprintf("audio: HD Audio at %04x:%02x:%02x.%x: no memory for its thread\n", PCI_ADDRESS_ARGS(address));
+    irq_off(h);
+    return -N_ERR_NO_MEMORY;
+}
 
 static int hda_attach(struct hal_device *hal) {
     struct pci_device *d = pci_device_of(hal);
     if (!hal_resource(hal, N_HAL_MEMORY, 0)) return -N_ERR_NOT_FOUND;
     struct hda *h = kzalloc(sizeof *h);
-    if (!h) {
-        kprintf("audio: HD Audio at %04x:%02x:%02x.%x found, but no memory for it\n", PCI_ADDRESS_ARGS(d->address));
-        return -N_ERR_NO_MEMORY;
-    }
-    uint64_t bus;
-    uint8_t *memory = regs ? hal_dma_alloc(hal, DMA_PAGES * PAGE_SIZE, 32, &bus) : NULL;
-    if (!memory) {
+    volatile uint8_t *regs = h ? hal_map(hal, 0) : NULL;
+    if (!regs) {
         kprintf("audio: HD Audio at %04x:%02x:%02x.%x found, but no memory for it\n", PCI_ADDRESS_ARGS(d->address));
         kfree(h);
         return -N_ERR_NO_MEMORY;
@@ -779,29 +890,12 @@ static int hda_attach(struct hal_device *hal) {
     h->pci = d;
     h->hal = hal;
     h->regs = regs;
-    h->dma_bus = bus;
-    h->corb = (uint32_t *)memory;
-    h->rirb = (volatile uint64_t *)(memory + PAGE_SIZE / 2);
-    h->bdl = (struct bdl_entry *)(memory + RINGS_PAGES * PAGE_SIZE);
     h->frame_bytes = 4; /* 形式が開くまで */
     alarm_init(&h->tick, hda_tick);
     hal_enable(hal, HAL_ENABLE_MEMORY | HAL_ENABLE_DMA);
     mutex_lock(&h->state);
     mutex_lock(&h->stream);
-    bool up = link_up(h);
-    uint32_t caps = up ? read16(h, GCAP) : 0;
-    /* 鳴らす stream が無い制御器は driver が動かさない：アプリが動かしてよい */
-    int r = !up ? -N_ERR_IO : !GCAP_OSS(caps) && !GCAP_BSS(caps) ? HAL_DECLINE : 0;
-    if (r) kprintf("audio: HD Audio at %04x:%02x:%02x.%x %s\n", PCI_ADDRESS_ARGS(d->address), up ? "has no stream to play on" : "does not come out of reset");
-    if (!r) {
-        irq_on(h);
-        h->thread = kthread_create("hda", hda_thread, h);
-        if (!h->thread) {
-            kprintf("audio: HD Audio at %04x:%02x:%02x.%x: no memory for its thread\n", PCI_ADDRESS_ARGS(d->address));
-            irq_off(h);
-            r = -N_ERR_NO_MEMORY;
-        }
-    }
+    int r = controller_start(h);
     if (r) link_reset(h);
     mutex_unlock(&h->stream);
     mutex_unlock(&h->state);
@@ -822,5 +916,7 @@ static const struct hal_driver hda_driver = {
     .suspend = hda_suspend,
     .resume = hda_resume,
     .after_sleep = HAL_AFTER_SLEEP_RESUME,
+    .dma_pause = hda_dma_pause,
+    .dma_restart = hda_dma_restart,
 };
 HAL_DRIVER(hda_driver);

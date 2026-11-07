@@ -36,16 +36,15 @@
  * THE POSSIBILITY OF SUCH DAMAGE.
  */
 #include "kernel.h"
-#include "net.h"
-#include "../arch/cpu.h"
-#include "../arch/irq.h"
-#include "../arch/spin.h"
-#include "../dev/pci.h"
-#include "../dev/entropy.h"
-#include "../hal/hal.h"
-#include "../mm/heap.h"
-#include "../sys/clock.h"
-#include "../sys/wait.h"
+#include "net/net.h"
+#include "arch/cpu.h"
+#include "arch/irq.h"
+#include "arch/spin.h"
+#include "dev/entropy.h"
+#include "hal/hal.h"
+#include "mm/heap.h"
+#include "sys/clock.h"
+#include "sys/wait.h"
 
 /* MAC のレジスター */
 #define IDR0        0x0000
@@ -639,7 +638,6 @@ static bool valid_mac(const uint8_t *m) {
 }
 
 static int rtl_attach(struct hal_device *d) {
-    struct pci_device *pci = pci_device_of(d);
     struct rtl8125 *c = kzalloc(sizeof *c);
     if (!c) {
         kprintf("rtl8125: no memory for a device\n");
@@ -662,8 +660,7 @@ static int rtl_attach(struct hal_device *d) {
     uint32_t txcfg = rd32(c, TXCFG);
     c->macver = txcfg & 0xFCF00000;
     if (txcfg == 0xFFFFFFFF || (c->macver != 0x64000000 && c->macver != 0x64100000)) {
-        kprintf("rtl8125: chip version %08x (rev %02x) not supported yet; only the RTL8125B is\n", txcfg,
-                pci_read32(pci->address, 8) & 0xFF);
+        kprintf("rtl8125: chip version %08x not supported yet; only the RTL8125B is\n", txcfg);
         goto fail;
     }
 
@@ -682,10 +679,12 @@ static int rtl_attach(struct hal_device *d) {
     phy_write(c, 0xA436, 0x801E);
     uint16_t phy_code = phy_read(c, 0xA438);
 
-    /* 輪、続いてそれが指す緩衝：それぞれ一つの塊で、緩衝は並べて */
+    /* MAC は 64 bit の番地を読み書きする：輪のレジスターと descriptor の番地は 64 bit で、Realtek の driver は全部の DMA の
+       tag を BUS_SPACE_MAXADDR で作る。輪、続いてそれが指す緩衝：それぞれ一つの塊で、緩衝は並べて */
+    hal_dma_bits(d, 64);
     uint64_t ring_bus, buffer_bus;
-    uint8_t *rings = hal_dma_alloc(d, 2 * PAGE_SIZE, 0, &ring_bus);
-    uint8_t *buffers = hal_dma_alloc(d, (NRX + NTX) * BUFSZ, 0, &buffer_bus);
+    uint8_t *rings = hal_dma_alloc(d, 2 * PAGE_SIZE, &ring_bus);
+    uint8_t *buffers = hal_dma_alloc(d, (NRX + NTX) * BUFSZ, &buffer_bus);
     if (!rings || !buffers) {
         kprintf("rtl8125: DMA allocation failed\n");
         r = -N_ERR_NO_MEMORY;

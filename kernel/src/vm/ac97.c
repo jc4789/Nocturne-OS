@@ -45,6 +45,7 @@
 #define GLOB_COLD_RESET_OFF 0x2 /* AC '97 Cold Reset#（2.2.8）：1 で cold reset の外 */
 #define GLOB_S0_READY 0x100     /* ACZ_SDIN0 Codec Ready（2.2.9） */
 
+#define ADDRESS_BITS 32  /* 機関が届く番地の幅：BDBAR と記述子の番地は 32 bit（2.2.1） */
 #define NBUF       32    /* 輪の記述子の数 */
 #define RATE       48000
 #define FRAME      4     /* バイト：16 bit の標本二つ */
@@ -61,9 +62,10 @@ struct bd {
 } PACKED;
 
 /* 一つの codec。
-   錠の順：音の層の mutex → ac97_mutex → engine。
+   錠の順：音の層の mutex → ac97_mutex → engine。HAL の DMA の錠（hal_dma_map・hal_dma_unmap、眠る）は音の層の mutex の
+   後、ac97_mutex の外で取る。
    ac97_mutex：音の層の呼出し（open、close、run、status。層が一つずつ呼ぶ）と、suspend・resume を一つずつにする。
-   generation、輪の大きさ、played、last_civ、last_at、ring_object はこの下。
+   generation、輪の大きさと場所、played、last_civ、last_at、ring_object はこの下。
    engine：割り込みの処理と alarm（どちらもどの CPU でも）と、呼出しの間で、LVI と CR の書込みと、ready と running。
    ready と running は両方の錠の下で書き、どちらかの下で読む。葉。 */
 struct ac97 {
@@ -84,7 +86,8 @@ struct ac97 {
     uint64_t played; /* 機関が始めてから終えた緩衝の frame */
     int last_civ;
     uint64_t last_at;
-    struct object *ring_object;
+    struct object *ring_object; /* 開いた輪：音の層の共有 object。HAL を通して機関へ渡してある */
+    uint64_t ring_phys, ring_pages;
 };
 
 static struct ac97 *ac97_of(struct audio_output *output) { return (struct ac97 *)output; }
@@ -203,11 +206,14 @@ static int ac97_open(struct audio_output *output, const struct n_audio_device_fo
     struct ac97 *c = ac97_of(output);
     (void)format; /* 申告した一つ */
     uint32_t frames = MAX(MIN(ring->block_frames, BUF_MOST), 2u);
-    uint64_t phys;
-    size_t bytes = (size_t)frames * FRAME * NBUF;
-    struct object *memory = shared_kernel_contig(ALIGN_UP(bytes, PAGE_SIZE) / PAGE_SIZE, 32, &phys);
+    uint64_t pages = ALIGN_UP((uint64_t)frames * FRAME * NBUF, PAGE_SIZE) / PAGE_SIZE, phys, bus;
+    /* 輪は音の層とサービスも持つ共有 object：機関が届く番地の中に取り、開いている間 HAL を通して渡す */
+    struct object *memory = shared_kernel_contig(pages, ADDRESS_BITS, &phys);
     if (!memory) return -N_ERR_NO_MEMORY;
-    uint64_t bus = hal_dma_address(c->hal, phys);
+    if (!hal_dma_map(c->hal, phys, pages, &bus)) {
+        object_unref(memory);
+        return -N_ERR_NO_MEMORY;
+    }
     mutex_lock(&c->ac97_mutex);
     for (uint32_t i = 0; i < NBUF; i++) {
         c->bdl_view[i].addr = (uint32_t)(bus + (uint64_t)i * frames * FRAME);
@@ -217,6 +223,8 @@ static int ac97_open(struct audio_output *output, const struct n_audio_device_fo
     c->buf_frames = frames;
     c->buf_ns = frames * NS_PER_S / RATE;
     c->ring_object = memory;
+    c->ring_phys = phys;
+    c->ring_pages = pages;
     mutex_unlock(&c->ac97_mutex);
     *ring = (struct audio_ring){.memory = memory, .block_frames = frames, .blocks = NBUF};
     return 0;
@@ -256,9 +264,12 @@ static void ac97_close(struct audio_output *output) {
     struct ac97 *c = ac97_of(output);
     mutex_lock(&c->ac97_mutex);
     engine_stop(c);
-    object_unref(c->ring_object);
+    struct object *memory = c->ring_object;
+    uint64_t phys = c->ring_phys, pages = c->ring_pages;
     c->ring_object = NULL;
     mutex_unlock(&c->ac97_mutex);
+    hal_dma_unmap(c->hal, phys, pages); /* 機関は止まり、もう輪を読まない */
+    object_unref(memory);
 }
 
 /* codec を cold reset の外へ出して ready を待ち（2.2.8、2.2.9）、0 dB と 48 kHz にし、PCM の出力の箱を初めに戻す。
@@ -300,11 +311,11 @@ static int ac97_attach(struct hal_device *d) {
     hal_enable(d, HAL_ENABLE_PORTS | HAL_ENABLE_DMA);
     int r = -N_ERR_NO_MEMORY;
 
-    /* 記述子は 32 bit の番地のため 4 GiB より下に */
+    hal_dma_bits(d, ADDRESS_BITS);
     uint64_t bus;
-    c->bdl_view = hal_dma_alloc(d, PAGE_SIZE, 32, &bus);
+    c->bdl_view = hal_dma_alloc(d, PAGE_SIZE, &bus);
     if (!c->bdl_view) {
-        kprintf("audio: AC'97 found, but no memory below 4 GiB for its descriptors\n");
+        kprintf("audio: AC'97 found, but no memory it reaches for its descriptors\n");
         goto fail;
     }
     c->bdl_bus = (uint32_t)bus;

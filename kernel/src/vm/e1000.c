@@ -336,10 +336,12 @@ static int e1000_attach(struct hal_device *d) {
         }
     }
 
-    /* 輪と、それが指す緩衝：一つずつの塊で、緩衝は続けて */
+    /* 制御器が出す番地は全部 64 bit（2.4。手引きの機種で 64 bit の番地を持たないのは 82547GI/EI だけで、規則に無い）。
+       輪と、それが指す緩衝：一つずつの塊で、緩衝は続けて */
+    hal_dma_bits(d, 64);
     uint64_t ring_bus, buffer_bus;
-    uint8_t *rings = hal_dma_alloc(d, 2 * PAGE_SIZE, 0, &ring_bus);
-    uint8_t *buffers = hal_dma_alloc(d, (NRX + NTX) * BUFSZ, 0, &buffer_bus);
+    uint8_t *rings = hal_dma_alloc(d, 2 * PAGE_SIZE, &ring_bus);
+    uint8_t *buffers = hal_dma_alloc(d, (NRX + NTX) * BUFSZ, &buffer_bus);
     if (!rings || !buffers) {
         kprintf("net: e1000 DMA allocation failed\n");
         goto fail;
