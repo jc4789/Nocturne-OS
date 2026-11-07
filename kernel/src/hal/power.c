@@ -126,12 +126,13 @@ bool hal_power_up(struct hal_device *d) {
 
 /* 止めて、眠りなら D3 にする。止まったら true（D3 にならなくても、firmware の失敗は持ち主が書いて進む）。 */
 static bool device_suspend(struct hal_device *d, enum hal_power_target target) {
+    /* 止められなかった実装も道を半ば閉じている：suspend を呼んだ装置は全部 resume で戻す */
+    d->power_suspended = true;
     bool stopped = d->claim ? hal_claim_suspend(d->claim) : !d->driver->suspend || d->driver->suspend(d, target);
     if (!stopped) {
         kprintf("pm: %s at %s did not stop\n", d->driver_name, d->location);
         return false;
     }
-    d->power_suspended = true;
     if (target != HAL_POWER_SLEEP) return true;
     bool bus = d->ops && d->ops->power, cold = false;
     if (bus && !d->ops->power(d, HAL_D3HOT)) {
