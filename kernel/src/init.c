@@ -53,7 +53,7 @@ void kmain_late(void) {
     vm_session_init();
     if (!wm_running()) input_set_sinks(console_key, NULL);
     settings_test_flags();
-    pm_sleep_check(); /* every driver has registered: whether the machine can sleep */
+    pm_sleep_check(); /* 機械の部分（IOMMU、S3、起こしの頁、C: の休止の置き場）が眠れるか */
 
     /* its input, output and log are the console */
     struct handle *con = stream_console_open();

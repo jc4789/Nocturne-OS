@@ -5,6 +5,7 @@
 #include "kernel.h"
 #include "hal/hal.h"
 struct pci_reset;
+struct pci_saved;
 struct irq;
 struct iommu_guest;
 struct iommu_irt;
@@ -82,6 +83,10 @@ struct pci_device {
     /* A Downstream Port: a configuration written back changed the Common Clock Configuration of
        the device below since its link trained, which takes effect once the link retrains (pci.c) */
     bool retrain;
+    /* 電源の状態（pci.c、hal_bus_ops.power）。saved は列挙のときと D3hot の前と眠りの前に取った構成で、D0 の後と
+       眠りの後に戻す。power は HAL が移した状態（HAL_D3COLD は電源を失ったという知らせ）。 */
+    struct pci_saved *saved;
+    enum hal_power_state power;
 };
 /* The PCI function a HAL device of bus N_BUS_PCI is. */
 static inline struct pci_device *pci_device_of(struct hal_device *d) {
@@ -279,7 +284,9 @@ bool pci_config_firmware_write(struct pci_address a, uint16_t off, uint32_t v, u
    the firmware's accesses. The dword at off & ~3. */
 bool pci_config_read_unless_reset(const struct pci_device *d, uint16_t off, uint32_t *v);
 /* Sleep (dev/pm.c): save every function's configuration before S3, write it back after (CPU 0,
-   every other CPU parked, before the drivers resume). pci_suspend allocates and so runs with
+   every other CPU parked, before the drivers resume). A function the HAL took to D3
+   (hal_bus_ops.power) is left out of both: its configuration was saved before, and the HAL's D0
+   writes it back. pci_suspend allocates and so runs with
    interrupts on; it returns NULL, or what could not be saved or why not (a reset under way: the
    sleep is then called off and pci_resume writes nothing).
    slept: the machine went to sleep, or a hibernation image was restored (machine_sleep).

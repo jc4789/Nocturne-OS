@@ -183,6 +183,8 @@ static const char *class_name(uint8_t c, uint8_t s) {
 }
 
 static uint64_t bar_probe(const struct pci_device *d, unsigned bar);
+static bool saved_take(struct pci_device *d, bool table);
+static bool bus_power(struct hal_device *h, enum hal_power_state to);
 
 /* A bridge's header has two BARs and a CardBus bridge's one; the dwords after them are bus
    numbers and windows, which must never be probed or written back as BARs. */
@@ -275,6 +277,8 @@ static void function_publish(struct pci_device *d) {
                               d->bar_size[b]);
         if (!(d->bar[b] & 1) && (d->bar[b] & 6) == 4) b++;
     }
+    /* 電源の戻りで書く構成（power_up）：firmware が D3 で渡した機能も、ここで読んだ番地へ戻る */
+    if (!saved_take(d, false)) kprintf("pci: %04x:%02x:%02x.%x: no memory to save its configuration\n", PCI_ADDRESS_ARGS(a));
     char where[24];
     ksnprintf(where, sizeof where, "%04x:%02x:%02x.%x", PCI_ADDRESS_ARGS(a));
     hal_location(h, where);
@@ -856,6 +860,7 @@ const struct hal_bus_ops pci_bus_ops = {
     .enable = bus_enable,
     .stop = bus_stop,
     .claim = &pci_claim_ops,
+    .power = bus_power,
 };
 
 
@@ -1051,24 +1056,23 @@ static bool reset_wait(uint64_t deadline) {
    link trains need not use the new value (7.5.3.7), so its training ends first (Link Training
    clear, 7.5.3.8), within the 1.0 s 6.6.1 lets a device take after a reset; a link still
    training then is left as it is. */
-static void links_retrain(bool sleeps) {
-    for (size_t i = 0; i < ndevices; i++) {
-        struct pci_device *p = &devices[i];
-        if (!p->retrain) continue;
-        p->retrain = false;
-        uint16_t status;
-        for (uint64_t until = clock_after(NS_PER_S);
-             ((status = pci_read16(p->address, p->pcie_cap + PCIE_LNKSTA)) & PCIE_LNKSTA_TRAINING) &&
-             clock_now_ns() < until;)
-            wait_step(sleeps);
-        if (status & PCIE_LNKSTA_TRAINING) {
-            kprintf("pci: %04x:%02x:%02x.%x: its link is still training; not retrained for the clock configuration below it\n",
-                    PCI_ADDRESS_ARGS(p->address));
-            continue;
-        }
-        uint16_t control = pci_read16(p->address, p->pcie_cap + PCIE_LNKCTL);
-        pci_write16(p->address, p->pcie_cap + PCIE_LNKCTL, control | PCIE_LNKCTL_RETRAIN);
+static void link_retrain(struct pci_device *p, bool sleeps) {
+    uint16_t status;
+    for (uint64_t until = clock_after(NS_PER_S);
+         ((status = pci_read16(p->address, p->pcie_cap + PCIE_LNKSTA)) & PCIE_LNKSTA_TRAINING) && clock_now_ns() < until;)
+        wait_step(sleeps);
+    if (status & PCIE_LNKSTA_TRAINING) {
+        kprintf("pci: %04x:%02x:%02x.%x: its link is still training; not retrained for the clock configuration below it\n",
+                PCI_ADDRESS_ARGS(p->address));
+        return;
     }
+    uint16_t control = pci_read16(p->address, p->pcie_cap + PCIE_LNKCTL);
+    pci_write16(p->address, p->pcie_cap + PCIE_LNKCTL, control | PCIE_LNKCTL_RETRAIN);
+}
+
+static void links_retrain(bool sleeps) {
+    for (size_t i = 0; i < ndevices; i++)
+        if (__atomic_exchange_n(&devices[i].retrain, false, __ATOMIC_ACQ_REL)) link_retrain(&devices[i], sleeps);
 }
 
 /* 6.6.2 clears the whole Command register so the function issues no new Request. Its Interrupt
@@ -1299,15 +1303,20 @@ bool pci_config_firmware_write(struct pci_address a, uint16_t off, uint32_t v, u
    Link training where it supports more, which its Data Link Layer Link Active bit shows (7.5.3.8;
    such a port must report it, 7.5.3.6). A link seen active had trained by then. One not active
    1.0 s after the reset leads to no device that must still be waited for. Once that can be told,
-   sets b->below and returns true. */
-static bool below_ready(struct pci_device *b) {
+   sets b->below and returns true. below_at is the same for a reset that ended at reset_end: the
+   time from which the device below may be read, CLOCK_NEVER for none, 0 while not yet known. */
+static uint64_t below_at(const struct pci_device *b, uint64_t reset_end) {
     uint32_t cap = pci_read32(b->address, b->pcie_cap + PCIE_LNKCAP);
-    if ((cap & PCIE_LNKCAP_SPEED) <= 2 || !(cap & PCIE_LNKCAP_DLL_REPORTING)) b->below = b->reset_end + 100 * NS_PER_MS;
-    else if (pci_read16(b->address, b->pcie_cap + PCIE_LNKSTA) & PCIE_LNKSTA_DLL_ACTIVE)
-        b->below = clock_after(100 * NS_PER_MS);
-    else if (clock_now_ns() >= b->reset_end + NS_PER_S) b->below = CLOCK_NEVER;
-    else return false;
-    return true;
+    if ((cap & PCIE_LNKCAP_SPEED) <= 2 || !(cap & PCIE_LNKCAP_DLL_REPORTING)) return reset_end + 100 * NS_PER_MS;
+    if (pci_read16(b->address, b->pcie_cap + PCIE_LNKSTA) & PCIE_LNKSTA_DLL_ACTIVE) return clock_after(100 * NS_PER_MS);
+    if (clock_now_ns() >= reset_end + NS_PER_S) return CLOCK_NEVER;
+    return 0;
+}
+
+static bool below_ready(struct pci_device *b) {
+    uint64_t at = below_at(b, b->reset_end);
+    if (at) b->below = at;
+    return at != 0;
 }
 
 /* The Downstream Port whose link d's device is on: the bridge above d, or above the switch d is
@@ -1504,25 +1513,118 @@ static bool bus_reset(struct pci_device *port) {
     return true;
 }
 
-/* ---- sleep ---- */
-static struct pci_saved *saved;
-static bool saved_valid;
+/* ---- 電源の状態と眠り ----
+   機能の D 状態は HAL のもの（hal_bus_ops.power。PCI Express Base 6.0 5.3.1、5.9、7.5.2）。D3hot の前に構成を d->saved
+   へ取り（列挙のときにも一度取る）、D0 の後に戻す。D3hot の機能はメモリー空間に答えない（5.3.1.4.1）ので、pci_suspend は
+   D3 にした機能の構成を取らず、pci_resume も戻さない：HAL の D0 が戻す。reset の記録を持つ機能は reset に任せ、D 状態を
+   変えない（pci_suspend と pci_resume も同じ）。
+   装置ごとの電源の段は電源の walk の装置ごとの thread で並んで走る。機能の power と saved はその機能の thread だけが
+   変え、walk の後に眠りが読む。 */
+#define PM_CAP           0x01
+#define PM_PMC_IMMEDIATE (1u << 20)       /* Immediate_Readiness_on_Return_to_D0（7.5.2.1） */
+#define PM_PMCSR         4
+#define PM_STATE         3u               /* PowerState（7.5.2.2） */
+#define PM_PME_STATUS    (1u << 15)       /* RW1CS：書く値では 0 にして消さない */
+#define PM_STATE_NS      (10 * NS_PER_MS) /* D0 から D3hot、D3hot から D0 の後の待ち（表 5-14、5.3.1.4） */
+
+static bool suspended; /* pci_suspend が全部を取った */
+
+static bool resetting(const struct pci_device *d) {
+    uint64_t f = spin_lock(&reset_lock);
+    bool r = d->reset != NULL;
+    spin_unlock(&reset_lock, f);
+    return r;
+}
+
+/* table：MSI-X の表の項も。false：記憶が無い。 */
+static bool saved_take(struct pci_device *d, bool table) {
+    if (!d->saved && !(d->saved = kzalloc(sizeof *d->saved))) return false;
+    return state_save(d, d->saved, table);
+}
+
+/* 電源を失った機能が、電源の戻りの後に読める時まで待ち（6.6.1）、ID を確かめる。上の Downstream Port の link が
+   5.0 GT/s までか Data Link Layer Link Active を報告しないなら待ちの始まりから 100 ms、報告するなら link が active に
+   なってから 100 ms。1.0 s で active にならなければ、下の装置は答えない。 */
+static bool cold_wait(struct pci_device *d) {
+    uint64_t since = clock_now_ns();
+    struct pci_device *b = port_above(d);
+    if (b) {
+        uint64_t below;
+        while (!(below = below_at(b, since))) wait_step(true);
+        if (below == CLOCK_NEVER) return false;
+        sleep_until(below);
+    }
+    struct pci_device *port = rrs_port(d);
+    if (port) rrs_hold(port);
+    uint32_t id = ready_id(port, d->address, since, true, true);
+    if (port) rrs_release(port);
+    return id == ((uint32_t)d->device << 16 | d->vendor);
+}
+
+/* 電源の状態の機能（PM の capability）なら D3hot へ。持たない機能（従来の PCI）は D0 のまま電源を失う。 */
+static bool power_down(struct pci_device *d) {
+    if (resetting(d)) return true;
+    if (!saved_take(d, true)) {
+        kprintf("pci: %04x:%02x:%02x.%x: no memory to save its configuration\n", PCI_ADDRESS_ARGS(d->address));
+        return false;
+    }
+    d->power = HAL_D3HOT;
+    uint8_t pm = pci_find_cap(d, PM_CAP);
+    if (!pm) return true;
+    uint16_t csr = pci_read16(d->address, pm + PM_PMCSR);
+    pci_write16(d->address, pm + PM_PMCSR, (csr & ~(PM_STATE | PM_PME_STATUS)) | 3);
+    sleep_until(clock_after(PM_STATE_NS));
+    return true;
+}
+
+/* D0 へ。D3 から（HAL が移したか、firmware が D3 で渡した）なら、保存した構成を戻す。 */
+static bool power_up(struct pci_device *d) {
+    if (resetting(d)) return present(d);
+    bool cold = d->power == HAL_D3COLD;
+    if (cold ? !cold_wait(d) : !present(d)) return false;
+    bool moved = d->power != HAL_D0;
+    uint8_t pm = pci_find_cap(d, PM_CAP);
+    uint16_t csr = pm ? pci_read16(d->address, pm + PM_PMCSR) : 0;
+    if (csr & PM_STATE) {
+        pci_write16(d->address, pm + PM_PMCSR, csr & ~(PM_STATE | PM_PME_STATUS));
+        if (!(pci_read32(d->address, pm) & PM_PMC_IMMEDIATE)) sleep_until(clock_after(PM_STATE_NS));
+        moved = true;
+    }
+    d->power = HAL_D0;
+    if (!moved || !d->saved) return true;
+    state_restore(d, d->saved);
+    if (d->upstream && __atomic_exchange_n(&d->upstream->retrain, false, __ATOMIC_ACQ_REL)) link_retrain(d->upstream, true);
+    return true;
+}
+
+static bool bus_power(struct hal_device *h, enum hal_power_state to) {
+    struct pci_device *d = pci_device_of(h);
+    switch (to) {
+    case HAL_D0: return power_up(d);
+    case HAL_D3HOT: return power_down(d);
+    case HAL_D3COLD:
+        if (!resetting(d)) d->power = HAL_D3COLD;
+        return true;
+    }
+    return false;
+}
 
 /* A function with a reset is left to it: the reset holds its configuration and writes it back
    once an FLR has been seen through (pci_function_reset; after a sleep, pci_resume). Every other
    CPU is parked (smp_suspend): a reset still running is asleep in its waits, and the sleep is
    called off rather than go on under it; none can start before pci_resume. */
 const char *pci_suspend(void) {
-    saved_valid = false;
+    suspended = false;
     uint64_t f = spin_lock(&reset_lock);
-    bool resetting = resets_running != 0;
+    bool busy = resets_running != 0;
     spin_unlock(&reset_lock, f);
-    if (resetting) return "PCI (a device is being reset)";
-    if (!saved) saved = kzalloc(ndevices * sizeof *saved);
-    if (!saved) return "PCI (no memory to save it)";
-    for (size_t i = 0; i < ndevices; i++)
-        if (!devices[i].reset && !state_save(&devices[i], &saved[i], true)) return "PCI (no memory to save it)";
-    saved_valid = true;
+    if (busy) return "PCI (a device is being reset)";
+    for (size_t i = 0; i < ndevices; i++) {
+        struct pci_device *d = &devices[i];
+        if (d->reset || d->power != HAL_D0) continue;
+        if (!saved_take(d, true)) return "PCI (no memory to save it)";
+    }
+    suspended = true;
     return NULL;
 }
 
@@ -1576,10 +1678,12 @@ static void state_remake(struct pci_device *d, struct pci_saved *s) {
    configuration back like any other. Without a sleep (slept false: a hibernation's snapshot, or
    sleep called off) such a reset is left as it was. */
 void pci_resume(bool slept, bool remake) {
-    if (!saved_valid) return; /* the sleep was called off before anything went down */
+    if (!suspended) return; /* the sleep was called off before anything went down */
     uint64_t since = clock_now_ns();
-    for (size_t i = 0; remake && i < ndevices; i++)
-        state_remake(&devices[i], devices[i].reset ? &devices[i].reset->state : &saved[i]);
+    for (size_t i = 0; remake && i < ndevices; i++) {
+        struct pci_saved *s = devices[i].reset ? &devices[i].reset->state : devices[i].saved;
+        if (s) state_remake(&devices[i], s);
+    }
     for (size_t i = 0; i < ndevices; i++) {
         devices[i].below = 0;
         devices[i].reset_end = devices[i].pcie_cap && devices[i].pcie_type == 4 ? since : 0;
@@ -1591,6 +1695,7 @@ void pci_resume(bool slept, bool remake) {
         watching = false;
         for (size_t i = 0; i < ndevices; i++) {
             struct pci_device *b = devices[i].upstream;
+            if (devices[i].power != HAL_D0) continue; /* the HAL's D0 waits for it (cold_wait) */
             if (b && b->pcie_cap && b->pcie_type == 4 && !b->below) watching |= !below_ready(b);
         }
         if (watching) pause();
@@ -1598,6 +1703,7 @@ void pci_resume(bool slept, bool remake) {
     for (size_t i = 0; i < ndevices; i++) {
         struct pci_device *d = &devices[i];
         struct pci_reset *r = d->reset;
+        if (d->power != HAL_D0) continue;
         if (r && !slept) continue;
         if (r) reset_phase_set(r, RESET_IDLE);
         uint64_t reset_end = since;
@@ -1610,7 +1716,7 @@ void pci_resume(bool slept, bool remake) {
         if (port) rrs_hold(port);
         uint32_t id = ready_id(port, d->address, reset_end, true, false);
         if (port) rrs_release(port);
-        uint32_t was = r ? r->state.id : saved[i].id;
+        uint32_t was = r ? r->state.id : d->saved->id;
         if (r) {
             reset_initializing(r, id);
             r->stuck = r->broken = id != was;
@@ -1621,7 +1727,7 @@ void pci_resume(bool slept, bool remake) {
             continue;
         }
         if (r && r->owed) continue;
-        state_restore(d, r ? &r->state : &saved[i]);
+        state_restore(d, r ? &r->state : d->saved);
         if (r) reset_free(d);
     }
     links_retrain(false);

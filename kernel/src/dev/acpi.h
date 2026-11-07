@@ -184,8 +184,11 @@ void acpi_lid_read(void);
 bool acpi_aml_ready(void);
 /* Sleep states are ACPI's S numbers (3 = suspend to RAM, 5 = soft off). prepare runs _PTS with
    interrupts on; enter writes SLP_TYP with interrupts off and returns only on failure (S5) or
-   after waking (S3). acpi_reset is the FADT reset register through uACPI (any address space). */
+   after waking (S3). acpi_reset is the FADT reset register through uACPI (any address space).
+   acpi_sleep_transition は \_TTS(state)（ACPI 6.5 7.4.4）：眠りの前、装置を止める前に目標の状態で。戻った後と取りやめの
+   後に 0 で。無ければ何もしない。 */
 bool acpi_sleep_supported(unsigned state); /* the firmware has \_Sn */
+void acpi_sleep_transition(unsigned state);
 bool acpi_sleep_prepare(unsigned state);
 bool acpi_sleep_enter(unsigned state);
 /* After S3: wake_prepare with interrupts off, right after the CPU is back (SLP_TYP back to S0);
@@ -197,6 +200,11 @@ bool acpi_sleep_enter(unsigned state);
 void acpi_wake_prepare(unsigned state);
 void acpi_wake(unsigned state);
 void acpi_links_restore(void);
+/* 装置の電源（dev/acpi_power.c）。init は AML の初期化の後に一度：名前空間の装置の D 状態と電源資源の参照を数え、
+   HAL の firmware の方法になる（hal_firmware_set）。restore は firmware が走った眠りの後（S3、休止の写しの戻り）、
+   割り込みを切り凍らせた中で、PCI の機能の構成を戻す前に：参照のある資源を入れ直す（7.2.3：_ON は繰り返してよい）。 */
+void acpi_power_init(void);
+void acpi_power_restore(void);
 /* Around a sleep, from before the devices stop until they are all back: AML that waits (Sleep,
    Acquire, Wait in _WAK) spins instead of letting another thread at a device not back yet. on
    first lets queued GPE and Notify work finish, so no method holds a lock across the sleep. */

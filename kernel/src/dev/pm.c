@@ -1,6 +1,5 @@
-/* Power lifecycle (dev/pm.h): one thread takes every power change it is asked for through
-   apps -> disks -> devices -> firmware, and sleep through disks -> CPUs -> devices -> firmware
-   and back. What happens is told; what it means is the machine service's. */
+/* 電源の段取り（dev/pm.h）。一つの thread が頼まれた電源の変化を全部受け、決まった順で行う。何が起きたかを
+   言い、それが何を意味するかはサービス machine が決める。 */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/irq.h"
@@ -33,19 +32,18 @@
 void power_off(void);
 void power_reboot(void);
 
-#define STOP_NS (3 * NS_PER_S) /* stopped apps get this long to end */
+#define STOP_NS (3 * NS_PER_S) /* 止めたアプリが終わるまでの時間 */
 
 static struct wait_queue pm_wq;
-/* The request and the power thread's progress (requested, busy, stopping, wanted), the state told and
-   the events; also the appends to the stages' lists. Taken from tasks on any CPU and from the power
-   button's handler. Taken alone; only the wait queue's lock is taken under it. */
+/* 頼みと電源の thread の進み（requested、busy、stopping、wanted）、言った状態、起きたこと。どの CPU の task からも、
+   電源ボタンの handler からも取る。単独で取り、下では待ち行列の錠だけを取る。 */
 static struct spinlock pm_lock;
 static bool requested, busy, stopping, napping;
 static enum pm_action wanted;
 
 void pm_request(enum pm_action action) {
     uint64_t f = spin_lock(&pm_lock);
-    /* sleep never replaces a shutdown that is already waiting */
+    /* 眠りは、もう待っている電源断を置き換えない */
     bool nap = action == PM_SLEEP || action == PM_HIBERNATE;
     if (!stopping && !(nap && (busy || requested))) {
         wanted = action;
@@ -55,14 +53,14 @@ void pm_request(enum pm_action action) {
     spin_unlock(&pm_lock, f);
 }
 
-/* ---- what happened ----
-   Counted under pm_lock; the machine service reads them and decides. */
+/* ---- 起きたこと ----
+   pm_lock の下で数える。サービス machine が読んで決める。 */
 static struct n_power_events happened;
 static struct watched happened_watched;
 
 void pm_button_pressed(void) {
     uint64_t f = spin_lock(&pm_lock);
-    /* the press that woke the machine says nothing more */
+    /* 機械を起こした押下は、それ以上を言わない */
     bool counts = !napping;
     if (counts) happened.button_presses++;
     spin_unlock(&pm_lock, f);
@@ -109,8 +107,8 @@ int64_t pm_events_syscall(void *out, size_t size) {
     return copy_to_user(out, &now, sizeof now);
 }
 
-/* ---- what is told ----
-   The state the watch reports, under pm_lock. */
+/* ---- 言う状態 ----
+   watch が知らせる状態。pm_lock の下。 */
 static struct n_power_state told;
 static struct watched told_watched;
 
@@ -140,7 +138,7 @@ int64_t pm_state_syscall(void *out, size_t size) {
     return copy_to_user(out, &now, sizeof now);
 }
 
-/* SYS_POWER_SAY: the stages the machine service leads, for whoever tells the user. */
+/* SYS_POWER_SAY：サービス machine が率いる段。利用者に言う者のため。 */
 int64_t pm_say_syscall(const void *state, size_t size) {
     struct n_power_state s;
     if (size != sizeof s) return -N_ERR_INVALID;
@@ -163,32 +161,35 @@ static bool flush_disks(void) {
     bool ok = true;
     for (int i = 0; i < blk_count(); i++) {
         struct blkdev *d = blk_get(i);
-        if (__atomic_load_n(&d->gone, __ATOMIC_ACQUIRE)) continue; /* what it held left with it */
-        /* blk logs it; what a disk's cache lost before (blk_cache_lost) a sleep does not make worse */
+        if (__atomic_load_n(&d->gone, __ATOMIC_ACQUIRE)) continue; /* 持っていたものは一緒に去った */
+        /* blk がログに書く。眠りの前にディスクの cache が失ったもの（blk_cache_lost）は、眠りが悪くしない */
         if (blk_persist(d) < 0 && !__atomic_load_n(&d->cache_lost, __ATOMIC_ACQUIRE)) ok = false;
     }
     return ok;
 }
 
-/* The volume's saves are on the disks before (pm_thread): after a hibernation's snapshot nothing
-   may be committed, the image has the machine as it was before any of it. The interrupts it turns
-   off are its own CPU's: the other CPUs still run their kernel threads while the devices stop, and
-   the hold keeps those from the disks. */
+/* 電源断と再起動（dev/pm.h）。ボリュームの保存は先にディスクにある（pm_thread、休止の写しの書き終わり）。装置は
+   HAL_POWER_OFF の walk で止まり（止まらない装置があっても進む）、その後に電源が切れる。 */
 static NORETURN void finish(enum pm_action action) {
     hal_power_begin();
+    if (action == PM_POWER_OFF) {
+        acpi_sleep_transition(5); /* _TTS(5)：装置に知らせる前（ACPI 6.5 7.4.4） */
+        acpi_sleep_prepare(5);    /* _PTS(5)：先に（16.1.7 の 1） */
+    }
     blk_hold();
-    flush_disks(); /* a disk that fails is logged: the power goes off all the same */
-    if (action == PM_POWER_OFF) acpi_sleep_prepare(5); /* the firmware's _PTS(5), while interrupts still run */
-    cli();
+    flush_disks(); /* 失敗したディスクはログに書かれる：電源は同じく切れる */
     kprintf("pm: stopping the devices\n");
+    const char *stuck = hal_power_suspend(HAL_POWER_OFF);
+    if (stuck) kprintf("pm: %s did not stop; the power goes off all the same\n", stuck);
+    cli();
     serial_flush();
     if (action == PM_REBOOT) power_reboot();
     power_off();
     for (;;) hlt();
 }
 
-/* ---- sleep (S3) and hibernation ---- */
-/* For the log. */
+/* ---- 眠り（S3）と休止 ---- */
+/* ログのため。 */
 static const char *reason_text(enum n_power_reason reason) {
     switch (reason) {
     case N_POWER_REASON_NONE: return "none";
@@ -198,7 +199,7 @@ static const char *reason_text(enum n_power_reason reason) {
     case N_POWER_REASON_DEVICE: return "a device cannot come back";
     case N_POWER_REASON_DEVICE_BUSY: return "a device cannot sleep now";
     case N_POWER_REASON_DEVICE_STUCK: return "a device did not stop";
-    case N_POWER_REASON_APP_DRIVER: return "an app drives one of the PCI devices";
+    case N_POWER_REASON_APP_DRIVER: return "an app drives a device and does not take part in sleep";
     case N_POWER_REASON_DISK_FLUSH: return "a disk did not write its cache back";
     case N_POWER_REASON_CPU_STOP: return "a processor did not stop";
     case N_POWER_REASON_FIRMWARE: return "the firmware did not sleep";
@@ -208,11 +209,13 @@ static const char *reason_text(enum n_power_reason reason) {
     case N_POWER_REASON_NO_SPACE: return "not enough free space on C:";
     case N_POWER_REASON_IMAGE_TOO_LARGE: return "the image did not fit in memory or on C:";
     case N_POWER_REASON_STORE_WRITE: return "C: could not be written";
-    default: return "unknown";
+    case N_POWER_REASON_COUNT: break;
     }
+    return "unknown";
 }
 
-static enum n_power_reason sleep_blocker(bool hibernate, const char **detail) {
+/* 機械の部分：IOMMU、S3 か休止の置き場、起こしの頁。 */
+static enum n_power_reason machine_blocker(bool hibernate, const char **detail) {
     *detail = NULL;
     if (!iommu_power_ready()) return N_POWER_REASON_IOMMU;
     enum n_power_reason why = hibernate ? hibernate_blocker(detail) : !acpi_sleep_supported(3) ? N_POWER_REASON_NO_S3 : N_POWER_REASON_NONE;
@@ -221,10 +224,26 @@ static enum n_power_reason sleep_blocker(bool hibernate, const char **detail) {
     return N_POWER_REASON_NONE;
 }
 
-/* The machine's part, decided once by pm_sleep_check: the start menu asks on every redraw. The
-   devices' part follows the tree, which changes as drivers come and go. */
+/* 装置の部分：hal_power_begin の間に。 */
+static enum n_power_reason devices_blocker(bool hibernate, const char **detail) {
+    enum hal_refusal refusal;
+    const char *who = hal_power_refused(hibernate, &refusal);
+    if (who) *detail = who;
+    switch (refusal) {
+    case HAL_REFUSAL_NONE: return N_POWER_REASON_NONE;
+    case HAL_REFUSAL_CANNOT: return N_POWER_REASON_DEVICE;
+    case HAL_REFUSAL_BUSY: return N_POWER_REASON_DEVICE_BUSY;
+    case HAL_REFUSAL_PROCESS: return N_POWER_REASON_APP_DRIVER;
+    }
+    return N_POWER_REASON_DEVICE;
+}
+
+/* 機械の部分は pm_sleep_check が起動で一度決める（開始メニューは描くたびに聞く）。装置の部分は結んでいる実装の
+   after_sleep で、実装が来て去るたびに変わるので、聞かれるたびに見る（hal_power_cannot）。 */
 static bool can_sleep, can_hibernate;
 
+bool pm_can_sleep(void) { return can_sleep && !hal_power_cannot(false); }
+bool pm_can_hibernate(void) { return can_hibernate && !hal_power_cannot(true); }
 
 static void blocker_log(const char *what, enum n_power_reason why, const char *detail) {
     if (why) kprintf("pm: %s unavailable (%s%s%s)\n", what, reason_text(why), detail ? ": " : "", detail ? detail : "");
@@ -232,11 +251,11 @@ static void blocker_log(const char *what, enum n_power_reason why, const char *d
 
 void pm_sleep_check(void) {
     const char *detail;
-    enum n_power_reason why = sleep_blocker(false, &detail);
+    enum n_power_reason why = machine_blocker(false, &detail);
     can_sleep = !why;
     blocker_log("sleep", why, detail);
     if (!why) kprintf("pm: sleep (S3) available\n");
-    why = sleep_blocker(true, &detail);
+    why = machine_blocker(true, &detail);
     can_hibernate = !why;
     blocker_log("hibernation", why, detail);
     if (!why) kprintf("pm: hibernation available\n");
@@ -245,60 +264,55 @@ void pm_sleep_check(void) {
 
 static void enter_s3(void) { acpi_sleep_enter(3); }
 
-/* Devices, interrupt controllers and the CPU down, enter(), and all of it back. True after a real
-   sleep (S3 woke up, or a hibernation image was restored), false when enter() returned or a device
-   did not stop (*why and *detail say which; enter() is then not called). On CPU 0, every other CPU parked
-   (smp_suspend): from the freeze to the thaw no other thread runs, the devices are down or not
-   back yet. The interrupts this saves and restores are CPU 0's own. The other CPUs start again
-   (smp_resume) once the interrupt controllers are back and before any device is: a device's
-   interrupts go to any CPU, and one sent to a CPU still held in INIT is lost. */
+/* 割り込みの制御器と CPU を止め、enter() を呼び、全部を戻す（ACPI 6.5 7.5 の 5 から 8）。装置はもう HAL の walk で
+   止まっている。機械が眠った（S3 から起きた、休止の写しが戻った）なら true。enter() が戻ったか、PCI の構成を取れ
+   なかったなら false（後者は *why と *detail が言い、enter() は呼ばない）。CPU 0 で、ほかの CPU を止めてから
+   （smp_suspend）CPU を戻す（smp_resume）まで、ほかの thread は走らない。保存して戻す割り込みは CPU 0 のもの。ほかの
+   CPU は割り込みの制御器が戻った後に動き出す：装置の割り込みはどの CPU にも来て、INIT の中の CPU へのものは失われる。 */
 static bool machine_sleep(void (*enter)(void), unsigned state, enum pm_action action, enum n_power_reason *why,
-                          const char **detail, bool *lost_told) {
+                          const char **detail, bool *units_told) {
     acpi_freeze(true);
     const char *stuck = pci_suspend();
     uint64_t f = irq_save();
     irq_suspend();
-    /* the log's readers are told again in log_resume, once the APICs are back; before the clock
-       stops, which bounds the serial port's last wait */
+    /* log の読み手は APIC が戻った後の log_resume で知らされる。時計が止まる前に：serial の最後の待ちを限る */
     log_suspend();
-    alarm_suspend(); /* until its LAPIC is back: the clock's own alarms as it comes back wait */
+    alarm_suspend(); /* LAPIC が戻るまで：戻る時計の alarm は待つ */
     clock_suspend();
-    /* called off, the way back is the one after an enter() that returned */
+    /* 取りやめなら、戻る道は enter() が戻った後と同じ */
     bool slept = !stuck && wake_sleep(enter);
-    /* awake (or never asleep): the CPU is back; now what it talks to */
-    /* Wake firmware may have enabled plain routes. Stop their sources before any
-       remapping mode transition; the saved routes remain intact for the final restore. */
+    /* 起きた（か眠らなかった）：CPU は戻った。次はそれが話す相手 */
+    /* 起こしの firmware が素の経路を開けたかもしれない。再割り当ての切り替えの前にその元を止める。保存した経路は
+       最後の戻しのために残る */
     ioapic_mask_all();
-    /* The clock first: every wait from here on (a unit's or a link's that does not answer) is
-       bounded on it, and until it is back it stands still (the TSC began again from 0). */
+    /* 時計が先：ここからの待ち（答えない unit や link の待ち）は時計で限られ、戻るまで時計は止まっている（TSC は 0
+       から数え直した） */
     int64_t secs = clock_resume();
-    /* before anything sends it an interrupt or a request, and before the APIC goes back to its
-       mode (arch/apic.h), x2APIC mode coming after interrupt remapping with extended IDs (SDM
-       13.12.7); units that never slept are still on, translating with the claims' tables, and are
-       left alone. Units that do not come back are turned off where they confirm it
-       (iommu_resume): the IOAPICs' entries and the PCI functions' messages are then made again
-       plain, or left off, and the APIC comes back in its mode without remapping. */
+    /* 何かが割り込みや要求を送る前に、APIC が自分の型に戻る前に（arch/apic.h。x2APIC は拡張 ID の割り込み再割り当ての
+       後、SDM 13.12.7）。眠らなかった unit は claim の表で訳したまま動いているので触れない。戻らなかった unit は確かめ
+       られる所で切り（iommu_resume）、IOAPIC の項と PCI の機能の message は素で作り直すか切ったままにし、APIC は
+       再割り当てなしで自分の型に戻る。 */
     const char *units_lost = slept ? iommu_resume() : NULL;
     if (!apic_init_cpu()) panic("pm: this CPU's APIC did not come back in %s mode", apic_x2() ? "x2APIC" : "xAPIC");
-    irq_resume(slept); /* the 8259 masked again; the IOAPIC entries stay masked until every CPU is back */
-    log_resume(); /* the serial port set up again */
-    vm_resume(); /* the hypervisor's other overlay pages and its interrupts, after the LAPIC */
-    alarm_resume(); /* CPU 0's wake device, after its LAPIC */
+    irq_resume(slept); /* 8259 をまた塞ぐ。IOAPIC の項は全部の CPU が戻るまで塞いだまま */
+    log_resume();      /* serial を立て直す */
+    vm_resume();       /* hypervisor のほかの重ね頁と割り込み。LAPIC の後 */
+    alarm_resume();    /* CPU 0 の起こしの装置。LAPIC の後 */
     acpi_wake_prepare(state);
-    /* the INTx wiring before any function's configuration (its interrupt enable) is back, and
-       before this CPU takes an interrupt: no level reaches a pin through a link not set again */
-    if (slept) acpi_links_restore();
+    if (slept) {
+        /* INTx の配線は、どの機能の構成（割り込みの許可）より先に、この CPU が割り込みを受ける前に戻す：立て直して
+           いない link を通って pin に届く level は無い。電源資源は PCI の構成より先に入れ直す */
+        acpi_links_restore();
+        acpi_power_restore();
+    }
     pci_resume(slept, units_lost != NULL);
     irq_restore(f);
-    /* a hibernation's snapshot is no sleep: the firmware heard of none */
-    if (state == 3 || slept) acpi_wake(state);
     smp_resume();
-    irq_resume_lines(); /* the IOAPIC entries, to CPUs that run */
+    irq_resume_lines(); /* IOAPIC の項を、動いている CPU へ */
     input_resumed();
     acpi_freeze(false);
     if (units_lost) say(N_POWER_DEVICE_LOST, action, N_POWER_REASON_IOMMU, units_lost, false);
-    if (lost) say(N_POWER_DEVICE_LOST, action, N_POWER_REASON_DEVICE, lost, false);
-    *lost_told = units_lost || lost;
+    *units_told = units_lost != NULL;
     if (slept) kprintf("pm: awake after %ld s\n", (long)secs);
     if (stuck) {
         *why = N_POWER_REASON_DEVICE_STUCK;
@@ -307,22 +321,19 @@ static bool machine_sleep(void (*enter)(void), unsigned state, enum pm_action ac
     return slept;
 }
 
+/* 眠りの順（ACPI 6.5 7.5、16.1.6）：拒みの確かめ、_TTS(3)、保存と書き出し、HAL_POWER_SLEEP の walk、_PTS(3)、CPU、
+   enter。戻りは machine_sleep の戻し、_WAK(3)、walk の戻し、_TTS(0)。_TTS(0) は取りやめでも、_WAK は _PTS の後の
+   取りやめでも呼ぶ（7.4.1、7.4.4）。
+   休止：拒みの確かめ、保存と書き出し、HAL_POWER_IMAGE の walk、CPU、写し、戻し、walk の戻し、写しを書いて電源断。
+   写しを書く間、門は開く（ディスクの実装の thread が動く）が、ディスクは電源断まで holder のもの（写しの後に C: へ
+   届くのは写しだけ）。写しから戻った機械は、写しを取った所から machine_sleep の戻しへ進む（_WAK(4)）。 */
 static void sleep_now(bool hibernate) {
     enum pm_action action = hibernate ? PM_HIBERNATE : PM_SLEEP;
+    unsigned state = hibernate ? 4 : 3;
     const char *detail;
-    enum n_power_reason why = sleep_blocker(hibernate, &detail);
-    hal_power_begin(); /* no driver comes or goes from here to the end, and none is on its way */
-    if (!why) {
-        enum hal_refusal refusal;
-        const char *who = hal_power_refused(hibernate, &refusal);
-        switch (refusal) {
-        case HAL_REFUSAL_NONE: break;
-        case HAL_REFUSAL_CANNOT: why = N_POWER_REASON_DEVICE; break;
-        case HAL_REFUSAL_BUSY: why = N_POWER_REASON_DEVICE_BUSY; break;
-        case HAL_REFUSAL_PROCESS: why = N_POWER_REASON_APP_DRIVER; break;
-        }
-        if (who) detail = who;
-    }
+    enum n_power_reason why = machine_blocker(hibernate, &detail);
+    hal_power_begin(); /* ここから hal_power_end まで、実装は来も去りもせず、途中のものも無い */
+    if (!why) why = devices_blocker(hibernate, &detail);
     if (!why && hibernate) why = hibernate_prepare();
     if (why) {
         kprintf("pm: not %s: %s%s%s\n", hibernate ? "hibernating" : "sleeping", reason_text(why), detail ? ": " : "",
@@ -332,52 +343,62 @@ static void sleep_now(bool hibernate) {
         return;
     }
     kprintf("pm: going to %s\n", hibernate ? "hibernate" : "sleep");
-    store_sync(); /* what was saved is on its volume, whatever becomes of the sleep */
-    /* no transfer is cut off by the controllers losing their state, and after a snapshot nothing
-       but the image reaches the disks */
+    if (!hibernate) acpi_sleep_transition(3);
+    store_sync(); /* 保存したものは、眠りがどうなってもボリュームにある */
+    /* 制御器が状態を失って切れる転送は無く、写しの後にディスクへ届くのは写しだけ */
     blk_hold();
-    bool parked = false, slept = false, lost_told = false, cpus_back = false; /* machine_sleep started them */
-    if (!flush_disks()) why = N_POWER_REASON_DISK_FLUSH; /* asleep or in an image, it could be lost */
+    bool walked = false, prepared = false, slept = false, snapshot = false, units_told = false;
+    if (!flush_disks()) why = N_POWER_REASON_DISK_FLUSH; /* 眠りか写しの中で失われうる */
     if (!why) {
-        parked = true;
-        if (!smp_suspend()) why = N_POWER_REASON_CPU_STOP;
-    }
-    if (why) {
-    } else if (hibernate) {
-        slept = machine_sleep(hibernate_snapshot, 4, action, &why, &detail, &lost_told);
-        cpus_back = true;
-        if (!slept && !why) {
-            /* the snapshot: the machine as it is from here on never comes back */
-            say(N_POWER_SAVING, action, N_POWER_REASON_NONE, NULL, false);
-            if (!(why = hibernate_write())) {
-                uint64_t f = spin_lock(&pm_lock);
-                stopping = true;
-                spin_unlock(&pm_lock, f);
-                kprintf("pm: hibernated, power off\n");
-                finish(PM_POWER_OFF);
-            }
+        walked = true;
+        const char *stuck = hal_power_suspend(hibernate ? HAL_POWER_IMAGE : HAL_POWER_SLEEP);
+        if (stuck) {
+            why = N_POWER_REASON_DEVICE_STUCK;
+            detail = stuck;
         }
-    } else if (!acpi_sleep_prepare(3)) {
-        why = N_POWER_REASON_FIRMWARE;
-    } else {
-        slept = machine_sleep(enter_s3, 3, action, &why, &detail, &lost_told);
-        cpus_back = true;
-        if (!slept && !why) why = N_POWER_REASON_FIRMWARE;
     }
-    if (parked && !cpus_back) smp_resume();
-    blk_release();
+    if (!why && !hibernate) {
+        prepared = true;
+        if (!acpi_sleep_prepare(3)) why = N_POWER_REASON_FIRMWARE;
+    }
+    if (!why) {
+        if (!smp_suspend()) {
+            smp_resume();
+            why = N_POWER_REASON_CPU_STOP;
+        } else {
+            slept = machine_sleep(hibernate ? hibernate_snapshot : enter_s3, state, action, &why, &detail, &units_told);
+            snapshot = hibernate && !slept && !why;
+            if (!hibernate && !slept && !why) why = N_POWER_REASON_FIRMWARE;
+        }
+    }
+    if (prepared || (hibernate && slept)) acpi_wake(state);
+    const char *lost = walked ? hal_power_resume(slept) : NULL;
+    if (!hibernate) acpi_sleep_transition(0);
     hal_power_end();
+    if (snapshot) {
+        /* 写し：ここからの機械は戻って来ない */
+        say(N_POWER_SAVING, action, N_POWER_REASON_NONE, NULL, false);
+        if (!(why = hibernate_write())) {
+            uint64_t f = spin_lock(&pm_lock);
+            stopping = true;
+            spin_unlock(&pm_lock, f);
+            kprintf("pm: hibernated, power off\n");
+            finish(PM_POWER_OFF);
+        }
+    }
+    blk_release();
     if (hibernate) hibernate_cleanup(slept);
     if (screen_display) screen_display->repaint();
+    if (lost) say(N_POWER_DEVICE_LOST, action, N_POWER_REASON_DEVICE, lost, false);
     if (slept) {
-        acpi_lid_read(); /* it may have changed while nothing listened */
+        acpi_lid_read(); /* 誰も聞いていない間に変わったかもしれない */
         woke();
     }
     if (!slept) {
         kprintf("pm: %s failed: %s%s%s\n", hibernate ? "hibernation" : "sleep", reason_text(why), detail ? ": " : "",
                 detail ? detail : "");
         say(N_POWER_FAILED, action, why, detail, false);
-    } else if (!lost_told) {
+    } else if (!lost && !units_told) {
         say(N_POWER_AWAKE, action, N_POWER_REASON_NONE, NULL, false);
     }
 }
@@ -399,7 +420,7 @@ static void pm_thread(void *arg) {
             f = spin_lock(&pm_lock);
             napping = true;
             spin_unlock(&pm_lock, f);
-            sleep_now(action == PM_HIBERNATE); /* apps keep running: they are only told the time moved */
+            sleep_now(action == PM_HIBERNATE); /* アプリは走り続ける：時計が進んだと知らされるだけ */
             f = spin_lock(&pm_lock);
             napping = false;
             spin_unlock(&pm_lock, f);
@@ -411,7 +432,7 @@ static void pm_thread(void *arg) {
             spin_unlock(&pm_lock, f);
             say(N_POWER_STOPPING, action, N_POWER_REASON_NONE, NULL, false);
             stop_apps();
-            store_sync(); /* what was saved reaches its volume first */
+            store_sync(); /* 保存したものが先にボリュームへ */
             finish(action);
         }
         f = spin_lock(&pm_lock);
@@ -420,8 +441,7 @@ static void pm_thread(void *arg) {
     }
 }
 
-/* On the first CPU: the sleep it runs (smp_suspend, wake_sleep) comes back on the CPU the firmware
-   wakes. */
+/* 最初の CPU で：眠り（smp_suspend、wake_sleep）は firmware が起こす CPU で戻る。 */
 void pm_init(void) {
     watched_init(&told_watched, NULL);
     watched_init(&happened_watched, NULL);

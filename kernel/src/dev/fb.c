@@ -642,6 +642,9 @@ static const struct n_hal_rule boot_screen_rules[] = {N_FIXED("boot-screen")};
 static const struct hal_driver boot_screen_driver = {.name = "firmware-screen", .rules = boot_screen_rules,
                                                      .rule_count = ARRAY_SIZE(boot_screen_rules),
                                                      .attach = boot_screen_attach, .detach = boot_screen_detach,
+                                                     /* firmware の画面は S3 の後に戻らない（S3 の戻りは画面の firmware を
+                                                        走らせない）。休止の後は次の起動の firmware が元どおりにする */
+                                                     .after_sleep = HAL_AFTER_SLEEP_BOOT};
 HAL_DRIVER(boot_screen_driver);
 
 void fb_publish(void) {

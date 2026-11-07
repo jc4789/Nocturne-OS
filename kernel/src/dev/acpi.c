@@ -878,6 +878,7 @@ void acpi_aml_init(void) {
     acpi_lid_read();
     if (!hw_reduced) aml_ok(uacpi_finalize_gpe_initialization(), "enabling GPEs");
     aml_ready = true;
+    acpi_power_init();
     kprintf("acpi: AML ready in %lu ms, SCI GSI %d, power button: %s%s%u in the namespace, lid: %s\n",
             (clock_now_ns() - t0) / NS_PER_MS, sci ? (int)sci_gsi : -1, fixed ? "fixed" : "", fixed ? " + " : "",
             button_count, lid_node ? "yes" : "no");
@@ -920,6 +921,19 @@ bool acpi_sleep_supported(unsigned state) {
     path[3] = (char)('0' + state);
     uacpi_namespace_node *node;
     return uacpi_namespace_node_find(UACPI_NULL, path, &node) == UACPI_STATUS_OK;
+}
+
+void acpi_sleep_transition(unsigned state) {
+    if (!aml_ready) return;
+    uacpi_object *arg = uacpi_object_create_integer(state);
+    if (!arg) {
+        kprintf("acpi: no memory to run _TTS(%u)\n", state);
+        return;
+    }
+    uacpi_object_array args = {&arg, 1};
+    uacpi_status st = uacpi_execute(uacpi_namespace_root(), "_TTS", &args);
+    if (st != UACPI_STATUS_OK && st != UACPI_STATUS_NOT_FOUND) kprintf("acpi: _TTS(%u): %s\n", state, uacpi_status_to_string(st));
+    uacpi_object_unref(arg);
 }
 
 bool acpi_sleep_prepare(unsigned state) {

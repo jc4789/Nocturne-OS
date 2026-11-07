@@ -4,7 +4,7 @@
    参照で持ち、claim の終わりは記録を消さない：終わった後の写像と DMA は N_ERR_CLOSED と、全部 1 が読める頁になる。
    ここはバスを知らない。バスの持ち分は struct hal_claim_ops（begin、end、call）にある。
 
-   錠の順（先 → 後）：end_mutex → claims_mutex、end_mutex → バスの錠と mm/shared.c の錠、offers_mutex → hal_lock、
+   錠の順（先 → 後）：門（hal_busy_begin）→ end_mutex と装置の bind、end_mutex → claims_mutex、end_mutex → バスの錠と mm/shared.c の錠、offers_mutex → hal_lock、
    irq_lock → 待ち行列と事象の錠、power_lock → 待ち行列の錠。ends_lock は葉。
    終わりは claim ごとに一度だけ走る（end_mutex）。最後の handle の close と hal_remove が同時に来ても、後の者は
    終わりが済むまで待つ。呼出しは hal_claim_enter で記録を hold するので、hal_remove が戻った後に claim が装置に触ることは
@@ -470,8 +470,8 @@ int64_t hal_claim_power_done(struct handle *h, bool ok) {
     return awaiting ? 0 : -N_ERR_INVALID;
 }
 
-/* SUSPEND を渡し、答えを待つ。できたと答えたら true。 */
-static bool claim_suspend(struct hal_claim *c) {
+bool hal_claim_suspend(struct hal_claim *c) {
+    if (!hal_claim_sleeps(c)) return false;
     uint64_t deadline = clock_after(SLEEP_ANSWER_NS);
     uint64_t irq = spin_lock(&c->power_lock);
     c->power_event = N_HAL_POWER_SUSPEND;
@@ -486,6 +486,18 @@ static bool claim_suspend(struct hal_claim *c) {
     bool ok = c->power_answer == 1;
     spin_unlock(&c->power_lock, irq);
     return ok;
+}
+
+void hal_claim_resume(struct hal_claim *c) {
+    uint64_t irq = spin_lock(&c->power_lock);
+    if (c->power_told) {
+        c->power_told = false;
+        /* SUSPEND をまだ取っていないなら、見ずに済む */
+        c->power_event = c->power_event == N_HAL_POWER_SUSPEND ? 0 : N_HAL_POWER_RESUME;
+        c->power_awaiting = false;
+        wq_wake_all(&c->power_wq);
+    }
+    spin_unlock(&c->power_lock, irq);
 }
 
 /* ---- 終わり ---- */
@@ -515,9 +527,12 @@ static void claim_end(struct hal_claim *c) {
     spin_unlock(&hal_lock, f);
     wq_wake_all(&c->wq);
     claim_wake_power(c);
+    /* 装置に触る終わりは電源の walk と並ばない：walk の SUSPEND の待ちは上の起こしで済み、終わりは walk の後に走る */
+    hal_busy_begin();
     mutex_lock(&c->end_mutex);
     if (c->ended) {
         mutex_unlock(&c->end_mutex);
+        hal_busy_end();
         return;
     }
     c->ended = true;
@@ -549,6 +564,7 @@ static void claim_end(struct hal_claim *c) {
     kprintf("hal: %s released\n", d->location);
     mutex_unlock(&c->end_mutex);
     hal_unbind_process(d);
+    hal_busy_end();
 }
 
 /* d->claim が見えている間は、object の参照が残っている。 */
@@ -583,7 +599,7 @@ static int64_t claim_begin(struct hal_device *d, struct process *t, const char *
         kfree(c);
         return r;
     }
-    r = ops->begin ? ops->begin(c, &c->bus) : 0;
+    r = !hal_power_up(d) ? -N_ERR_IO : ops->begin ? ops->begin(c, &c->bus) : 0;
     if (r < 0) {
         hal_unbind_process(d);
         kfree(c);
@@ -612,9 +628,11 @@ int64_t hal_claim_open(uint32_t device, const char *driver, struct handle **out)
     if (!t) return -N_ERR_DENIED;
     struct hal_device *d = hal_find(device);
     if (!d) return -N_ERR_NOT_FOUND;
+    hal_busy_begin(); /* 電源の walk の間は始めない */
     mutex_lock(&d->bind);
     int64_t r = d == &hal_root ? -N_ERR_NOT_FOUND : claim_begin(d, t, driver, out);
     mutex_unlock(&d->bind);
+    hal_busy_end();
     hal_put(d);
     return r;
 }

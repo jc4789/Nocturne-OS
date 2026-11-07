@@ -16,11 +16,17 @@
    ホスト、電源のボタン、console のシリアル、IOMMU）は、その部品が struct hal_machine で宣言する。HAL は宣言に合う
    装置に実装を結ばず、claim させず、電源の段で呼ばない。台帳には持ち主の部品が動かしているものとして載る。
 
+   電源。眠り、休止、電源断の装置の段は HAL の walk が持つ（hal_power_suspend）。動いている装置（カーネルの実装か
+   claim を持つ装置）を、子と依存する側から止める。眠り（S3）では、止めた装置をバスの方法（hal_bus_ops.power）と
+   firmware の方法（struct hal_firmware_ops）で D3 にし、戻りは D0 にしてから実装に戻させる。実装に渡る前（attach、
+   claim）にも装置を D0 にする。
+
    firmware の節。struct firmware_node は、機械の firmware が装置を記述する節（ACPI の名前空間の Device）である。
    中身は firmware の持ち主（dev/acpi.c）だけが知り、HAL とバスは指を運ぶだけである。
 
-   文脈。attach と detach は装置ごとの thread で走り、眠ってよく、秒の単位で待ってよい。別の装置を待たせない。
-   quiesce と resume は dev/pm.h の文脈で走る（割り込みを切った CPU の上で、眠らない）。 */
+   文脈。attach と detach は装置ごとの thread、suspend と resume は電源の walk の thread で走る。どれも割り込みは
+   開いていて、全部の CPU が動いている。眠ってよく、秒の単位で待ってよく、自分の装置の割り込みを待ってよい。別の
+   装置を待たせない。 */
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
@@ -42,6 +48,10 @@ struct irq_spec;
 #define HAL_ENABLE_PORTS 2u  /* ポートの資源に答える */
 #define HAL_ENABLE_DMA 4u    /* 装置がメモリーへ読み書きする */
 
+/* 装置の電源の状態（PCIe 6.0 5.3.1、ACPI 6.5 2.3 と 7.3）。D1 と D2 は使わない。D3hot の装置には電源があり、バスの
+   構成の空間に答える。D3cold の装置には電源が無く、電源が戻ると初めから始まる。 */
+enum hal_power_state { HAL_D0, HAL_D3HOT, HAL_D3COLD };
+
 /* バスが自分の子のために持つ操作。無いものは NULL。 */
 struct hal_bus_ops {
     /* count 本までの割り込みを立て、立てた数を返す。specs[i] が i 番目。irqs は NULL でよい。バスが一番良い形を選ぶ
@@ -54,6 +64,38 @@ struct hal_bus_ops {
     bool (*stop)(struct hal_device *d);
     /* プロセスの実装の口（hal/claim.c）。claim が NULL のバスはプロセスの実装を持てない。 */
     const struct hal_claim_ops *claim;
+    /* 装置の電源の状態をバスの方法で変える（PCI は PMCSR）。眠ってよい。NULL：バスに電源の状態が無い。
+       HAL_D3HOT：実装が止めた後に来る。バスの構成を保存してから移す。
+       HAL_D3COLD：移す操作でなく知らせ。装置が電源を失ったか、失っていた電源が戻った（firmware の方法、機械の眠り）。
+       次の HAL_D0 は電源の入りから数えて待つ。
+       HAL_D0：D3 の後と、実装に渡る前に来る。装置が答えるまで待ち、D0 に移し、D3 から来たなら保存した構成を戻す。
+       false：移らなかった（D3HOT なら構成を保存できない、D0 なら装置が答えない）。 */
+    bool (*power)(struct hal_device *d, enum hal_power_state to);
+};
+
+/* firmware が記述する装置の電源（ACPI なら dev/acpi_power.c）。持ち主が hal_firmware_set で一度置く。
+   power は節を HAL_D0 か HAL_D3COLD へ移す。HAL_D3COLD なら節を D3 にしてから、要らなくなった共有の資源を切る。HAL_D0
+   なら要る資源を入れてから節を D0 にする（ACPI 6.5 7.2、7.3.8、7.3.11）。資源の順は節ごとの要る資源の中で守る。もう
+   to にある節には何もしない。*cold：この呼出しで装置の電源が切れたか、切れていた電源が戻ったかもしれない（装置は
+   電源の入りから始まる）。眠ってよい。電源の walk の装置ごとの thread と結ぶ前の thread から並んで来るので、持ち主が
+   自分の錠で一つずつにする（ACPI 6.5 7.3.15 の _IRC も一つずつを求める）。false：移らなかった（持ち主がログに書く）。 */
+struct hal_firmware_ops {
+    bool (*power)(struct firmware_node *node, enum hal_power_state to, bool *cold);
+};
+void hal_firmware_set(const struct hal_firmware_ops *ops);
+
+/* 眠りの目標（hal_power_suspend）。 */
+enum hal_power_target {
+    HAL_POWER_SLEEP, /* 機械が S3 で眠る。止めた後、装置は D3 になり電源を失う。resume が続く */
+    HAL_POWER_IMAGE, /* 休止の写しを取る。電源は残り、resume が続く（写しから戻った後の resume も同じ） */
+    HAL_POWER_OFF,   /* 電源が切れるか、機械が休止の写しのカーネルへ渡る。resume は来ない */
+};
+
+/* 眠りの後に実装が装置を戻せるか。宣言しない実装（0）は戻せない。 */
+enum hal_after_sleep {
+    HAL_AFTER_SLEEP_LOST,   /* 戻せない：結んでいる間、機械は眠らず、休止もしない */
+    HAL_AFTER_SLEEP_BOOT,   /* 戻せないが、休止の後は次の起動の firmware が元どおりにする：休止だけを許す */
+    HAL_AFTER_SLEEP_RESUME, /* suspend と resume で眠りと休止に加わる */
 };
 
 /* カーネルの実装。規則に合う装置ごとに attach が呼ばれる。
@@ -61,8 +103,14 @@ struct hal_bus_ops {
    HAL が割り込みを切り、DMA を止め、DMA のメモリーを返す。
    detach：装置が去る、または手放す。自分が hal_publish した子を hal_remove してから返る。戻った後、割り込みと DMA は
    HAL が片づける。NULL の実装は装置が去らないバスの上だけで動く。
-   refuse：今は眠れない理由（ログのため）か NULL。眠りのたびに聞く。
-   cold_ok：resume が無くても、次の起動の後に元どおりになる（休止は妨げない）。 */
+   suspend：装置の仕事を止める。DMA と割り込みを静め、戻すのに要る状態を持ち、自分のデータの道（送信、要求、描画）
+   を自分の錠で閉じる（ほかの thread は動いている）。true は止まった。false は止められなかった：眠りと休止は取りやめ
+   になり、resume が呼ばれる。HAL_POWER_OFF では false でも電源は切れる。NULL は止めるものが無い。
+   resume：suspend の後に戻す。HAL は先に装置を D0 にし、バスの構成（PCI なら BAR、命令、MSI と MSI-X）を戻してある。
+   装置そのものは電源を失っていてもよく（眠りと休止の後）、そのままでもよい（取りやめと写しの後）。どちらでも元どおり
+   にする。false は戻らなかった（実装は持ち続け、hal_failed で言う）。NULL はすることが無い。
+   refuse：今は眠れない理由（ログのため）か NULL。眠りと休止のたびに聞く。
+   after_sleep：enum hal_after_sleep。 */
 #define HAL_DECLINE 1
 struct hal_driver {
     const char *name;
@@ -70,7 +118,10 @@ struct hal_driver {
     uint32_t rule_count;
     int (*attach)(struct hal_device *d);
     void (*detach)(struct hal_device *d);
+    bool (*suspend)(struct hal_device *d, enum hal_power_target target);
+    bool (*resume)(struct hal_device *d);
     const char *(*refuse)(struct hal_device *d);
+    enum hal_after_sleep after_sleep;
 };
 #define HAL_DRIVER(driver) \
     static const struct hal_driver *const driver##_entry __attribute__((used, section(".hal_drivers"))) = &driver
@@ -113,14 +164,16 @@ struct hal_device {
     struct hal_claim *claim;
     struct hal_device *parent, *first_child, *last_child, *prev, *next;
     struct hal_device *pending_next;
-    struct hal_device *power_next, *power_prev;
+    struct hal_device *power_next; /* 電源の walk の動いている装置の鎖（hal/power.c） */
+    uint32_t power_level;          /* その段 */
     struct hal_offer_entry *offers;
     struct hal_depend_entry *depends;
     struct hal_dma_block *dma;
     struct mutex bind; /* attach、detach、claim の始まり、hal_remove を一度に一つにする */
     uint32_t holds;    /* 記録を読んでいる attach の thread、claim、呼出しの数。hal_remove は 0 を待つ。hal_lock の下 */
     uint32_t offer_count, depend_count;
-    bool queued, gone, listed, power_seen, power_down, irqs_on;
+    bool queued, gone, listed, irqs_on;
+    bool power_seen, power_suspended, power_lowered; /* walk が辿った、止めた、D3 にした */
     bool machine; /* 機械の装置（struct hal_machine） */
 };
 
@@ -195,19 +248,30 @@ bool hal_settled(void);  /* 結ぶ途中のものも、探しているものも�
 /* この性質の物に合うカーネルの実装があるか（USB の設定を選ぶ）。 */
 bool hal_driver_exists(const struct n_hal_prop *props, uint32_t count, const uint8_t *bytes);
 
-/* ---- 電源（dev/pm.c だけが呼ぶ） ----
-   hal_power_begin は新しい attach と変更を止め、進行中のものを待ち、止める順の列を作る。hal_power_end で開く。
-   順は子が先で親が後、依存する側が先。戻すのは逆。 */
+/* ---- 電源（dev/pm.c と dev/hibernate.c が呼ぶ） ----
+   hal_power_begin は新しい attach と変更を止め、進行中のものを待ち、装置の段を数える。hal_power_end で開く。
+   段は、動いている装置だけを数えた、木の親と依存先（hal_depends）を辿る深さである。
+   hal_power_suspend は動いている装置を深い段から止める。同じ段の装置は装置ごとの thread で同時に止まる。
+   HAL_POWER_SLEEP では、止まった装置をバスと firmware の方法で D3 にする。止まらない装置があれば、その段の後で
+   止め、その名を返す（HAL_POWER_OFF は全部を回り、最初の名を返す）。止まった装置はそのまま残る。
+   hal_power_resume は止まった装置を浅い段から D0 にして戻す。取りやめでも眠りの後でも呼ぶ。slept：機械が眠った
+   （D3 にした装置は電源を失った）。戻らない装置があれば最初の名を返す。どちらも hal_power_begin の間に、割り込みを
+   開け、全部の CPU が動く中で呼ぶ。 */
 void hal_power_begin(void);
 void hal_power_end(void);
+const char *hal_power_suspend(enum hal_power_target target);
+const char *hal_power_resume(bool slept);
 /* 眠りを妨げるものの名か NULL。hal_power_begin の間に呼ぶ。 */
 enum hal_refusal {
     HAL_REFUSAL_NONE,
-    HAL_REFUSAL_CANNOT,  /* 実装に resume が無い */
+    HAL_REFUSAL_CANNOT,  /* 実装が眠りの後に装置を戻せない（after_sleep） */
     HAL_REFUSAL_BUSY,    /* 実装の refuse が理由を言った */
     HAL_REFUSAL_PROCESS, /* 眠りに加わらないプロセスの実装が持っている */
 };
 const char *hal_power_refused(bool hibernate, enum hal_refusal *why);
+/* 結んでいる実装の after_sleep だけを見て、眠り（休止）の後に戻せない実装の名か NULL。錠を取る。いつでも呼べる
+   （開始メニューは描くたびに聞く）。 */
+const char *hal_power_cannot(bool hibernate);
 
 /* ---- プログラムへ ---- */
 int64_t hal_syscall_list(void *user_out, uint64_t bytes);
@@ -296,6 +360,8 @@ int hal_bind_process(struct hal_device *d, struct hal_claim *claim, const char *
 void hal_unbind_process(struct hal_device *d);
 void hal_claim_end_device(struct hal_device *d);
 
+/* 眠り。n_hal_power_wait を一度でも呼んだ claim は眠りの知らせを受ける（hal_claim_sleeps）。呼ばない claim を
+   持つ装置は眠りと休止を断る（HAL_REFUSAL_PROCESS）。知らせは電源の walk が渡す（hal/power.c）。 */
 bool hal_claim_sleeps(const struct hal_claim *claim);
 /* 番号で引き、見つかれば記録を hold する。去っている装置は見つからない。眠らない。hal_put で放す。 */
 struct hal_device *hal_find(uint32_t id);

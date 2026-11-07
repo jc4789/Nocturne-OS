@@ -34,7 +34,6 @@ struct pci_claim {
     struct pci_device *d;
     struct guard guards[CLAIM_GUARDS];
     unsigned guard_count;
-    uint16_t pmcsr; /* the power management capability's control register, or 0 */
     struct iommu_domain *domain; /* where an IOMMU isolates the function (dev/iommu.h) */
     struct pci_device *reset_port; /* where this claim's attempt sent a Secondary Bus Reset (bus_reset) */
 };
@@ -63,10 +62,7 @@ static void guards_init(struct pci_claim *c) {
     guard(c, 0x0C, 1u << 30); /* BIST: start */
     guard(c, 0x3C, 0xFF);     /* Interrupt Line: the platform's routing record */
     uint8_t pm = pci_find_cap(d, 0x01);
-    if (pm) {
-        c->pmcsr = pm + 4;
-        guard(c, c->pmcsr, 3); /* power state: sleep belongs to dev/pm.c; waking to D0 is let through */
-    }
+    if (pm) guard(c, pm + 4, 3); /* PowerState：D 状態は HAL のもの（hal_bus_ops.power）。claim には D0 で渡る */
     if (d->pcie_cap) {
         /* Device Control: Max_Payload_Size must match the whole path to the root, phantom
            functions widen the requester IDs, and Initiate FLR resets the function. */
@@ -106,9 +102,7 @@ static bool guarded(const struct pci_claim *c, uint32_t offset, uint32_t width, 
         const struct pci_device *d = c->d;
         uint32_t old = pci_read32(d->address, dword);
         uint32_t now = (old & ~written) | ((value << shift) & written);
-        uint32_t bits = c->guards[i].bits;
-        if (dword == c->pmcsr && !(now & 3)) bits &= ~3u; /* back to D0 */
-        if ((old ^ now) & bits) return true;
+        if ((old ^ now) & c->guards[i].bits) return true;
     }
     return false;
 }

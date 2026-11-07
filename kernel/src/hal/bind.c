@@ -114,7 +114,7 @@ static void bind_thread(void *arg) {
         score = next_score;
         order = e->order;
         set_attaching(d, e->driver);
-        int r = e->driver->attach(d);
+        int r = hal_power_up(d) ? e->driver->attach(d) : -N_ERR_IO;
         if (!r) {
             set_attached(d);
             break;

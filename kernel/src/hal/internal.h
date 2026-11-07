@@ -26,3 +26,10 @@ void hal_release(struct hal_device *d);      /* hal/resource.c：実装が手放
 /* hal/bind.c の門：closing の間は新しい attach を起こさず、進行中のものの終わりを待つ。open で開き、待つ列を流す */
 void hal_gate_close(void);
 void hal_gate_open(void);
+/* hal/power.c：装置を D0 にする（firmware の D0、バスの D0）。実装か claim に渡る前と、眠りの戻りで。false：装置が
+   D0 で答えない */
+bool hal_power_up(struct hal_device *d);
+/* hal/claim.c：電源の walk の claim の知らせ。suspend は SUSPEND を渡して答えを待ち、止まったと答えたら true。眠りに
+   加わらない claim と、答えずに終わった claim は false。resume は SUSPEND を渡した claim に RESUME を渡す */
+bool hal_claim_suspend(struct hal_claim *claim);
+void hal_claim_resume(struct hal_claim *claim);
