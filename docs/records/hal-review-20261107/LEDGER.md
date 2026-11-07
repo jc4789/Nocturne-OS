@@ -154,7 +154,8 @@
 - `bool hal_dma_map(struct hal_device *d, uint64_t phys, uint64_t pages, uint64_t *bus)`・`void hal_dma_unmap(struct hal_device *d, uint64_t phys, uint64_t pages)`：ほかの持ち主のメモリー（共有 object の音の輪）を長く装置へ渡す。幅の外なら false（呼ぶ側は幅の中で取り直す）。眠ってよい thread から。
 - `bool hal_dma_reach(const struct hal_device *d, uint64_t phys, uint64_t bytes, uint64_t *bus)`：データの道（どの文脈でも）。そのままで届く区間なら番地。領域にいる装置は、写した区間の中だけ。
 - バスの方法：`hal_bus_ops.dma_map(d, phys, pages)`・`dma_unmap`。PCI は装置が domain にいればそこへ同じ番地で写す（`iommu_map`）。いなければ何もしない。
-- 道が変わる知らせ：`struct hal_driver` の `dma_pause(d)`・`dma_resume(d, bool messages)`。バスが装置を領域へ移す前に pause（何も送らず、割り込みを止める。眠ってよい）、写した後に resume（messages が false なら MSI を使わない）。持つ実装だけが claim の group に入れる（今の `struct iommu_guest` を PCI が実装の欄から作る）。
+- 道が変わる知らせ：HAL の `hal_dma_pause(d)`・`hal_dma_restart(d, translated)`（`hal/dma.c`）が、実装の `struct hal_driver` の `dma_pause(d)`・`dma_restart(d)` を呼ぶ。pause は実装を止め（何も送らず、割り込みを止める。眠ってよい）、バスの `stop` で止めを確かめ、領域から外す。restart は一覧の全部を新しい道へ写してから実装を始める。両方を持つ実装だけが claim の group に入れる（`dev/iommu.c` の `iommu_guests_stop`・`iommu_guests_start`。claim が立てば `no_messages` と `claim_domain` を立てて restart）。止めた装置は電源の walk が飛ばす。
+- CPU のキャッシュの書き出しは `arch/cpu.h` の `cpu_cache_flush`（IOMMU の表と、キャッシュを覗かない装置の両方が使う）。
 
 **block**
 - `struct blkdev` に `struct hal_device *dma`（データを DMA で動かす装置。CPU で動かす実装は NULL：`usbmsc`、`ata`）。
@@ -165,7 +166,7 @@
 - `nvme`：64。PRP と SGL は `segments[i].bus`。輪と一覧は `hal_dma_alloc`。
 - `ahci`：S64A なら 64、無ければ 32。
 - `xhci`：AC64 なら 64、無ければ 32（断りを消す、H18）。`dma_page`・`dma_block`・`pmm_*` を `hal_dma_alloc`・`hal_dma_free` に（装置の文脈と輪は USB の装置ごとに取り、返す）。
-- `hda`：64BIT（GCAP の 64OK）で幅。CORB・RIRB・BDL は `hal_dma_alloc`、流れの輪は `hal_dma_map`。`iommu_map`・`iommu_unmap`・guest の欄を消し、`dma_pause`・`dma_resume` にする。`iommu_cache_flush` の要るかを読む。
+- `hda`：64BIT（GCAP の 64OK）で幅。CORB・RIRB・BDL は `hal_dma_alloc`、流れの輪は `hal_dma_map`。`iommu_map`・`iommu_unmap`・guest の欄を消し、`dma_pause`・`dma_restart` にする。キャッシュを覗かない流れの書き出しは `cpu_cache_flush`。
 - `ac97`、`e1000`、`tulip`、`rtl8125`：幅の申告と `hal_dma_alloc`。`ac97` の流れの輪は `hal_dma_map`。
 - `virtio_gpu`：`pmm_*` を `hal_dma_alloc` に、`vmm_map_mmio` を `hal_map` に、`pci_read32` を PCI の口に（H19）。`ata`：`hal_port` で（H19）。
 - VMBus の実装（`netvsc`、`storvsc`）の GPADL の頁：VMBus は訳の無いバス。`hal_dma_alloc` に揃えるかは読んで決める。
