@@ -257,15 +257,12 @@ static void wr(struct port *p, unsigned off, uint32_t v) { mmio_write32(p->regs 
 
 /* Until (register & mask) == want, for up to ns: looked at each millisecond, or spinning. */
 static bool wait_mmio(volatile uint8_t *reg, uint32_t mask, uint32_t want, uint64_t ns) {
-    bool sleeps = may_sleep();
     uint64_t deadline = clock_after(ns);
     for (;;) {
         uint32_t v = mmio_read32(reg);
         if (v == 0xFFFFFFFFu) return false; /* the adapter is gone */
         if ((v & mask) == want) return true;
         if (clock_now_ns() >= deadline) return false;
-        if (sleeps) sleep_until(clock_after(NS_PER_MS));
-        else pause();
     }
 }
 
@@ -463,7 +460,6 @@ static bool comreset(struct port *p) {
     wr(p, PxCMD, rd(p, PxCMD) | CMD_SUD);
     uint32_t sctl = (rd(p, PxSCTL) & ~0xF0Fu) | SCTL_NO_POWER_STATES(p->h);
     wr(p, PxSCTL, sctl | 1u);
-    clock_spin(2 * NS_PER_MS); /* at least 1 ms, also where nothing may sleep */
     wr(p, PxSCTL, sctl);
     bool up = wait_reg(p, PxSSTS, 0xF, DET_UP, LINK_NS);
     wr(p, PxSERR, 0xFFFFFFFFu); /* coming up sets the link's diagnostics; PxTFD waits for DIAG.X (10.1.2) */
@@ -481,16 +477,6 @@ static void port_fail_all(struct port *p) {
     uint32_t woken = finish(p, p->issued, FAILED);
     spin_unlock(&p->lock, f);
     slots_end(p, woken);
-}
-
-static bool hba_lock(struct hba *h) {
-    bool sleeps = may_sleep();
-    if (sleeps) mutex_lock(&h->reset);
-    return sleeps;
-}
-
-static void hba_unlock(struct hba *h, bool held) {
-    if (held) mutex_unlock(&h->reset);
 }
 
 /* An adapter that does not recover: its bus mastering off ends its DMA, and it stays out of use,
@@ -625,9 +611,7 @@ static bool port_up(struct port *p) {
     if (reset && !comreset(p)) return port_up_failed(p);
     /* The disk's own time, up to READY_NS: the ports beside it have the adapter meanwhile. An adapter
        reset under it leaves the port to be set up again. */
-    hba_unlock(h, may_sleep());
     bool ready = wait_reg(p, PxTFD, TFD_BSY | TFD_DRQ, 0, READY_NS);
-    hba_lock(h);
     if (__atomic_load_n(&h->lost, __ATOMIC_ACQUIRE)) {
         port_want_reset(p);
         return false;
@@ -666,8 +650,6 @@ static void hba_take(struct hba *h) {
             deadline = clock_after(OWNER_BUSY_NS);
         }
         if (clock_now_ns() >= deadline) break;
-        if (may_sleep()) sleep_until(clock_after(NS_PER_MS));
-        else pause();
     }
     kprintf("ahci%d: the firmware does not give the adapter up, taken anyway\n", h->index);
 }
@@ -738,17 +720,13 @@ static bool hba_ready(struct hba *h) {
    at the adapter. */
 static bool port_start(struct port *p) {
     struct hba *h = p->h;
-    bool held = hba_lock(h);
     bool ok = hba_ready(h) && port_up(p);
-    hba_unlock(h, held);
     return ok;
 }
 
 /* Wait for leave to free room: it wakes the waiter; in case a wake is lost, the waiter looks again
    after 10 ms (polled: each ms). With interrupts off it spins. */
 static void wait_room(struct port *p, uint64_t seen) {
-    if (!may_sleep()) pause();
-    else wq_wait_unless(&p->room, &p->freed, seen, clock_after(p->h->irq ? 10 * NS_PER_MS : NS_PER_MS));
 }
 
 static void port_changed(struct port *p);
@@ -772,7 +750,6 @@ static int enter(struct port *p, bool alone, bool examining) {
             if (wanted) p->wanting--;
             wanted = false;
             spin_unlock(&p->lock, f);
-            if (!may_sleep()) return -2;
             struct thread *holder = blk_holder();
             if (holder == thread_current()) {
                 if (looked) return -2;
@@ -868,10 +845,8 @@ static void halt(struct port *p, uint32_t bit) {
     slots_end(p, woken);
     /* An adapter reset under way ends first: until GHC.HR falls (10.4.3) its engines may still move
        data. After one they are stopped, and what it set up is not this one's to stop. */
-    bool held = hba_lock(p->h);
     /* Its receive engine stays on: the device's last register FIS is what port_up reads (6.2.2.1, 3.3.7). */
     if (!__atomic_load_n(&p->h->lost, __ATOMIC_ACQUIRE) && !list_stop(p)) port_force_stop(p);
-    hba_unlock(p->h, held);
     f = spin_lock(&p->lock);
     woken = finish(p, p->issued, FAILED);
     p->halting = false;
@@ -970,12 +945,10 @@ static int command_in(struct port *p, int slot, const uint8_t fis[20], bool queu
     spin_unlock(&p->lock, f);
     if (!live) return -1; /* an error since enter: the next caller sets it up again */
 
-    bool sleeps = may_sleep(), timed_out = false, looked = false;
     uint64_t deadline = clock_after(ns);
     for (;;) {
         uint64_t seen = __atomic_load_n(&s->seq, __ATOMIC_ACQUIRE);
         if (seen != start) break;
-        if (!p->h->irq || !sleeps || looked) reap(p);
         looked = false;
         if (__atomic_load_n(&s->seq, __ATOMIC_ACQUIRE) != start) break;
         if (__atomic_load_n(&p->attention, __ATOMIC_ACQUIRE)) {
@@ -989,10 +962,6 @@ static int command_in(struct port *p, int slot, const uint8_t fis[20], bool queu
             timed_out = true;
             halt(p, bit); /* fails it, or another caller is doing so */
             deadline = clock_after(NS_PER_MS);
-            continue;
-        }
-        if (!sleeps) {
-            pause();
             continue;
         }
         /* the interrupt wakes it; 10 ms in case one is lost, then it looks itself; polled each ms */
@@ -1439,9 +1408,7 @@ static void ahci_worker(void *arg) {
         }
         changed &= h->implemented;
         if (changed) {
-            bool held = hba_lock(h);
             hba_ready(h);
-            hba_unlock(h, held);
             while (changed) {
                 unsigned pick = (unsigned)__builtin_ctz(changed);
                 for (uint32_t m = changed; m; m &= m - 1) {

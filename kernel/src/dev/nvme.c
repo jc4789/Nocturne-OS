@@ -168,16 +168,12 @@ struct nvme {
     struct vector *vectors;
     struct ns *found;  /* its usable namespaces, as the first enable found them */
     bool discovered;   /* found is made */
-    bool in_use;       /* they are block devices: what they were given is to be kept */
     /* live: the admin queue takes commands; ready: the I/O queues too, looked at under a queue's
        submission lock. A timeout or a fatal status clears them until the reset that follows
        (recover). generation: moves on at each enable, so that of the callers whose commands failed
        only the first resets the controller. */
     bool live, ready, vwc;
     uint64_t generation;
-    /* back from a sleep: enabled again before the next command. Set by resume while the disks are
-       held (blk_hold). */
-    bool woke;
     /* One stop at a time (controller_stop), taken inside reset_lock and alone by a command that
        ran out of time. stops moves on when one has ended; stopped: the last one's end, its bus
        mastering off if false; cut: the controller does not stop, and it stays out of use. */
@@ -904,18 +900,6 @@ static bool recover(struct nvme *c, uint64_t seen) {
     return ok;
 }
 
-/* Back from a sleep, the controller enabled again first. */
-static void awake(struct nvme *c) {
-    if (!__atomic_load_n(&c->woke, __ATOMIC_ACQUIRE)) return;
-    mutex_lock(&c->reset_lock);
-    if (c->woke) {
-        c->woke = false;
-        if (enable_recorded(c)) kprintf("nvme%d: ready again after sleep\n", c->index);
-        else kprintf("nvme%d: did not come back after sleep\n", c->index);
-    }
-    mutex_unlock(&c->reset_lock);
-}
-
 /* The calling CPU's I/O queue. */
 static struct queue *io_queue(struct nvme *c) {
     unsigned nio = __atomic_load_n(&c->nio, __ATOMIC_ACQUIRE);
@@ -1021,7 +1005,6 @@ static void queue_chain(struct nvme *c, struct blk_request *chain) {
 
 static void nvme_submit(struct blkdev *d, struct blk_request *chain) {
     struct nvme *c = ((struct ns *)d->priv)->c;
-    awake(c);
     if (__atomic_load_n(&c->ready, __ATOMIC_ACQUIRE) || recover(c, __atomic_load_n(&c->generation, __ATOMIC_ACQUIRE))) {
         queue_chain(c, chain);
         return;
@@ -1150,7 +1133,6 @@ static int start(struct nvme *c) {
             c->pci->vendor, c->pci->device, rd32(c, VS), c->namespaces, c->nio, c->io[0].depth, c->nvectors,
             !c->nvectors ? "vectors: polled" : pci_msix_max_vectors(c->pci) ? "MSI-X vectors" : "vectors",
             c->vwc ? ", write cache" : "", c->sgl ? "SGL" : "PRP");
-    __atomic_store_n(&c->in_use, true, __ATOMIC_RELEASE);
     for (struct ns *s = c->found; s; s = s->next) {
         ksnprintf(s->blk.name, sizeof s->blk.name, "nvme%d.%u", c->index, s->nsid);
         strlcpy(s->blk.model, c->model, sizeof s->blk.model);
