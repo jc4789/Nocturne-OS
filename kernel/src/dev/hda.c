@@ -743,11 +743,11 @@ static void hda_thread(void *arg) {
    reset から codec を戻す。function group は link の clock を止める前に D3 にする（7.3.3.10：codec は D0 から D3 へ
    移る音の乱れを自分で抑える。clock の止まった codec は完全な reset から始め直し、resume はそうする）。claim の客で
    止まっていれば、link はもう下りている。
-   止まらなければ false。眠りと休止は取りやめになり、止まらなかった装置に resume は来ない（hal/power.c）ので、動いて
-   いたとおりに戻す。電源断では戻さない：電源が切れるか、休止の写しへ渡る前に DMA をまた始めることになる。 */
+   止まらなければ false：眠りと休止の取りやめで resume が続き、link を上げ直す。 */
 static bool hda_suspend(struct hal_device *d, enum hal_power_target target) {
+    (void)target;
     struct hda *h = d->driver_data;
-    bool stopped = true, back = true;
+    bool stopped = true;
     mutex_lock(&h->state);
     if (!h->stopped) {
         mutex_lock(&h->stream);
@@ -755,15 +755,10 @@ static bool hda_suspend(struct hal_device *d, enum hal_power_target target) {
         for (unsigned at = 0; at < 15; at++)
             if (h->codecs[at]) hda_codec_sleep(h->codecs[at]);
         stopped = link_reset(h);
-        if (!stopped && target != HAL_POWER_OFF) {
-            back = link_up(h);
-            h->restore = back;
-        }
         mutex_unlock(&h->stream);
     }
     mutex_unlock(&h->state);
     if (!stopped) kprintf("audio: HD Audio at %04x:%02x:%02x.%x does not stop\n", PCI_ADDRESS_ARGS(h->pci->address));
-    if (!back) hal_failed(d, -N_ERR_IO);
     signal(h);
     tell_open(h); /* 開いた出口の持ち主が、止まったことと新しい生成を見る */
     return stopped;

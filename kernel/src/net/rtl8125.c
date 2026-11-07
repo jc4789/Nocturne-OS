@@ -598,28 +598,13 @@ static void phy_power_down(struct rtl8125 *c) {
     wr8(c, PMCH, rd8(c, PMCH) & ~PMCH_PHY_WAKE);
 }
 
-/* 道を閉じて：装置を初めから立て直し（re_hw_init）、道を開く。MAC が reset を出て送受信が入ったら true。 */
-static bool rtl_restart(struct rtl8125 *c) {
-    hw_init(c);
-    rtl_run(c);
-    uint8_t cmd = rd8(c, CMD);
-    bool back = !(cmd & CMD_RESET) && (cmd & (CMD_TX_EN | CMD_RX_EN)) == (CMD_TX_EN | CMD_RX_EN);
-    path_open(c);
-    return back;
-}
-
 /* hal.h の suspend（re_suspend と re_shutdown）。道を閉じてから MAC を reset する：DMA と割り込みが止まる。眠りと電源断
    では装置が D3 に入るか電源を失うので、D3 の前の設定と PHY の電源断を続ける。休止の写しでは電源が残り、resume が
-   初めから立て直す。reset が済まなければ false。眠りと休止は取りやめになり、止まらなかった装置に resume は来ない
-   （hal/power.c）ので、動いていたとおりに戻す。電源断では戻さない：電源が切れるか、休止の写しへ渡る前に DMA を
-   また始めることになる。 */
+   初めから立て直す。reset が済まなければ false：眠りと休止の取りやめで resume が続き、立て直す。 */
 static bool rtl_suspend(struct hal_device *d, enum hal_power_target target) {
     struct rtl8125 *c = d->driver_data;
     path_close(c);
-    if (!mac_reset(c)) {
-        if (target != HAL_POWER_OFF && !rtl_restart(c)) hal_failed(d, -N_ERR_IO);
-        return false;
-    }
+    if (!mac_reset(c)) return false;
     switch (target) {
     case HAL_POWER_SLEEP:
     case HAL_POWER_OFF:
@@ -631,12 +616,17 @@ static bool rtl_suspend(struct hal_device *d, enum hal_power_target target) {
     return true;
 }
 
-/* hal.h の resume（re_resume）。装置は電源を失っていても、そのままでもよい：hw_init はどちらからも初めから立てる。局の
-   番地と輪の場所は記憶にあり、電源を失っても失われない。 */
+/* hal.h の resume（re_resume）。装置は電源を失っていても、そのままでもよい：道を閉じて hw_init（re_hw_init）がどちら
+   からも初めから立て、道を開く。局の番地と輪の場所は記憶にあり、電源を失っても失われない。MAC が reset を出て送受信が
+   入ったら true。 */
 static bool rtl_resume(struct hal_device *d) {
     struct rtl8125 *c = d->driver_data;
     path_close(c);
-    bool back = rtl_restart(c);
+    hw_init(c);
+    rtl_run(c);
+    uint8_t cmd = rd8(c, CMD);
+    bool back = !(cmd & CMD_RESET) && (cmd & (CMD_TX_EN | CMD_RX_EN)) == (CMD_TX_EN | CMD_RX_EN);
+    path_open(c);
     if (!back) {
         kprintf("rtl8125: did not come back after sleeping\n");
         hal_failed(d, -N_ERR_IO);
