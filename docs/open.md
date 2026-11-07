@@ -78,7 +78,15 @@
 - `nvrm` の帰線とフリップの糸が fair 級である（`ports/nvidia` に `n_thread_schedule` が無い）。
 - カーネルの機能は IOMMU を素通りする（`kernel/src/dev/iommu.h:9-10`）。絞る口が無い（`kernel/src/dev/iommu.c:647`）。
 - PCI に抜き差しと AER が無い。
-- ノート PC の内蔵キーボード（i8042、I2C の HID）の実装が無い。
+- ノート PC の内蔵キーボード（i8042、I2C の HID）の実装が無い。HAL は ACPI の接続の資源（`GpioInt`、`GpioIo`、`I2cSerialBus`、`SpiSerialBus`、`UartSerialBus`）を表さず、GPIO の割り込みの提供者の口も無い（`kernel/src/dev/acpi_devices.c:125`）。
+- 眠り：`nvrm` は `n_hal_power_wait` を呼ばないので、NVIDIA の GPU を持つ機械は眠らず、休止もしない（`ports/nvidia/nvrm.c`）。
+- 眠り：起動の画面（`firmware-screen`、`HAL_AFTER_SLEEP_BOOT`）は、claim の GPU ドライバーが画面 0 を持っても結ばれたままで、S3 を拒む。手放すのはカーネルの `vbe` だけ（`kernel/src/dev/fb.c:642`、`kernel/src/vm/vbe.c:182`）。
+- 眠り：起こしの元（`_PRW`、`_DSW`、GPE、PCI の PME）を扱わない。起こせるのは電源のボタンだけ。設定の窓の項目と組で作る。
+- 電源：動作中の装置の電源の管理（使わない装置を D3 へ）が無い。
+- PCI の列挙は、firmware が D3cold で渡した機能（`_PR0` の資源が切れている）を、数える前に D0 にしない（`kernel/src/dev/pci.c`）。
+- HAL：固まった装置をバスでリセットして実装を結び直す口が無い。PCI の FLR と SBR は claim の道（`kernel/src/dev/pciuser.c`）だけが使う。
+- HAL：detach の後に記録と thread を返さない実装がある（`nvme`、`ahci`、`storvsc`）。
+- レジスターを期限つきで待つ関数を実装ごとに写している（9 か所、`docs/records/hal-review-20261107/LEDGER.md` の H21）。
 - AVX-512：カーネルは CPU が持てば有効にするが、FFmpeg は切ってある（`ports/ffmpeg/prepare.py`、`Makefile:190`）。我々のコードは実行時に選ばない。
 - GPU：ドライバーが動作中に落ちると既定の道へ戻らない（`docs/records/audit-gpu-generic-20261102.md` の F1）。
 - virgl：製品のカーネルで起きない（`kernel/src/vm/virtio_gpu.c:579`）。

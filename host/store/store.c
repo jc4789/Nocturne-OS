@@ -10,7 +10,7 @@
                                              512-byte sectors
      store format <image> <label>            a new empty volume
      store folder <image> <C:\path> [--private]
-     store put <image> <C:\path> <host path> [--system]
+     store put <image> <C:\path> <host path> [--private]
                                              a host file as a document, or a host folder and
                                              everything in it
      store fill <image> <list>               many puts, folders and removals (scripts/layout.py
@@ -2287,7 +2287,7 @@ static int usage(void) {
                     "       store esp <image>\n"
                     "       store format <image> <label>\n"
                     "       store folder <image> <C:\\path> [--private]\n"
-                    "       store put <image> <C:\\path> <host path> [--system]\n"
+                    "       store put <image> <C:\\path> <host path> [--private]\n"
                     "       store fill <image> <list>\n"
                     "       store remove <image> <C:\\path>\n"
                     "       store list <image> <C:\\path>\n"

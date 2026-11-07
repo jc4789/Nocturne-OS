@@ -122,6 +122,38 @@
 - QEMU の表には電源資源が無い。試験の SSDT（`-acpitable`）で電源資源と `_PS0`・`_PS3` を持つ装置を作り、試験のプログラムが claim する。浅い段の claim が断ると取りやめになるので、深い段の装置の D3 と D0、同じ段の NVMe・e1000・xHCI の D3hot から D0 と構成の戻りを、眠らずに見られる。
 - 休止の全部の輪、電源断、再起動を QEMU で見る。
 
+## 3.3 段 D の設計
+
+照らしたもの：PCI の DMA の番地の幅（32 bit は全部の機能が持ち、64 bit は機能ごとの申告：NVMe 1.4 の PRP と SGL は 64 bit、AHCI 1.3.1 の CAP.S64A、xHCI 1.2 の HCCPARAMS1.AC64）、`dev/iommu.h` の domain と guest の約束、`dev/blk.h` の要求の形。
+
+**持ち主**
+- 装置が届く番地の幅は実装の申告（装置の register が言う）。HAL が持ち、`hal_dma_alloc` と `hal_dma_reach` が使う。既定は 32（PCI の床）。
+- 装置へ渡す番地を決めるのは HAL とバス。実装は物理番地から番地を作らない（`dma_offset`、`hal_dma_address`、`bus - dma_offset`、`hhdm_virt_to_phys` を消す）。
+- 訳の領域（IOMMU の domain）に装置を入れるのはバス。HAL は装置の DMA のメモリーの一覧を持ち、装置が領域に入るとバスにその全部を写させる。実装は IOMMU を知らない。
+- 区切りの DMA（block の要求）は `blk.c` が一か所で扱う。届かない区切りは `blk.c` の緩衝（今ある `bounce_io`）を通す。HAL に二つ目の緩衝を作らない（D7 の「HAL が予約した緩衝」はこれに替える：同じ責務を二つ持たない）。
+
+**口（`hal/hal.h`）**
+- `void hal_dma_bits(struct hal_device *d, unsigned bits)`：attach の中、DMA のメモリーを取る前に。
+- `void *hal_dma_alloc(struct hal_device *d, size_t bytes, uint64_t *bus)`・`void hal_dma_free(struct hal_device *d, void *memory)`：長く使うメモリー（輪、記述子、装置の文脈、送受の緩衝）。幅の中、装置の node の近く、0 埋め。装置が領域にいればそこに写る。眠ってよい thread から。装置が止まったと確かめられない限り、片づけで返さない（今のとおり）。
+- `bool hal_dma_map(struct hal_device *d, uint64_t phys, uint64_t pages, uint64_t *bus)`・`void hal_dma_unmap(struct hal_device *d, uint64_t phys, uint64_t pages)`：ほかの持ち主のメモリー（共有 object の音の輪）を長く装置へ渡す。幅の外なら false（呼ぶ側は幅の中で取り直す）。眠ってよい thread から。
+- `bool hal_dma_reach(const struct hal_device *d, uint64_t phys, uint64_t bytes, uint64_t *bus)`：データの道（どの文脈でも）。そのままで届く区間なら番地。領域にいる装置は、写した区間の中だけ。
+- バスの方法：`hal_bus_ops.dma_map(d, phys, pages)`・`dma_unmap`。PCI は装置が domain にいればそこへ同じ番地で写す（`iommu_map`）。いなければ何もしない。
+- 道が変わる知らせ：`struct hal_driver` の `dma_pause(d)`・`dma_resume(d, bool messages)`。バスが装置を領域へ移す前に pause（何も送らず、割り込みを止める。眠ってよい）、写した後に resume（messages が false なら MSI を使わない）。持つ実装だけが claim の group に入れる（今の `struct iommu_guest` を PCI が実装の欄から作る）。
+
+**block**
+- `struct blkdev` に `struct hal_device *dma`（データを DMA で動かす装置。CPU で動かす実装は NULL：`usbmsc`、`ata`）。
+- `struct blk_segment` に `bus`。`blk.c` が区切りを作るときに `hal_dma_reach` で埋める。届かない区切りを持つ要求は `bounce_io` へ行き、緩衝は `hal_dma_alloc` で取る。実装は `bus` だけを読む。
+- `ahci` の低い緩衝（`p->low`）と、S64A の無い道の写しを消す。
+
+**実装**
+- `nvme`：64。PRP と SGL は `segments[i].bus`。輪と一覧は `hal_dma_alloc`。
+- `ahci`：S64A なら 64、無ければ 32。
+- `xhci`：AC64 なら 64、無ければ 32（断りを消す、H18）。`dma_page`・`dma_block`・`pmm_*` を `hal_dma_alloc`・`hal_dma_free` に（装置の文脈と輪は USB の装置ごとに取り、返す）。
+- `hda`：64BIT（GCAP の 64OK）で幅。CORB・RIRB・BDL は `hal_dma_alloc`、流れの輪は `hal_dma_map`。`iommu_map`・`iommu_unmap`・guest の欄を消し、`dma_pause`・`dma_resume` にする。`iommu_cache_flush` の要るかを読む。
+- `ac97`、`e1000`、`tulip`、`rtl8125`：幅の申告と `hal_dma_alloc`。`ac97` の流れの輪は `hal_dma_map`。
+- `virtio_gpu`：`pmm_*` を `hal_dma_alloc` に、`vmm_map_mmio` を `hal_map` に、`pci_read32` を PCI の口に（H19）。`ata`：`hal_port` で（H19）。
+- VMBus の実装（`netvsc`、`storvsc`）の GPADL の頁：VMBus は訳の無いバス。`hal_dma_alloc` に揃えるかは読んで決める。
+
 ## 4. 段
 
 | 段 | 中身 | 状態 |
@@ -140,3 +172,10 @@
 - 前提の食い違い：`-device VGA` ではカーネルの `vbe` が VGA を持つので、pcitest の VGA の場合は claim できない（busy）。AMD の IOMMU は QEMU で x2APIC に要る形式（XTSup）を持たず使われない。WHPX は split の irqchip を持たないので、Intel の IOMMU は割り込みの再割り当てなしで使う。
 - `C:\Tests` で tcc で組んだプログラムは公開の呼出ししか持たず、claim の能力を引けない。pcitest と nvrmtest はホストで組み（`build/tests/pcitest`、`build/tests/nvrmtest`）、試験の媒体の `C:\Nocturne\System` に置く。
 - 確かめていないこと：管理者が台帳の見張りで装置ごとの実例を作り・消す道（QEMU に宣言に合う装置が無い）。
+
+**段 C（コミット 88c1d6fc の媒体、xHCI の実装の前。QEMU 窓付き、WHPX、q35、`intel-iommu,intremap=off,caching-mode=on`、NVMe の起動、e1000、`intel-hda`＋`hda-duplex`、`edu` 二つ、試験の SSDT（作業場の `power_ssdt.py`）、`-device VGA`。xHCI は外した：まだ実装の電源の段が無く、眠りを拒む）**
+- 取りやめの walk（`powertest`、作業場）：0 failed。NOCT0001 と edu 1 は SUSPEND に止まったと答え、edu 2 は止まらないと答える。同じ段の全部（NVMe、AHCI、e1000、HDA、vbe、三つの claim）が SLEEP で止まり、取りやめで戻る。NOCT0001 の記録は "3abBA0"：`_PS3`、資源を順の大きい方から `_OFF`（共有の PRC0 は残る）、小さい方から `_ON`、`_PS0`。edu 1 は D3hot から D0 と構成の戻しの後に答える。止まらないと答えた edu 2 も RESUME を受ける。戻った後、AHCI は port を見直し、NVMe の C: は書ける（電源断の段まで失敗の行が無い）。
+- S3 の入り（`powertest sleep`）：QMP の `query-status` が `suspended`。walk の全部の装置が止まり D3 になり、`_PTS`、CPU の停止、入りまで通った。WHPX は S3 から戻れない：戻りは確かめていない。
+- 休止の全部の輪（`powertest hibernate`、作業場の qcow2 の overlay）：一度目は IMAGE の walk、写し（30 MiB を 152 ms）、戻る walk（AHCI の見直し）、OFF の walk、電源断。二度目の起動は写しへ戻り「awake after 30 s」「the image is removed」、続く電源断も通る。
+- 見つけて直したこと：止まらないと答えた装置に resume が来なかった（`hal/power.c`、3811a86a）。眠る前から使えない装置が眠りのたびに「戻らなかった」と言う形（7f414941）。止まらない suspend が自分で戻す二つ目の道（88c1d6fc）。
+- 確かめていないこと：実機と Hyper-V。tulip、ata、rtl8125、ac97 の walk（QEMU のこの構成に無い）。S3 からの戻り。
