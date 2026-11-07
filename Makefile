@@ -380,7 +380,9 @@ $(BUILD)/tests/nvk_contracttest: $(NVK_OBJ) $(NVRM_CLIENT_OBJ)
 $(BUILD)/u/tests/nvrm_servetest.o: UCFLAGS += $(NVRM_CLIENT_INC)
 $(BUILD)/tests/nvrm_servetest: private TEST_OBJ := $(NVRM_OUT)/os/nvrm_serve.o
 $(BUILD)/tests/nvrm_servetest: $(NVRM_OUT)/os/nvrm_serve.o
-$(BUILD)/tests/media_cenc_test $(BUILD)/tests/nvk_contracttest $(BUILD)/tests/nvrm_servetest $(BUILD)/tests/testrun: $(BUILD)/tests/%: $(BUILD)/u/tests/%.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
+# pcitest と nvrmtest は claim の能力を使うので、試験の媒体の C:\Nocturne\System に置く（C:\Tests で組んだ
+# プログラムは公開の呼出ししか持たない、sys/proc.c）。
+$(BUILD)/tests/media_cenc_test $(BUILD)/tests/nvk_contracttest $(BUILD)/tests/nvrm_servetest $(BUILD)/tests/testrun $(BUILD)/tests/pcitest $(BUILD)/tests/nvrmtest: $(BUILD)/tests/%: $(BUILD)/u/tests/%.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
 	@mkdir -p $(dir $@)
 	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< $(TEST_OBJ) --start-lib @$(LIBC_RSP) --end-lib -o $@
 

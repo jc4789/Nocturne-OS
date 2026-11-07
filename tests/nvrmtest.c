@@ -41,9 +41,7 @@ static uint32_t find_edu(void) {
 int main(void) {
     uint32_t edu = find_edu();
     if (!edu) {
-        printf("nvrmtest: no edu device (run QEMU with -device edu)
-nvrmtest: 1 failed
-");
+        printf("nvrmtest: no edu device (run QEMU with -device edu)\nnvrmtest: 1 failed\n");
         return 1;
     }
     /* the argument is the device's ledger id, the claim the handle N_SERVICE_HANDLE_DEVICE */

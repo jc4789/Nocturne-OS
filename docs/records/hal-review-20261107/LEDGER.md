@@ -66,12 +66,69 @@
 | D8 | PCI の根の機能は ACPI のホストブリッジの下に出す。AML が無ければ根の下 | H6 |
 | D9 | H20〜H25 はこの仕事の範囲の外。`docs/open.md` へ | 範囲。H22〜H24 は端から端まで（制御器の実装、設定の窓）通さないと、口だけで呼ぶ側が無い |
 
+## 3.1 段 C の設計
+
+照らした原文：ACPI 6.5 の 7.1〜7.3（電源資源、`_PSx`、`_PRx`）、7.4.1（`_PTS`）、7.4.4（`_TTS`）、7.5、16.1.3、16.1.6、16.1.7。PCIe 6.0 の 5.3.1（D 状態）、5.9（表 5-14）、7.5.2（PMC、PMCSR）。
+
+**実装の電源の段（D1）**
+- `struct hal_driver` の電源の欄：`bool (*suspend)(d, enum hal_power_target)`、`bool (*resume)(d)`、`refuse`、`enum hal_after_sleep after_sleep`。
+  - `after_sleep`：`LOST`（既定。戻せない：結んでいる間、眠りも休止もしない）、`BOOT`（次の起動の firmware が戻す：休止だけを許す）、`RESUME`（suspend・resume で加わる。無い方は、することが無い）。
+  - 目標：`SLEEP`（S3。この後、装置は電源を失う）、`IMAGE`（休止の写し。電源は残り、resume が続く）、`OFF`（電源断、再起動、休止の写しへ渡す。resume は来ない）。
+  - 文脈：電源の walk の thread。割り込みは開き、全部の CPU が動いている。眠ってよく、自分の割り込みを待ってよい。実装は自分のデータの道（送信、要求、描画）を自分の錠で閉じる。実装の thread の `hal_busy_begin` は walk の間待つ。
+- walk：動いている装置（カーネルの実装か claim を持ち、機械の装置でない）だけを数えた段。段は木の親と依存先を辿った深さ。止めるのは深い段から、戻すのは浅い段から。同じ段の装置は装置ごとの thread で同時に走らせる（NVMe の shutdown のような秒の単位の手順を足し算にしない）。claim も同じ walk に入る（`N_HAL_POWER_SUSPEND` を渡して答えを待ち、戻りは `N_HAL_POWER_RESUME` を渡す）。
+- 止まらない装置があれば、その段の後で walk を止める。戻す walk は、止まった印と電源を落とした印の付いた装置だけを戻す。`OFF` は止まらない装置があっても全部を回る。
+- 消すもの：`quiesce`、`cold_ok`、`hal_quiesce_all`、`hal_resume_all`、`hal_claims_suspend`、`hal_claims_resume`、各実装の quiesce と resume（割り込みを切った文脈のための回る待ち、錠を取らない道、`RFLAGS.IF` を読む分かれ道）。
+
+**装置の電源の状態（D2）**
+- `SLEEP` だけ、各装置の suspend の後に二つを行う。
+  - バスの電源（`hal_bus_ops.power`）。PCI は構成を保存して PMCSR を D3hot にし、10 ms 待つ（表 5-14）。
+  - firmware の電源（`struct hal_firmware_ops`、firmware の持ち主が置く）。ACPI は `_PS3` を呼び、`_PR0` の参照を放し、参照の無くなった電源資源を順の値の大きい方から一つずつ `_OFF` する（7.2、7.3.11）。firmware の段は、段ごとに walk の thread でまとめて一つずつ行う。
+- 戻りは段ごとに、firmware → バス → 実装の resume の順。
+  - firmware：`_PR0` の資源を参照し、切れていたものを順の値の小さい方から `_ON` し、その後 `_PS0`（7.3.8）。
+  - バス：準備の待ち、D0、10 ms（Immediate_Readiness_on_Return_to_D0 なら待たない、7.5.2.1）、構成を戻す。
+- 結ぶ前（attach、claim）にも装置を D0 にする（firmware が D3 で渡した装置のため）。`rtl8125` の PMCSR の手書きを消す。
+- ACPI の電源資源の記録：AML の初期化の後、名前空間の全部の Device の `_PR0` を読み、資源の `_STA` から D0 にある装置の参照を数える。実装の無い装置の参照も数え、共有の資源を切らない。S3 の後は、参照のある資源を PCI の構成を戻す前に `_ON` し直す（7.2.3：繰り返してよい）。
+- PCI：HAL が D3 にした機能は、`pci_suspend` が保存しない（D3hot ではメモリー空間に届かない、5.3.1.4.1）。`pci_resume` も戻さない（HAL の戻りが firmware の後で戻す）。claim の PMCSR の守りは「D 状態は HAL のもの」。
+
+**機械の順（H3、H14）**
+- S3：
+  1. 拒みの確かめ。
+  2. `_TTS(3)`（7.4.4）。
+  3. store_sync、blk_hold、flush。
+  4. `SLEEP` の walk（16.1.6 の 4）。
+  5. `_PTS(3)`（16.1.6 の 5）。
+  6. ほかの CPU を止める（16.1.6 の 6）。
+  7. PCI の構成を保存し、AML を凍らせ、割り込みを切り、入る。
+  8. 起きたら：時計、IOMMU、APIC、割り込みの線、ACPI の link、電源資源、PCI の構成、`_WAK`（7.5 の 9）。
+  9. ほかの CPU を戻し、凍結を解く。
+  10. 戻す walk（7.5 の 10）。
+  11. `_TTS(0)`（7.5 の 11）。
+  - 取りやめでも `_TTS(0)` を呼ぶ。`_PTS` の後の取りやめは `_WAK` も呼ぶ（7.4.1）。
+- 休止の写し：拒み → store_sync、blk_hold、flush → `IMAGE` の walk → CPU を止める → 写し → 戻す → 写しを書く → 電源断。
+- 電源断：`_TTS(5)` → `_PTS(5)`（16.1.7 の 1）→ blk_hold、flush（16.1.7 の 2）→ `OFF` の walk → 切る。再起動は `_TTS`・`_PTS` なし。
+- 休止からの戻し（起動した側のカーネル）：`OFF` の walk → CPU を止める → 写しへ跳ぶ。
+- H12：`pm_sleep_check` は起動で一度、機械の部分（IOMMU、S3、起こしの頁、休止の置き場）だけを決める。文を事実に直す。
+
+**確かめ方**
+- WHPX は S3 から戻れない（`qemu-visual.md`）。TCG で必須の CPU の機能が揃うかを見る。揃わなければ、S3 の戻りは未確認と書く。
+- QEMU の表には電源資源が無い。試験の SSDT（`-acpitable`）で電源資源と `_PS0`・`_PS3` を持つ装置を作り、試験のプログラムが claim する。浅い段の claim が断ると取りやめになるので、深い段の装置の D3 と D0、同じ段の NVMe・e1000・xHCI の D3hot から D0 と構成の戻りを、眠らずに見られる。
+- 休止の全部の輪、電源断、再起動を QEMU で見る。
+
 ## 4. 段
 
 | 段 | 中身 | 状態 |
 |---|---|---|
 | A | 機械の装置（D4）、木（D8）、H10、H11 | 済：宣言 `struct hal_machine`（`.hal_machine`）、firmware の節 `struct firmware_node`、ACPI の二度の出し方、QEMU で木を確かめた |
-| B | firmware の口（D3）、claim の渡し方（D5）、台帳の見張り（D6） | 済：`dev/acpi_claim.c`（`SYS_HAL_ACPI_EVAL`・`_NOTIFY_TAKE`、`N_ACPI_PARENT`）、`SYS_SCREEN_HOLD`、`n_hal_claim` の実装の名、管理者が claim を取って `N_SERVICE_HANDLE_DEVICE` で渡す、台帳の見張りで実例を作り・消す、見張りの相手へ一覧の全部 |
+| B | firmware の口（D3）、claim の渡し方（D5）、台帳の見張り（D6） | 済：`dev/acpi_claim.c`（`SYS_HAL_ACPI_EVAL`・`_NOTIFY_TAKE`、`N_ACPI_PARENT`）、`SYS_SCREEN_HOLD`、`n_hal_claim` の実装の名、管理者が claim を取って `N_SERVICE_HANDLE_DEVICE` で渡す、台帳の見張りで実例を作り・消す、見張りの相手へ一覧の全部。確かめは下の 5 |
+
+## 5. 確かめの記録
+
+**段 B（コミット 6babecc2 の媒体、QEMU 窓付き、WHPX、q35、`intel-iommu,intremap=off,caching-mode=on`、`edu,dma_mask=0xffffffff`）**
+- `nvrmtest`：0 failed。試験が edu を `nvrm` の名で claim し、`N_SERVICE_HANDLE_DEVICE` で nvrm に渡す。nvrm は動き、終わると claim が終わり、試験の名で取り直せる。
+- `pcitest`（起動の画面を `bochs-display` にした回）：ACPI の口（`N_ACPI_SELF`・`N_ACPI_PARENT`・`N_ACPI_CHILD` の評価と断り）と `n_screen_hold` の場合に失敗は無い。5 件は画面に描かれた印の数の確かめで落ちる（refresh の分からない画面での合成の振る舞い。HAL の範囲の外、`docs/open.md` へ）。
+- 前提の食い違い：`-device VGA` ではカーネルの `vbe` が VGA を持つので、pcitest の VGA の場合は claim できない（busy）。AMD の IOMMU は QEMU で x2APIC に要る形式（XTSup）を持たず使われない。WHPX は split の irqchip を持たないので、Intel の IOMMU は割り込みの再割り当てなしで使う。
+- `C:\Tests` で tcc で組んだプログラムは公開の呼出ししか持たず、claim の能力を引けない。pcitest と nvrmtest はホストで組み（`build/tests/pcitest`、`build/tests/nvrmtest`）、試験の媒体の `C:\Nocturne\System` に置く。
+- 確かめていないこと：管理者が台帳の見張りで装置ごとの実例を作り・消す道（QEMU に宣言に合う装置が無い）。
 | C | 電源（D1、D2、H3、H12、H14） | 未 |
 | D | DMA（D7）、H19 | 未 |
 | E | 文書（`docs/hal.md`、ABI の §9、地図、`docs/open.md`）と全体の確かめ | 未 |

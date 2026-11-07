@@ -1,6 +1,8 @@
-/* 試験の媒体のサービス "tests"。製品の媒体には無い（scripts/test.py が C:\Nocturne\System に置く）。
+/* 試験の媒体のサービス "tests"。製品の媒体には無い。試験の媒体を作るとき、build/host/store.exe put で
+   C:\Nocturne\System に置く。
    試験の利用者を一人用意して自動で入るようにし、その身元で C:\Tests\autorun.sh を実行し、電源を切る。
-   シェルは受けた能力を子へ渡すので、試験のプログラムは n_cap_find で能力を引く。 */
+   シェルは受けた能力を子へ渡すので、試験のプログラムは n_cap_find で能力を引く。能力の呼出しは公開の呼出しでない
+   ので、それを使う試験（pcitest、nvrmtest）はホストで組んで C:\Nocturne\System に置く（sys/proc.c）。 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
