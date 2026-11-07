@@ -26,6 +26,7 @@
 #include "arch/spin.h"
 #include "dev/acpi.h"
 #include "dev/serial.h"
+#include "hal/hal.h"
 #include "mm/vmm.h"
 #include "sys/clock.h"
 #include "sys/log.h"
@@ -79,7 +80,8 @@ struct uart {
     bool present;
     bool mmio;
     uint16_t port;           /* I/O space */
-    volatile uint8_t *base;  /* system memory */
+    uint64_t phys;           /* system memory: the registers' address */
+    volatile uint8_t *base;  /* system memory: mapped */
     unsigned stride;         /* the bytes from one register to the next, and the width of an access */
     unsigned depth;          /* the bytes the transmitter takes at once */
     uint32_t clock, divisor;
@@ -181,6 +183,7 @@ static bool spcr_port(struct uart *u) {
         u->port = (uint16_t)g->address;
     } else if (g->space == 0) {
         if (!g->address || !(u->base = vmm_map_mmio(g->address, (REG_SCR + 1) * stride))) return false;
+        u->phys = g->address;
         u->mmio = true;
     } else {
         return false;
@@ -330,3 +333,15 @@ void serial_panic_log(void) {
     if (log_pending(c) && (!put_text(rest, sizeof rest - 1, true) || !put_cursor(c, !cursor))) return;
     wait_line(LSR_TEMT);
 }
+
+/* ---- the machine's device that is this file's (hal/hal.h) ----
+   The port the log leaves by: the 16550-compatible device (PNP0500, PNP0501) whose registers it is. */
+static bool console_mine(struct hal_device *d) {
+    if (!started) return false; /* serial_start came before the drivers bind */
+    return uart.mmio ? hal_resource_holds(d, N_HAL_MEMORY, uart.phys) : hal_resource_holds(d, N_HAL_PORT, uart.port);
+}
+
+static const struct n_hal_rule console_rules[] = {N_ACPI_ID("PNP0500"), N_ACPI_ID("PNP0501")};
+static const struct hal_machine serial_console = {
+    .owner = "serial", .rules = console_rules, .rule_count = ARRAY_SIZE(console_rules), .mine = console_mine};
+HAL_MACHINE(serial_console);

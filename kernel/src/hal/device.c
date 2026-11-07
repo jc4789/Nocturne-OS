@@ -5,15 +5,6 @@
 #include "sys/syscall.h"
 #include "sys/watch.h"
 
-struct hal_offer_entry {
-    struct hal_offer_entry *next;
-    struct n_hal_offer offer;
-};
-struct hal_depend_entry {
-    struct hal_depend_entry *next;
-    struct hal_device *on;
-};
-
 struct spinlock hal_lock;
 struct hal_device hal_root;
 static uint32_t hal_ids;
@@ -61,6 +52,17 @@ void hal_prop_text(struct hal_device *d, uint32_t key, const char *text) {
 }
 
 void hal_location(struct hal_device *d, const char *text) { strlcpy(d->location, text, sizeof d->location); }
+
+void hal_device_discard(struct hal_device *d) {
+    ASSERT(!d->listed);
+    kfree(d->props);
+    kfree(d->prop_bytes);
+    kfree(d->resources);
+    d->props = NULL;
+    d->prop_bytes = NULL;
+    d->resources = NULL;
+    d->prop_count = d->prop_bytes_used = d->resource_count = 0;
+}
 
 /* 根の下の深さ優先。 */
 struct hal_device *hal_walk_next(struct hal_device *d) {
@@ -261,6 +263,17 @@ struct hal_device *hal_find(uint32_t id) {
     if (d && d->gone) d = NULL;
     if (d) d->holds++;
     spin_unlock(&hal_lock, f);
+    return d;
+}
+
+struct hal_device *hal_find_firmware(const struct firmware_node *f) {
+    if (!f) return NULL;
+    uint64_t flags = spin_lock(&hal_lock);
+    struct hal_device *d = hal_root.first_child;
+    while (d && d->firmware != f) d = hal_walk_next(d);
+    if (d && d->gone) d = NULL;
+    if (d) d->holds++;
+    spin_unlock(&hal_lock, flags);
     return d;
 }
 

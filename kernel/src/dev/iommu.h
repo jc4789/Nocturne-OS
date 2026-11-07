@@ -197,6 +197,9 @@ struct iommu_hw {
     uint32_t (*ioapic_reach)(uint8_t ioapic_id);
     bool (*resume)(void);
     bool (*shutdown)(void);
+    /* d is the PCI function of one of the units (an AMD-Vi unit is one), whose registers the back
+       end drives. NULL: no unit is a PCI function (VT-d). */
+    bool (*unit_function)(const struct pci_device *d);
 };
 /* The units the firmware describes (IVRS, DMAR), their registers mapped and read: the back end,
    or NULL. Nothing is written to them before start. On NULL, plain_safe is true only with no

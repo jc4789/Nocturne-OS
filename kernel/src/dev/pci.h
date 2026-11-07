@@ -39,7 +39,9 @@ struct pci_device {
     bool bridge;                  /* a PCI-to-PCI bridge (header type 1) */
     uint8_t secondary, subordinate; /* a bridge's buses: those below it, as enumeration found them */
     struct pci_device *upstream;  /* the bridge whose secondary bus this function is on, or NULL */
-    int node; /* the NUMA node it sits on (topology's index, from the firmware's _PXM), -1 when unknown */
+    /* The host bridge of its root bus in the firmware's description (dev/acpi.h), NULL without one.
+       The function's own node is hal.firmware. */
+    struct firmware_node *host;
     uint16_t msix_entries;      /* the MSI-X table's size, once mapped (pci_irq_enable) */
     volatile uint32_t *msix_table; /* mapped MSI-X table, 16 bytes per entry */
     /* The irqs its messages deliver (pci_irq_enable): MSI's msi_count from the first, each MSI-X
@@ -55,7 +57,8 @@ struct pci_device {
     unsigned irte_room;
     bool kernel_owned; /* a kernel driver enabled it (pci_enable_busmaster, hal_enable): no app may claim it */
     /* Its place in the device tree (hal/hal.h): the function is a HAL device of bus N_BUS_PCI, whose
-       implementation reaches it through pci_device_of. The bus operations are pci_bus_ops. */
+       implementation reaches it through pci_device_of, below its bridge, or on a root bus below its
+       host bridge. The bus operations are pci_bus_ops. */
     struct hal_device hal;
     bool published;     /* hal_publish done (pci_init) */
     struct irq *intx;   /* its INTx line where hal_irq_enable found no message (pci.c) */

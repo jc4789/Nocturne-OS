@@ -1,5 +1,6 @@
 /* Late kernel initialisation: filesystems, devices, GUI and the first process. */
 #include "kernel.h"
+#include "dev/acpi.h"
 #include "dev/entropy.h"
 #include "fs/store.h"
 #include "dev/input.h"
@@ -23,7 +24,6 @@
 #include "sys/authority.h"
 
 void acpi_init(void);
-void acpi_devices_publish(void);
 void net_init(void);
 
 #define INIT_PATH N_FOLDER_SYSTEM "\\services"
@@ -38,11 +38,12 @@ void kmain_late(void) {
     hal_init();
     fb_publish();
     vm_init(); /* only in a VM: its own bus, its fixed ports and the drivers of its devices */
+    acpi_devices_publish(); /* the host bridges first: the root buses' functions go below them */
     pci_init();
     iommu_init(); /* before any driver turns an interrupt on: their messages may be remapped */
     net_init();
     audio_init();
-    acpi_devices_publish();
+    acpi_devices_publish_below();
     hal_start(); /* the drivers bind, each device on a thread of its own */
     store_init();        /* C:, from the disk the system started from (waiting for it to appear) */
     hibernate_restore(); /* returns only when there is no image to go back to */

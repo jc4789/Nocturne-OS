@@ -8,8 +8,16 @@
        hal_prop_number(&x->hal, N_PROP_..., value);
        hal_resource_add(&x->hal, N_HAL_MEMORY, slot, flags, base, size);
        hal_location(&x->hal, "...");
+       x->hal.firmware = ...;  （firmware が記述する装置なら）
        hal_publish(parent, &x->hal);
    実装を足すのは、struct hal_driver を一つ書き、HAL_DRIVER(名前) を置くことである。
+
+   機械の装置。核の部品が firmware の表から自分で見つけて起動の早い段で使う装置（基準の時計、割り込みの線、PCI の
+   ホスト、電源のボタン、console のシリアル、IOMMU）は、その部品が struct hal_machine で宣言する。HAL は宣言に合う
+   装置に実装を結ばず、claim させず、電源の段で呼ばない。台帳には持ち主の部品が動かしているものとして載る。
+
+   firmware の節。struct firmware_node は、機械の firmware が装置を記述する節（ACPI の名前空間の Device）である。
+   中身は firmware の持ち主（dev/acpi.c）だけが知り、HAL とバスは指を運ぶだけである。
 
    文脈。attach と detach は装置ごとの thread で走り、眠ってよく、秒の単位で待ってよい。別の装置を待たせない。
    quiesce と resume は dev/pm.h の文脈で走る（割り込みを切った CPU の上で、眠らない）。 */
@@ -26,6 +34,7 @@ struct hal_claim_ops;
 struct hal_offer_entry;
 struct hal_depend_entry;
 struct hal_dma_block;
+struct firmware_node;
 struct irq;
 struct irq_spec;
 
@@ -71,6 +80,17 @@ struct hal_driver {
 #define HAL_DRIVER(driver) \
     static const struct hal_driver *const driver##_entry __attribute__((used, section(".hal_drivers"))) = &driver
 
+/* 機械の装置の宣言。規則に合い、mine が true を返す装置を owner が持つ。mine が NULL なら、規則に合う装置は全部。
+   mine は結ぶ時（hal_start の後）に呼ばれ、眠らない。持ち主はそれまでに自分の装置を見つけておく。 */
+struct hal_machine {
+    const char *owner;
+    const struct n_hal_rule *rules;
+    uint32_t rule_count;
+    bool (*mine)(struct hal_device *d);
+};
+#define HAL_MACHINE(machine) \
+    static const struct hal_machine *const machine##_entry __attribute__((used, section(".hal_machine"))) = &machine
+
 /* 装置の記録。バスの物に埋め、寿命はその物と同じ。hal_remove が戻るまで生きている。 */
 struct hal_device {
     /* バスが hal_publish の前に書く。後は読むだけ。錠なしで読める */
@@ -85,6 +105,7 @@ struct hal_device {
     uint32_t resource_count;
     bool incomplete; /* hal_prop_* か hal_resource_add が記憶を得られなかった */
     char location[48];
+    struct firmware_node *firmware; /* firmware が装置を記述する節。NULL：記述しない */
 
     void *driver_data; /* 実装の物 */
 
@@ -105,6 +126,7 @@ struct hal_device {
     uint32_t holds;    /* 記録を読んでいる attach の thread、claim、呼出しの数。hal_remove は 0 を待つ。hal_lock の下 */
     uint32_t offer_count, depend_count;
     bool queued, gone, listed, power_seen, power_down, irqs_on;
+    bool machine; /* 機械の装置（struct hal_machine） */
 };
 
 /* ---- バスの側 ----
@@ -119,6 +141,10 @@ void hal_resource_add(struct hal_device *d, enum n_hal_resource_kind kind, uint3
 void hal_location(struct hal_device *d, const char *text);
 void hal_publish(struct hal_device *parent, struct hal_device *d);
 void hal_remove(struct hal_device *d);
+/* hal_device_init の後、hal_publish の前に出さないと決めた記録の性質と資源を返す。この後、バスは記録を消してよい。 */
+void hal_device_discard(struct hal_device *d);
+/* firmware の節 f が記述する装置。見つかれば記録を hold する（hal_put で放す）。去っている装置は見つからない。眠らない。 */
+struct hal_device *hal_find_firmware(const struct firmware_node *f);
 /* d はこの後、on より先に止まり、on より後に戻る（ACPI の _DEP）。眠ってよい thread から。 */
 void hal_depends(struct hal_device *d, struct hal_device *on);
 static inline uint32_t hal_id(const struct hal_device *d) { return d->id; }
@@ -126,6 +152,8 @@ static inline uint32_t hal_id(const struct hal_device *d) { return d->id; }
 /* ---- 実装の側 ---- */
 /* 資源。slot の番号はバスが決める。無ければ NULL。 */
 const struct n_hal_resource *hal_resource(const struct hal_device *d, enum n_hal_resource_kind kind, uint32_t slot);
+/* kind の資源のどれかが address（メモリーかポートの番地、GSI の番号）を含むか。 */
+bool hal_resource_holds(const struct hal_device *d, enum n_hal_resource_kind kind, uint64_t address);
 /* メモリーの資源を丸ごと uncached で写す。無い、写せないなら NULL。返す番地を実装が直接読み書きする。 */
 void *hal_map(struct hal_device *d, uint32_t slot);
 /* ポートの資源の最初の番地。無ければ 0。 */

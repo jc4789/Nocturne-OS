@@ -802,7 +802,7 @@ static struct iommu_id amd_alias(struct iommu_id id) {
    delivered. The table is cached: every change is invalidated (2.3.2) for the IDs that use it. */
 #define MSI_ADDRESS_DM (1u << 2)
 
-static bool is_unit_function(const struct pci_device *d) {
+static bool amd_unit_function(const struct pci_device *d) {
     for (size_t i = 0; i < nunits; i++)
         if (units[i].fn == d) return true;
     return false;
@@ -897,7 +897,7 @@ static void kernel_irts_leave(const struct iommu_domain *dom) {
 static bool amd_msi_table(struct pci_device *d, struct iommu_irt **t) {
     *t = NULL;
     if (d->irt) return *t = d->irt, true;
-    if (is_unit_function(d) || !iommu_seen(d)) return true;
+    if (amd_unit_function(d) || !iommu_seen(d)) return true;
     struct iommu_domain *dom = d->claimed ? iommu_domain_of(d) : NULL;
     if (dom) return *t = &dom->irt, true;
     if (iommu_in_use(d) || sends_as_ioapic(d)) return false;
@@ -905,7 +905,7 @@ static bool amd_msi_table(struct pci_device *d, struct iommu_irt **t) {
 }
 
 static uint32_t amd_msi_reach(const struct pci_device *d) {
-    return is_unit_function(d) || !apic_x2() || !iommu_seen(d) ? IOMMU_PLAIN_REACH : UINT32_MAX;
+    return amd_unit_function(d) || !apic_x2() || !iommu_seen(d) ? IOMMU_PLAIN_REACH : UINT32_MAX;
 }
 
 static bool amd_msi_write(struct pci_device *d, struct iommu_irt *t, unsigned first, unsigned count, uint8_t vector,
@@ -1121,7 +1121,7 @@ static void event_interrupts_enable(void) {
         struct pci_device *fn = units[i].fn;
         if (!fn) continue;
         for (unsigned k = 0; k < 32; k++)
-            specs[k] = (struct irq_spec){.name = "AMD-Vi events", .handler = event_isr, .node = fn->node};
+            specs[k] = (struct irq_spec){.name = "AMD-Vi events", .handler = event_isr, .node = fn->hal.node};
         bool seen = false;
         unsigned top = 0;
         for (size_t j = 0; j < i; j++) seen |= units[j].fn == fn;
@@ -1218,6 +1218,7 @@ static struct iommu_hw amd = {
     .ioapic_reach = amd_ioapic_reach,
     .resume = amd_resume,
     .shutdown = amd_shutdown,
+    .unit_function = amd_unit_function,
 };
 
 /* Capability+10h, 3.2 (pp203-204); Table86 uses the same encodings in IVinfo. */

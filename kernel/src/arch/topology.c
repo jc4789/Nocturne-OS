@@ -402,6 +402,16 @@ unsigned topology_cpu_of(uint32_t apic_id) {
     return lo < topology.cpus && topology.cpu[lo].apic_id == apic_id ? lo : topology.cpus;
 }
 
+int topology_node_of_domain(uint32_t domain) {
+    unsigned lo = 0, hi = topology.nodes;
+    while (lo < hi) { /* the nodes by proximity domain */
+        unsigned mid = lo + (hi - lo) / 2;
+        if (topology.node[mid].domain < domain) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < topology.nodes && topology.node[lo].domain == domain ? (int)lo : -1;
+}
+
 unsigned topology_node_span(uint64_t at, uint64_t end, uint64_t *run_end) {
     unsigned lo = 0, hi = topology.ranges;
     while (lo < hi) { /* the first range that starts above at */

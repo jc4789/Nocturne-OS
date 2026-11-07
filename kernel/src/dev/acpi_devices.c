@@ -1,10 +1,16 @@
 /* ACPI の名前空間の装置を HAL のバスにする（ACPI 6.5 6.1、6.2、6.5.1）。
 
-   _HID か _CID を持つ Device を全部 hal_publish する。身元は字の性質で、資源は _CRS の中身である。PCI の機能は _HID を
-   持たず（_ADR）、dev/pci.c が出す。CPU（ACPI0007）は arch/topology.c の台帳に載っている。 */
+   _HID か _CID を持つ Device を全部 hal_publish する。身元は字の性質、資源は _CRS の中身、firmware の節は名前空間の
+   節である。親は名前空間で一番近い、木に載った祖先：ACPI の装置か、_ADR で記述された PCI の機能（dev/pci.c が出す）。
+   CPU（ACPI0007）は arch/topology.c の台帳に載っている。
+
+   出すのは二度に分ける（dev/acpi.h）。acpi_devices_publish はホストブリッジ（PNP0A03、PNP0A08）の内を除く全部と
+   ホストブリッジを出し、acpi_devices_publish_below は PCI の機能が載った後にホストブリッジの内を出す。I2C の HID や
+   LPC の EC は、その制御器の機能の下に載る。_DEP は両方が済んでから結ぶ。 */
 #include "kernel.h"
 #include "arch/ioapic.h"
 #include "arch/irq.h"
+#include "arch/topology.h"
 #include "dev/acpi.h"
 #include "hal/hal.h"
 #include "mm/heap.h"
@@ -19,8 +25,6 @@
 
 struct acpi_device {
     struct hal_device hal;
-    uacpi_namespace_node *node;
-    struct acpi_device *up;   /* 名前空間で一番近い、出した祖先 */
     struct acpi_device *next; /* 出した順の全部 */
     struct irq **irqs;
     unsigned irq_count;
@@ -30,6 +34,8 @@ struct acpi_device {
 extern const struct hal_claim_ops hal_claim_plain;
 
 static struct acpi_device *of(struct hal_device *d) { return (struct acpi_device *)d; }
+
+static uacpi_namespace_node *node_of(const struct acpi_device *a) { return acpi_namespace_node(a->hal.firmware); }
 
 /* _CRS の GSI を順に count まで。信号は _CRS のとおり（MADT が書いた pin は MADT のとおり、arch/ioapic.h）。
    Exclusive の GSI（ACPI 6.5 6.4.2.1、6.4.3.6）は誰とも線を分けない。一つでも立たなければ、そこで止める。 */
@@ -129,21 +135,22 @@ static uacpi_iteration_decision found_resource(void *user, uacpi_resource *r) {
 
 /* _HID と _CID を性質にする。一つも無ければ false。 */
 static bool add_identity(struct acpi_device *a) {
+    uacpi_namespace_node *node = node_of(a);
     bool any = false;
     uacpi_id_string *hid = NULL;
-    if (uacpi_eval_hid(a->node, &hid) == UACPI_STATUS_OK) {
+    if (uacpi_eval_hid(node, &hid) == UACPI_STATUS_OK) {
         hal_prop_text(&a->hal, N_PROP_ACPI_ID, hid->value);
         any = true;
         uacpi_free_id_string(hid);
     }
     uacpi_pnp_id_list *cids = NULL;
-    if (uacpi_eval_cid(a->node, &cids) == UACPI_STATUS_OK) {
+    if (uacpi_eval_cid(node, &cids) == UACPI_STATUS_OK) {
         for (uint32_t i = 0; i < cids->num_ids; i++) hal_prop_text(&a->hal, N_PROP_ACPI_ID, cids->ids[i].value);
         any = any || cids->num_ids;
         uacpi_free_pnp_id_list(cids);
     }
     uacpi_id_string *uid = NULL;
-    if (uacpi_eval_uid(a->node, &uid) == UACPI_STATUS_OK) {
+    if (uacpi_eval_uid(node, &uid) == UACPI_STATUS_OK) {
         hal_prop_text(&a->hal, N_PROP_ACPI_UID, uid->value);
         uacpi_free_id_string(uid);
     }
@@ -155,26 +162,70 @@ static bool is_processor(uacpi_namespace_node *node) {
     return uacpi_device_matches_pnp_id(node, ids);
 }
 
-static struct acpi_device *current, *published;
+static bool is_pci_host(uacpi_namespace_node *node) {
+    static const char *const ids[] = {"PNP0A03", "PNP0A08", NULL};
+    return uacpi_device_matches_pnp_id(node, ids);
+}
 
-static uacpi_iteration_decision walk_down(void *user, uacpi_namespace_node *node, uacpi_u32 depth) {
-    (void)user;
-    (void)depth;
-    uacpi_u32 sta = STA_PRESENT | STA_FUNCTIONING;
-    if (uacpi_eval_sta(node, &sta) != UACPI_STATUS_OK) sta = STA_PRESENT | STA_FUNCTIONING;
-    /* ACPI 6.5 6.3.7：どちらでもなければ、子も無いものとする */
-    if (!(sta & (STA_PRESENT | STA_FUNCTIONING))) return UACPI_ITERATION_DECISION_NEXT_PEER;
-    if (!(sta & STA_PRESENT) || is_processor(node)) return UACPI_ITERATION_DECISION_CONTINUE;
+/* 巡りの途中の、名前空間の節から木の装置への道。一番上が、次に出す装置の親である。hold は hal_find_firmware で
+   見つけた装置（巡りの間 hold する）。 */
+struct frame {
+    uacpi_namespace_node *node;
+    struct hal_device *hal;
+    bool hold;
+};
+
+struct walk {
+    bool below;                  /* acpi_devices_publish_below：ホストブリッジの内 */
+    struct frame *frames;
+    unsigned depth, room;
+};
+
+static struct acpi_device *published;
+static struct acpi_device **hosts; /* 出したホストブリッジ。acpi_devices_publish_below がその内を巡る */
+static unsigned host_count;
+
+static void frame_push(struct walk *w, uacpi_namespace_node *node, struct hal_device *hal, bool hold) {
+    if (w->depth == w->room) {
+        unsigned room = w->room ? w->room * 2 : 8;
+        struct frame *grown = krealloc(w->frames, room * sizeof *grown);
+        if (!grown) {
+            /* 下の装置は、この節を飛ばして一つ上の装置の下に載る */
+            kprintf("acpi: no memory to walk below %.4s\n", uacpi_namespace_node_name(node).text);
+            if (hold) hal_put(hal);
+            return;
+        }
+        w->frames = grown;
+        w->room = room;
+    }
+    w->frames[w->depth++] = (struct frame){node, hal, hold};
+}
+
+static struct hal_device *frame_parent(const struct walk *w) { return w->depth ? w->frames[w->depth - 1].hal : NULL; }
+
+static void host_remember(struct acpi_device *a) {
+    struct acpi_device **grown = krealloc(hosts, (host_count + 1) * sizeof *grown);
+    if (!grown) {
+        kprintf("acpi: no memory to walk below host bridge %s\n", a->hal.location);
+        return;
+    }
+    hosts = grown;
+    hosts[host_count++] = a;
+}
+
+/* 節が _HID か _CID を持てば、その装置を出して true。 */
+static bool device_publish(struct walk *w, uacpi_namespace_node *node) {
     struct acpi_device *a = kzalloc(sizeof *a);
     if (!a) {
         kprintf("acpi: no memory for a device\n");
-        return UACPI_ITERATION_DECISION_CONTINUE;
+        return false;
     }
     hal_device_init(&a->hal, N_BUS_ACPI, &acpi_bus_ops);
-    a->node = node;
+    a->hal.firmware = acpi_firmware(node);
     if (!add_identity(a)) {
+        hal_device_discard(&a->hal);
         kfree(a);
-        return UACPI_ITERATION_DECISION_CONTINUE;
+        return false;
     }
     uacpi_for_each_device_resource(node, "_CRS", found_resource, a);
     const char *path = uacpi_namespace_node_generate_absolute_path(node);
@@ -182,39 +233,81 @@ static uacpi_iteration_decision walk_down(void *user, uacpi_namespace_node *node
         hal_location(&a->hal, path);
         uacpi_free_absolute_path(path);
     }
-    a->up = current;
+    uint32_t domain;
+    if (topology.nodes > 1 && acpi_proximity(a->hal.firmware, &domain)) a->hal.node = topology_node_of_domain(domain);
     a->next = published;
     published = a;
-    hal_publish(current ? &current->hal : NULL, &a->hal);
-    current = a;
+    hal_publish(frame_parent(w), &a->hal);
+    frame_push(w, node, &a->hal, false);
+    return true;
+}
+
+static uacpi_iteration_decision walk_down(void *user, uacpi_namespace_node *node, uacpi_u32 depth) {
+    (void)depth;
+    struct walk *w = user;
+    uacpi_u32 sta = STA_PRESENT | STA_FUNCTIONING;
+    if (uacpi_eval_sta(node, &sta) != UACPI_STATUS_OK) sta = STA_PRESENT | STA_FUNCTIONING;
+    /* ACPI 6.5 6.3.7：どちらでもなければ、子も無いものとする */
+    if (!(sta & (STA_PRESENT | STA_FUNCTIONING))) return UACPI_ITERATION_DECISION_NEXT_PEER;
+    if (!(sta & STA_PRESENT) || is_processor(node)) return UACPI_ITERATION_DECISION_CONTINUE;
+    if (device_publish(w, node)) {
+        if (w->below || !is_pci_host(node)) return UACPI_ITERATION_DECISION_CONTINUE;
+        host_remember(published);
+        return UACPI_ITERATION_DECISION_NEXT_PEER; /* 内は PCI の機能が載ってから */
+    }
+    /* 身元の無い節：_ADR で記述された PCI の機能なら、下の装置はその機能の下に載る */
+    struct hal_device *h = w->below ? hal_find_firmware(acpi_firmware(node)) : NULL;
+    if (h) frame_push(w, node, h, true);
     return UACPI_ITERATION_DECISION_CONTINUE;
 }
 
 static uacpi_iteration_decision walk_up(void *user, uacpi_namespace_node *node, uacpi_u32 depth) {
-    (void)user;
     (void)depth;
-    if (current && current->node == node) current = current->up;
+    struct walk *w = user;
+    if (!w->depth || w->frames[w->depth - 1].node != node) return UACPI_ITERATION_DECISION_CONTINUE;
+    struct frame *f = &w->frames[--w->depth];
+    if (f->hold) hal_put(f->hal);
     return UACPI_ITERATION_DECISION_CONTINUE;
 }
 
-/* _DEP（ACPI 6.5 6.5.8）：名前の並び。 */
+/* _DEP（ACPI 6.5 6.5.8）：名前の並び。依存先は木の上のどの装置でもよい（ACPI の装置、PCI の機能）。 */
 static void add_depends(struct acpi_device *a) {
     uacpi_object *result = NULL;
-    if (uacpi_eval_typed(a->node, "_DEP", NULL, UACPI_OBJECT_PACKAGE_BIT, &result) != UACPI_STATUS_OK) return;
+    if (uacpi_eval_typed(node_of(a), "_DEP", NULL, UACPI_OBJECT_PACKAGE_BIT, &result) != UACPI_STATUS_OK) return;
     uacpi_object_array list;
     if (uacpi_object_get_package(result, &list) == UACPI_STATUS_OK)
         for (uacpi_size i = 0; i < list.count; i++) {
             uacpi_namespace_node *on = NULL;
-            if (uacpi_object_resolve_as_aml_namepath(list.objects[i], a->node, &on) != UACPI_STATUS_OK) continue;
-            for (struct acpi_device *o = published; o; o = o->next)
-                if (o->node == on && o != a) hal_depends(&a->hal, &o->hal);
+            if (uacpi_object_resolve_as_aml_namepath(list.objects[i], node_of(a), &on) != UACPI_STATUS_OK) continue;
+            struct hal_device *o = hal_find_firmware(acpi_firmware(on));
+            if (!o) continue;
+            if (o != &a->hal) hal_depends(&a->hal, o);
+            hal_put(o);
         }
     uacpi_object_unref(result);
 }
 
 void acpi_devices_publish(void) {
     if (!acpi_aml_ready()) return;
-    uacpi_namespace_for_each_child(uacpi_namespace_root(), walk_down, walk_up, UACPI_OBJECT_DEVICE_BIT, UACPI_MAX_DEPTH_ANY,
-                                   NULL);
+    struct walk w = {0};
+    uacpi_namespace_for_each_child(uacpi_namespace_root(), walk_down, walk_up, UACPI_OBJECT_DEVICE_BIT,
+                                   UACPI_MAX_DEPTH_ANY, &w);
+    ASSERT(!w.depth);
+    kfree(w.frames);
+}
+
+void acpi_devices_publish_below(void) {
+    if (!acpi_aml_ready()) return;
+    struct walk w = {.below = true};
+    for (unsigned i = 0; i < host_count; i++) {
+        frame_push(&w, node_of(hosts[i]), &hosts[i]->hal, false);
+        uacpi_namespace_for_each_child(node_of(hosts[i]), walk_down, walk_up, UACPI_OBJECT_DEVICE_BIT,
+                                       UACPI_MAX_DEPTH_ANY, &w);
+        w.depth = 0;
+    }
+    kfree(w.frames);
+    kfree(hosts);
+    hosts = NULL;
+    host_count = 0;
     for (struct acpi_device *a = published; a; a = a->next) add_depends(a);
 }

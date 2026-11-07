@@ -35,6 +35,14 @@ void *hal_map(struct hal_device *d, uint32_t slot) {
     return r ? vmm_map_mmio(r->base, ALIGN_UP(r->size, PAGE_SIZE)) : NULL;
 }
 
+bool hal_resource_holds(const struct hal_device *d, enum n_hal_resource_kind kind, uint64_t address) {
+    for (uint32_t i = 0; i < d->resource_count; i++) {
+        const struct n_hal_resource *r = &d->resources[i];
+        if (r->kind == kind && address >= r->base && address - r->base < r->size) return true;
+    }
+    return false;
+}
+
 uint16_t hal_port(const struct hal_device *d, uint32_t slot) {
     const struct n_hal_resource *r = hal_resource(d, N_HAL_PORT, slot);
     return r ? (uint16_t)r->base : 0;

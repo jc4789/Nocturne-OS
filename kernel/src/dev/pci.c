@@ -234,8 +234,17 @@ static void pcie_identify(struct pci_device *d) {
     d->pcie_v2 = (caps & 0xF) >= 2;
 }
 
-/* The function in the device tree, below the bridge it is behind (published first). Its properties
-   are what a rule names (hal_buses.h); a resource is a BAR, its slot the BAR's number. */
+/* The NUMA node of the firmware's proximity domain for a node (dev/acpi.h), -1 when it names none. */
+static int node_of(struct firmware_node *f) {
+    uint32_t domain;
+    return topology.nodes > 1 && acpi_proximity(f, &domain) ? topology_node_of_domain(domain) : -1;
+}
+
+/* The function in the device tree, below the bridge it is behind (published first), or on a root bus
+   below its host bridge (dev/acpi_devices.c published it). Its properties are what a rule names
+   (hal_buses.h); a resource is a BAR, its slot the BAR's number. Its node in the firmware's
+   description is found below its bridge's, and its NUMA node is the one the firmware gives that
+   node (_PXM, which holds below it too), else its bridge's, else its host bridge's. */
 static void function_publish(struct pci_device *d) {
     if (d->published) return;
     d->published = true;
@@ -243,6 +252,10 @@ static void function_publish(struct pci_device *d) {
     struct pci_address a = d->address;
     struct hal_device *h = &d->hal;
     hal_device_init(h, N_BUS_PCI, &pci_bus_ops);
+    d->host = d->upstream ? d->upstream->host : acpi_pci_host(a.segment, a.bus);
+    h->firmware = acpi_pci_child(d->upstream ? d->upstream->hal.firmware : d->host, a.dev, a.func);
+    h->node = h->firmware ? node_of(h->firmware) : -1;
+    if (h->node < 0) h->node = d->upstream ? d->upstream->hal.node : node_of(d->host);
     uint32_t revision = pci_read32(a, 8) & 0xFF;
     hal_prop_number(h, N_PROP_PCI_VENDOR, d->vendor);
     hal_prop_number(h, N_PROP_PCI_DEVICE, d->device);
@@ -265,8 +278,9 @@ static void function_publish(struct pci_device *d) {
     char where[24];
     ksnprintf(where, sizeof where, "%04x:%02x:%02x.%x", PCI_ADDRESS_ARGS(a));
     hal_location(h, where);
-    h->node = d->node;
-    hal_publish(d->upstream ? &d->upstream->hal : NULL, h);
+    struct hal_device *host = d->upstream ? NULL : hal_find_firmware(d->host);
+    hal_publish(d->upstream ? &d->upstream->hal : host, h);
+    if (host) hal_put(host);
 }
 
 /* The function found at a with this ID on the list. */
@@ -337,20 +351,13 @@ void pci_init(void) {
                 b->secondary == devices[i].address.bus)
                 devices[i].upstream = &devices[k];
         }
-    /* each function's node, for its memory and the CPUs its interrupts go to. Finding a function's
-       ACPI object evaluates its neighbours' _ADR: with one node there is nothing to choose. */
-    for (size_t i = 0; i < ndevices; i++) {
-        uint32_t domain;
-        devices[i].node = -1;
-        if (topology.nodes < 2 || !acpi_pci_proximity(&devices[i], &domain)) continue;
-        for (unsigned n = 0; n < topology.nodes; n++)
-            if (topology.node[n].domain == domain) {
-                devices[i].node = (int)n;
-                break;
-            }
-    }
     for (size_t i = 0; i < ndevices; i++) function_publish(&devices[i]);
 }
+
+/* The host bridges are the PCI bus's own: pci_init found what is below them. */
+static const struct n_hal_rule host_rules[] = {N_ACPI_ID("PNP0A03"), N_ACPI_ID("PNP0A08")};
+static const struct hal_machine pci_hosts = {.owner = "pci", .rules = host_rules, .rule_count = ARRAY_SIZE(host_rules)};
+HAL_MACHINE(pci_hosts);
 
 void pci_enable_busmaster(struct pci_device *d) {
     d->kernel_owned = true;

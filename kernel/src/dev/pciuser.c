@@ -48,7 +48,7 @@ struct pci_claim {
        N_PCI_CALL_ACPI_NOTIFY_TAKE on, kept until taken (a ring; the oldest give way). */
     struct mutex acpi_lock;
     bool acpi_looked;
-    void *acpi_node, *acpi_upstream;
+    struct firmware_node *acpi_node, *acpi_upstream;
     struct acpi_watch *acpi_watch;
     uint32_t acpi_notes[CLAIM_ACPI_NOTES];
     unsigned acpi_first, acpi_count; /* notes_lock */
@@ -345,8 +345,8 @@ static int64_t info(struct pci_claim *c, struct n_hal_pci_info *out) {
 static void acpi_look(struct pci_claim *c) {
     if (c->acpi_looked) return;
     c->acpi_looked = true;
-    c->acpi_node = acpi_pci_node(c->d);
-    c->acpi_upstream = c->d->upstream ? acpi_pci_node(c->d->upstream) : acpi_pci_host(c->d);
+    c->acpi_node = c->d->hal.firmware;
+    c->acpi_upstream = c->d->upstream ? c->d->upstream->hal.firmware : c->d->host;
 }
 
 /* The predefined methods through which the system itself runs devices and the platform, as the
@@ -385,7 +385,7 @@ static int64_t acpi_eval(struct pci_claim *c, uint32_t which, const char *name, 
     if (!acpi_aml_ready()) return -N_ERR_UNSUPPORTED;
     mutex_lock(&c->acpi_lock);
     acpi_look(c);
-    void *node = which == N_ACPI_SELF ? c->acpi_node : which == N_ACPI_UPSTREAM ? c->acpi_upstream : NULL;
+    struct firmware_node *node = which == N_ACPI_SELF ? c->acpi_node : which == N_ACPI_UPSTREAM ? c->acpi_upstream : NULL;
     int64_t r = 0;
     if (which != N_ACPI_SELF && which != N_ACPI_UPSTREAM) {
         node = c->acpi_node ? acpi_node_child(c->acpi_node, which) : NULL;

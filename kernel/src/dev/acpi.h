@@ -203,26 +203,42 @@ void acpi_links_restore(void);
 void acpi_freeze(bool on);
 bool acpi_reset(void);
 
-/* ---- a PCI function's part of the namespace (n_hal_pci_acpi_eval, dev/pciuser.c) ----
-   A device node is uACPI's, opaque here. acpi_pci_node: the function's node, found from the host
-   bridge of its segment (_SEG) and root bus (_BBN) down its bridges by _ADR; acpi_pci_host: that host bridge's. NULL
-   when the firmware describes none, or AML is off. acpi_node_child: the node's device child
-   number index in namespace order; NULL past the last. */
-struct pci_device;
-void *acpi_pci_node(const struct pci_device *d);
-void *acpi_pci_host(const struct pci_device *d);
-/* The proximity domain the firmware gives d (_PXM, ACPI 6.5 6.2.14), which holds for a device and
-   what is below it: on the function's node or the nearest above it, its host bridge's at the
-   latest. False without one, or without AML. Sleeps. */
-bool acpi_pci_proximity(const struct pci_device *d, uint32_t *domain);
+/* ---- 装置の firmware の節（hal/hal.h の struct firmware_node） ----
+   節は uACPI の名前空間の Device で、中身を知るのはここ（dev/acpi.c）と ACPI のバス（dev/acpi_devices.c）だけである。
+   AML が無ければ、どの口も NULL か false を返す。 */
+struct firmware_node;
+struct uacpi_namespace_node;
+static inline struct firmware_node *acpi_firmware(struct uacpi_namespace_node *node) {
+    return (struct firmware_node *)node;
+}
+static inline struct uacpi_namespace_node *acpi_namespace_node(const struct firmware_node *f) {
+    return (struct uacpi_namespace_node *)f;
+}
+
+/* 名前空間の装置を装置の木に出す（dev/acpi_devices.c）。acpi_devices_publish は pci_init の前に、PCI のホストブリッジ
+   （PNP0A03、PNP0A08）の内を除く全部をホストブリッジも含めて出す：根のバスの機能はホストブリッジの下に載る。
+   acpi_devices_publish_below は pci_init の後に、ホストブリッジの内を、名前空間で一番近い木の上の祖先（ACPI の装置か
+   PCI の機能）の下に出す。 */
+void acpi_devices_publish(void);
+void acpi_devices_publish_below(void);
+
+/* PCI の機能の節。acpi_pci_host：segment（_SEG、無ければ 0）の根のバス bus（_BBN、無ければ 0）のホストブリッジ。
+   acpi_pci_child：バスの節 bus（ホストブリッジか、橋の機能の節）の直下で _ADR が (dev << 16 | func) の Device、
+   無ければその dev の全部の機能を表す Device（func 0xFFFF）。どちらも無ければ NULL。眠る。 */
+struct firmware_node *acpi_pci_host(uint16_t segment, uint8_t bus);
+struct firmware_node *acpi_pci_child(struct firmware_node *bus, uint8_t dev, uint8_t func);
+/* 節か、その上で一番近い _PXM（ACPI 6.5 6.2.14：装置とその下に効く）。無ければ false。眠る。 */
+bool acpi_proximity(struct firmware_node *node, uint32_t *domain);
 /* The GSI a function's INTx reaches (ACPI 6.5 6.2.13, _PRT): its Interrupt Pin, swizzled at each
-   bridge without a _PRT of its own, looked up in the nearest _PRT above it, a GSI there or the
-   interrupt of the link device it names (the link given one from its _PRS first, _SRS, when it
-   has none), and its signal (the link's line's, else PCI's level, active low and shared) for
-   irq_request_gsi. False without a pin, a route, an interrupt the link can be given, or AML.
-   Sleeps. */
+   bridge without a _PRT of its own, looked up in the nearest _PRT above it (the bridges' nodes,
+   then the host bridge's), a GSI there or the interrupt of the link device it names (the link
+   given one from its _PRS first, _SRS, when it has none), and its signal (the link's line's, else
+   PCI's level, active low and shared) for irq_request_gsi. False without a pin, a route, an
+   interrupt the link can be given, or AML. Sleeps. */
+struct pci_device;
 bool acpi_pci_gsi(const struct pci_device *d, uint32_t *gsi, struct gsi_signal *signal);
-void *acpi_node_child(void *node, uint32_t index);
+/* The node's device child number index in namespace order; NULL past the last. */
+struct firmware_node *acpi_node_child(struct firmware_node *node, uint32_t index);
 /* Whether s is one name segment: 4 characters of A-Z, 0-9 and _, the first not a digit (names of
    fewer characters are padded with _, as "_ON_"). Names starting with _ are ACPI's predefined
    ones; the others are the firmware's own. */
@@ -234,10 +250,10 @@ bool acpi_name_segment(const char *s);
    (a malformed argument or name), -N_ERR_TOO_LARGE (out_size is too small), -N_ERR_IO (the AML
    failed). Threads that may block only. */
 struct n_acpi_value;
-int64_t acpi_node_eval(void *node, const char *name, const struct n_acpi_value *args, uint32_t nargs,
+int64_t acpi_node_eval(struct firmware_node *node, const char *name, const struct n_acpi_value *args, uint32_t nargs,
                        const uint8_t *data, size_t data_size, uint8_t *out, size_t out_size);
 /* Notify(node, value) calls fn(context, value) on the acpi thread until acpi_node_unwatch, which
    returns once fn runs no more (never from fn itself). */
 struct acpi_watch;
-struct acpi_watch *acpi_node_watch(void *node, void (*fn)(void *context, uint64_t value), void *context);
+struct acpi_watch *acpi_node_watch(struct firmware_node *node, void (*fn)(void *context, uint64_t value), void *context);
 void acpi_node_unwatch(struct acpi_watch *w);

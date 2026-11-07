@@ -1163,3 +1163,16 @@ bool iommu_shutdown(void) {
     if (hw && !hw->shutdown()) restore_failed = true;
     return !restore_failed;
 }
+
+/* ---- the machine's devices that are this file's (hal/hal.h) ----
+   The PCI functions the units are (class 08h, subclass 06h): iommu_init took their registers and
+   interrupt from the firmware's tables before any driver binds, and they come back from a sleep
+   in iommu_resume. */
+static bool unit_mine(struct hal_device *d) {
+    return hw && hw->unit_function && d->bus == N_BUS_PCI && hw->unit_function(pci_device_of(d));
+}
+
+static const struct n_hal_rule unit_rules[] = {N_PCI_CLASS(0x08, 0x06)};
+static const struct hal_machine iommu_units = {
+    .owner = "iommu", .rules = unit_rules, .rule_count = ARRAY_SIZE(unit_rules), .mine = unit_mine};
+HAL_MACHINE(iommu_units);

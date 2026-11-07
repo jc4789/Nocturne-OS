@@ -11,6 +11,7 @@
 #include "dev/acpi.h"
 #include "dev/pci.h"
 #include "dev/pm.h"
+#include "hal/hal.h"
 #include "mm/bootmem.h"
 #include "mm/vmm.h"
 #include "mm/heap.h"
@@ -832,8 +833,19 @@ static uacpi_iteration_decision found_lid(void *user, uacpi_namespace_node *node
     return UACPI_ITERATION_DECISION_BREAK;
 }
 
+/* The control-method power buttons (PNP0C0C) whose Notify comes here. AML init writes them, before
+   anything reads them. */
+static uacpi_namespace_node **buttons;
+static unsigned button_count;
+
 static uacpi_iteration_decision found_button(void *user, uacpi_namespace_node *node, uacpi_u32 depth) {
-    if (uacpi_install_notify_handler(node, button_notify, NULL) == UACPI_STATUS_OK) (*(unsigned *)user)++;
+    uacpi_namespace_node **grown = krealloc(buttons, (button_count + 1) * sizeof *grown);
+    if (!grown) {
+        kprintf("acpi: no memory to keep power button %.4s\n", uacpi_namespace_node_name(node).text);
+        return UACPI_ITERATION_DECISION_CONTINUE;
+    }
+    buttons = grown;
+    if (uacpi_install_notify_handler(node, button_notify, NULL) == UACPI_STATUS_OK) buttons[button_count++] = node;
     return UACPI_ITERATION_DECISION_CONTINUE;
 }
 
@@ -861,16 +873,44 @@ void acpi_aml_init(void) {
     uacpi_is_platform_reduced_hardware(&hw_reduced);
     bool fixed = !hw_reduced &&
                  uacpi_install_fixed_event_handler(UACPI_FIXED_EVENT_POWER_BUTTON, power_button, NULL) == UACPI_STATUS_OK;
-    unsigned buttons = 0;
-    uacpi_find_devices("PNP0C0C", found_button, &buttons);
+    uacpi_find_devices("PNP0C0C", found_button, NULL);
     uacpi_find_devices("PNP0C0D", found_lid, NULL);
     acpi_lid_read();
     if (!hw_reduced) aml_ok(uacpi_finalize_gpe_initialization(), "enabling GPEs");
     aml_ready = true;
     kprintf("acpi: AML ready in %lu ms, SCI GSI %d, power button: %s%s%u in the namespace, lid: %s\n",
             (clock_now_ns() - t0) / NS_PER_MS, sci ? (int)sci_gsi : -1, fixed ? "fixed" : "", fixed ? " + " : "",
-            buttons, lid_node ? "yes" : "no");
+            button_count, lid_node ? "yes" : "no");
 }
+
+/* ---- the machine's devices that are this file's (hal/hal.h) ---- */
+
+static bool button_mine(struct hal_device *d) {
+    for (unsigned i = 0; i < button_count; i++)
+        if (d->firmware == acpi_firmware(buttons[i])) return true;
+    return false;
+}
+
+static bool lid_mine(struct hal_device *d) { return lid_node && d->firmware == acpi_firmware(lid_node); }
+
+static bool link_mine(struct hal_device *d) {
+    for (struct link *l = __atomic_load_n(&links, __ATOMIC_ACQUIRE); l; l = l->next)
+        if (d->firmware == acpi_firmware(l->node)) return true;
+    return false;
+}
+
+static const struct n_hal_rule button_rules[] = {N_ACPI_ID("PNP0C0C")};
+static const struct hal_machine acpi_buttons = {
+    .owner = "acpi", .rules = button_rules, .rule_count = ARRAY_SIZE(button_rules), .mine = button_mine};
+HAL_MACHINE(acpi_buttons);
+static const struct n_hal_rule lid_rules[] = {N_ACPI_ID("PNP0C0D")};
+static const struct hal_machine acpi_lid = {
+    .owner = "acpi", .rules = lid_rules, .rule_count = ARRAY_SIZE(lid_rules), .mine = lid_mine};
+HAL_MACHINE(acpi_lid);
+static const struct n_hal_rule link_rules[] = {N_ACPI_ID("PNP0C0F")};
+static const struct hal_machine acpi_links = {
+    .owner = "acpi", .rules = link_rules, .rule_count = ARRAY_SIZE(link_rules), .mine = link_mine};
+HAL_MACHINE(acpi_links);
 
 bool acpi_aml_ready(void) { return aml_ready; }
 
@@ -948,19 +988,30 @@ static uacpi_iteration_decision found_host(void *user, uacpi_namespace_node *nod
     return UACPI_ITERATION_DECISION_BREAK;
 }
 
-void *acpi_pci_host(const struct pci_device *d) {
+struct firmware_node *acpi_pci_host(uint16_t segment, uint8_t bus) {
     static const uacpi_char *const hids[] = {"PNP0A03", "PNP0A08", UACPI_NULL};
-    if (!aml_ready || !d) return NULL;
-    for (unsigned n = 0; d->upstream && n < PCI_DEPTH_MAX; n++) d = d->upstream;
-    struct host_search s = {d->address.segment, d->address.bus, UACPI_NULL};
+    if (!aml_ready) return NULL;
+    struct host_search s = {segment, bus, UACPI_NULL};
     uacpi_find_devices_at(uacpi_namespace_root(), hids, found_host, &s);
-    return s.found;
+    return acpi_firmware(s.found);
 }
 
-bool acpi_pci_proximity(const struct pci_device *d, uint32_t *domain) {
-    uacpi_namespace_node *node = acpi_pci_node(d);
-    if (!node) node = acpi_pci_host(d);
-    for (uacpi_namespace_node *root = uacpi_namespace_root(); node && node != root;
+struct firmware_node *acpi_pci_child(struct firmware_node *bus, uint8_t dev, uint8_t func) {
+    uacpi_namespace_node *iter = UACPI_NULL, *every = UACPI_NULL;
+    if (!aml_ready || !bus) return NULL;
+    while (uacpi_namespace_node_next_typed(acpi_namespace_node(bus), &iter, UACPI_OBJECT_DEVICE_BIT) ==
+           UACPI_STATUS_OK) {
+        uacpi_u64 address;
+        if (uacpi_eval_simple_integer(iter, "_ADR", &address) != UACPI_STATUS_OK) continue;
+        if (address == ((uint64_t)dev << 16 | func)) return acpi_firmware(iter);
+        if (!every && address == ((uint64_t)dev << 16 | 0xFFFF)) every = iter;
+    }
+    return acpi_firmware(every);
+}
+
+bool acpi_proximity(struct firmware_node *f, uint32_t *domain) {
+    if (!aml_ready) return false;
+    for (uacpi_namespace_node *node = acpi_namespace_node(f), *root = uacpi_namespace_root(); node && node != root;
          node = uacpi_namespace_node_parent(node)) {
         uacpi_u64 pxm;
         if (uacpi_eval_simple_integer(node, "_PXM", &pxm) == UACPI_STATUS_OK) {
@@ -969,34 +1020,6 @@ bool acpi_pci_proximity(const struct pci_device *d, uint32_t *domain) {
         }
     }
     return false;
-}
-
-/* The device under parent whose _ADR is the function (dev << 16 | func), else one that stands
-   for all of the device's functions (func 0xFFFF). */
-static uacpi_namespace_node *child_at(uacpi_namespace_node *parent, uint8_t dev, uint8_t func) {
-    uacpi_namespace_node *iter = UACPI_NULL, *every = UACPI_NULL;
-    while (uacpi_namespace_node_next_typed(parent, &iter, UACPI_OBJECT_DEVICE_BIT) == UACPI_STATUS_OK) {
-        uacpi_u64 address;
-        if (uacpi_eval_simple_integer(iter, "_ADR", &address) != UACPI_STATUS_OK) continue;
-        if (address == ((uint64_t)dev << 16 | func)) return iter;
-        if (!every && address == ((uint64_t)dev << 16 | 0xFFFF)) every = iter;
-    }
-    return every;
-}
-
-void *acpi_pci_node(const struct pci_device *d) {
-    const struct pci_device *chain[PCI_DEPTH_MAX];
-    unsigned n = 0;
-    for (const struct pci_device *p = d; p; p = p->upstream) {
-        if (n == PCI_DEPTH_MAX) return NULL;
-        chain[n++] = p;
-    }
-    uacpi_namespace_node *node = n ? acpi_pci_host(d) : UACPI_NULL;
-    while (node && n) {
-        n--;
-        node = child_at(node, chain[n]->address.dev, chain[n]->address.func);
-    }
-    return node;
 }
 
 /* The entry of a _PRT for device dev's pin (0 = INTA): a GSI wired to it, which PCI's INTx drive
@@ -1020,7 +1043,7 @@ bool acpi_pci_gsi(const struct pci_device *d, uint32_t *gsi, struct gsi_signal *
     if (pin < 1 || pin > 4) return false;
     pin--;
     for (unsigned depth = 0; d && depth < PCI_DEPTH_MAX; depth++) {
-        uacpi_namespace_node *bus = d->upstream ? acpi_pci_node(d->upstream) : acpi_pci_host(d);
+        uacpi_namespace_node *bus = acpi_namespace_node(d->upstream ? d->upstream->hal.firmware : d->host);
         uacpi_pci_routing_table *table;
         if (bus && uacpi_get_pci_routing_table(bus, &table) == UACPI_STATUS_OK) {
             bool found = prt_gsi(table, d->address.dev, pin, gsi, signal);
@@ -1034,11 +1057,11 @@ bool acpi_pci_gsi(const struct pci_device *d, uint32_t *gsi, struct gsi_signal *
     return false;
 }
 
-void *acpi_node_child(void *node, uint32_t index) {
+struct firmware_node *acpi_node_child(struct firmware_node *node, uint32_t index) {
     uacpi_namespace_node *iter = UACPI_NULL;
     if (!aml_ready || !node) return NULL;
-    while (uacpi_namespace_node_next_typed(node, &iter, UACPI_OBJECT_DEVICE_BIT) == UACPI_STATUS_OK)
-        if (!index--) return iter;
+    while (uacpi_namespace_node_next_typed(acpi_namespace_node(node), &iter, UACPI_OBJECT_DEVICE_BIT) == UACPI_STATUS_OK)
+        if (!index--) return acpi_firmware(iter);
     return NULL;
 }
 
@@ -1116,7 +1139,7 @@ static int64_t result_write(uacpi_object *result, uint8_t *out, size_t out_size)
     return r ? r : (int64_t)bytes;
 }
 
-int64_t acpi_node_eval(void *node, const char *name, const struct n_acpi_value *args, uint32_t nargs,
+int64_t acpi_node_eval(struct firmware_node *node, const char *name, const struct n_acpi_value *args, uint32_t nargs,
                        const uint8_t *data, size_t data_size, uint8_t *out, size_t out_size) {
     if (!aml_ready || !node) return -N_ERR_NOT_FOUND;
     if (!acpi_name_segment(name) || nargs > EVAL_ARGS_MAX) return -N_ERR_INVALID;
@@ -1151,7 +1174,7 @@ int64_t acpi_node_eval(void *node, const char *name, const struct n_acpi_value *
     uacpi_object *result = UACPI_NULL;
     if (!r) {
         uacpi_object_array array = {list, nargs};
-        uacpi_status st = uacpi_eval(node, name, nargs ? &array : UACPI_NULL, &result);
+        uacpi_status st = uacpi_eval(acpi_namespace_node(node), name, nargs ? &array : UACPI_NULL, &result);
         if (st == UACPI_STATUS_OK) r = result_write(result, out, out_size);
         else r = st == UACPI_STATUS_NOT_FOUND ? -N_ERR_NOT_FOUND : -N_ERR_IO;
     }
@@ -1174,12 +1197,12 @@ static uacpi_status watch_notify(uacpi_handle context, uacpi_namespace_node *nod
     return UACPI_STATUS_OK;
 }
 
-struct acpi_watch *acpi_node_watch(void *node, void (*fn)(void *context, uint64_t value), void *context) {
+struct acpi_watch *acpi_node_watch(struct firmware_node *node, void (*fn)(void *context, uint64_t value), void *context) {
     if (!aml_ready || !node) return NULL;
     struct acpi_watch *w = kmalloc(sizeof *w);
     if (!w) return NULL;
-    *w = (struct acpi_watch){node, fn, context};
-    if (uacpi_install_notify_handler(node, watch_notify, w) != UACPI_STATUS_OK) {
+    *w = (struct acpi_watch){acpi_namespace_node(node), fn, context};
+    if (uacpi_install_notify_handler(w->node, watch_notify, w) != UACPI_STATUS_OK) {
         kfree(w);
         return NULL;
     }

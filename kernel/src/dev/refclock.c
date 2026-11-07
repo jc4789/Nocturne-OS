@@ -33,6 +33,7 @@
 #include "arch/spin.h"
 #include "dev/acpi.h"
 #include "dev/refclock.h"
+#include "hal/hal.h"
 #include "mm/vmm.h"
 #include "sys/alarm.h"
 #include "sys/clock.h"
@@ -62,6 +63,7 @@ struct acpi_hpet { /* IA-PC HPET 1.0a 3.2.4 */
 #define FS_PER_S ((uint64_t)1000000000000000)
 
 static volatile uint32_t *hpet;
+static uint64_t hpet_phys; /* its block's address, once it is the rate reference */
 
 /* The rate reference: one CPU at a time touches this, the alarm's fire, or CPU 0 starting it at
    boot or after a sleep, before alarms come. */
@@ -211,6 +213,7 @@ static bool hpet_find(void) {
     }
     kprintf("refclock: HPET at %lx, %u bits, %lu.%06lu MHz\n", t->base.address, wide ? 64 : 32,
             FS_PER_S / period / 1000000, FS_PER_S / period % 1000000);
+    __atomic_store_n(&hpet_phys, t->base.address, __ATOMIC_RELEASE);
     return true;
 }
 
@@ -274,7 +277,7 @@ const struct clock_rate_reference *refclock_rate_reference(void) {
 #define FADT_BOOT_NO_CMOS_RTC (1u << 5) /* IAPC_BOOT_ARCH, ACPI 6.5 5.2.9.3 */
 
 static struct spinlock rtc_lock; /* the index and data ports: a leaf */
-static enum { RTC_UNKNOWN, RTC_HERE, RTC_NONE } rtc_state;
+static enum rtc_presence { RTC_UNKNOWN, RTC_HERE, RTC_NONE } rtc_state;
 static uint8_t century_index;
 
 static uint8_t cmos(uint8_t reg) {
@@ -287,23 +290,27 @@ static void cmos_put(uint8_t reg, uint8_t value) {
     outb(0x71, value);
 }
 
-static void rtc_find(void) {
+/* Whether the platform has the RTC, decided from the FADT the first time it is asked. Two that ask
+   at once both decide the same. */
+static bool rtc_here(void) {
+    enum rtc_presence state = __atomic_load_n(&rtc_state, __ATOMIC_ACQUIRE);
+    if (state != RTC_UNKNOWN) return state == RTC_HERE;
     const struct acpi_fadt *f = acpi_find("FACP", 0);
-    rtc_state = RTC_HERE;
-    if (!f) return;
-    if (f->h.length >= 109) century_index = f->century;
+    state = RTC_HERE;
+    if (f && f->h.length >= 109) century_index = f->century;
     /* IAPC_BOOT_ARCH is there from ACPI 2.0 (FADT revision 3) on */
-    if (f->h.revision >= 3 && f->h.length >= 111 && (f->boot_arch & FADT_BOOT_NO_CMOS_RTC)) {
+    if (f && f->h.revision >= 3 && f->h.length >= 111 && (f->boot_arch & FADT_BOOT_NO_CMOS_RTC)) {
         kprintf("refclock: the FADT says there is no CMOS RTC\n");
-        rtc_state = RTC_NONE;
+        state = RTC_NONE;
     }
+    __atomic_store_n(&rtc_state, state, __ATOMIC_RELEASE);
+    return state == RTC_HERE;
 }
 
 static int from_bcd(uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); }
 
 enum rtc_result rtc_read(int64_t *unix_seconds) {
-    if (rtc_state == RTC_UNKNOWN) rtc_find();
-    if (rtc_state == RTC_NONE) return RTC_ABSENT;
+    if (!rtc_here()) return RTC_ABSENT;
     uint8_t sec = 0, min = 0, hour = 0, day = 0, mon = 0, year = 0, century = 0, b = 0;
     uint64_t f = spin_lock(&rtc_lock);
     bool whole = false;
@@ -346,8 +353,7 @@ enum rtc_result rtc_read(int64_t *unix_seconds) {
 static uint8_t to_bcd(int v) { return (uint8_t)((v / 10) << 4 | (v % 10)); }
 
 int rtc_write(int64_t unix_seconds) {
-    if (rtc_state == RTC_UNKNOWN) rtc_find();
-    if (rtc_state == RTC_NONE) return -N_ERR_UNSUPPORTED;
+    if (!rtc_here()) return -N_ERR_UNSUPPORTED;
     struct tm_parts p;
     time_to_parts(unix_seconds, &p);
     if (p.year < 2000 || (!century_index && p.year > 2099) || p.year > 9999) return -N_ERR_INVALID;
@@ -374,3 +380,26 @@ int rtc_write(int64_t unix_seconds) {
     spin_unlock(&rtc_lock, f);
     return 0;
 }
+
+/* ---- the machine's devices that are this file's (hal/hal.h) ----
+   The HPET while it is the rate reference: the PNP0103 device whose memory holds its block. The RTC
+   while the platform has one: the device of ports 70h and 71h (PNP0B00, and the PIIX4's and the
+   DS1585's, PNP0B01 and PNP0B02). */
+
+static bool hpet_mine(struct hal_device *d) {
+    uint64_t at = __atomic_load_n(&hpet_phys, __ATOMIC_ACQUIRE);
+    return at && hal_resource_holds(d, N_HAL_MEMORY, at);
+}
+
+static bool rtc_mine(struct hal_device *d) {
+    return rtc_here() && hal_resource_holds(d, N_HAL_PORT, 0x70) && hal_resource_holds(d, N_HAL_PORT, 0x71);
+}
+
+static const struct n_hal_rule hpet_rules[] = {N_ACPI_ID("PNP0103")};
+static const struct hal_machine refclock_hpet = {
+    .owner = "refclock", .rules = hpet_rules, .rule_count = ARRAY_SIZE(hpet_rules), .mine = hpet_mine};
+HAL_MACHINE(refclock_hpet);
+static const struct n_hal_rule rtc_rules[] = {N_ACPI_ID("PNP0B00"), N_ACPI_ID("PNP0B01"), N_ACPI_ID("PNP0B02")};
+static const struct hal_machine refclock_rtc = {
+    .owner = "refclock", .rules = rtc_rules, .rule_count = ARRAY_SIZE(rtc_rules), .mine = rtc_mine};
+HAL_MACHINE(refclock_rtc);

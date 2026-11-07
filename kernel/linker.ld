@@ -30,9 +30,14 @@ SECTIONS
     __rodata_start = .;
     .rodata : {
         *(.rodata .rodata.*)
+        . = ALIGN(8);
         __hal_drivers_start = .;
         KEEP(*(.hal_drivers))
         __hal_drivers_end = .;
+        . = ALIGN(8);
+        __hal_machine_start = .;
+        KEEP(*(.hal_machine))
+        __hal_machine_end = .;
     } :rodata
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));

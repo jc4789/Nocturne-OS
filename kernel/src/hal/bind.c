@@ -1,7 +1,8 @@
 /* 実装の一覧と、装置への結びつけ（hal/hal.h）。
 
-   規則に合う実装のうち、一番具体的な規則（項が多い）の実装から順に試す。同じなら足された順。合う実装の無い装置には
-   何も起きないので、費用は結ぶ物の数だけである。結ぶ物ごとに thread を一つ起こすので、遅い装置は他を待たせない。 */
+   機械の装置の宣言に合う装置は、その持ち主のものとして台帳に載せ、実装を探さない。ほかは、規則に合う実装のうち、
+   一番具体的な規則（項が多い）の実装から順に試す。同じなら足された順。合う実装の無い装置には何も起きないので、費用は
+   結ぶ物の数だけである。結ぶ物ごとに thread を一つ起こすので、遅い装置は他を待たせない。 */
 #include "kernel.h"
 #include "hal/internal.h"
 #include "mm/heap.h"
@@ -14,6 +15,7 @@ struct driver_entry {
 };
 
 extern const struct hal_driver *const __hal_drivers_start[], *const __hal_drivers_end[];
+extern const struct hal_machine *const __hal_machine_start[], *const __hal_machine_end[];
 
 static struct driver_entry *drivers_first, **drivers_tail = &drivers_first;
 static uint32_t drivers_added;
@@ -131,6 +133,26 @@ static void bind_thread(void *arg) {
     busy_done();
 }
 
+/* d が機械の装置なら、持ち主のものとして台帳に載せて true。 */
+static bool machine_take(struct hal_device *d) {
+    for (const struct hal_machine *const *p = __hal_machine_start; p < __hal_machine_end; p++) {
+        const struct hal_machine *m = *p;
+        bool matches = false;
+        for (uint32_t i = 0; i < m->rule_count && !matches; i++)
+            matches = n_hal_rule_score(&m->rules[i], d->props, d->prop_count, d->prop_bytes) != 0;
+        if (!matches || (m->mine && !m->mine(d))) continue;
+        uint64_t f = spin_lock(&hal_lock);
+        d->machine = true;
+        d->state = N_HAL_RUNNING;
+        d->reason = 0;
+        strlcpy(d->driver_name, m->owner, sizeof d->driver_name);
+        spin_unlock(&hal_lock, f);
+        hal_ledger_changed();
+        return true;
+    }
+    return false;
+}
+
 void pending_forget(struct hal_device *d) {
     if (!d->queued) return;
     struct hal_device *before = NULL;
@@ -141,10 +163,10 @@ void pending_forget(struct hal_device *d) {
     queued--;
 }
 
-/* 合う実装があれば thread を起こす。 */
+/* 機械の装置でなく、合う実装があれば thread を起こす。 */
 static void bind_start(struct hal_device *d) {
     uint32_t score;
-    if (!candidate(d, 0, 0, &score)) return;
+    if (d->machine || machine_take(d) || !candidate(d, 0, 0, &score)) return;
     uint64_t f = spin_lock(&hal_lock);
     if (gate_closing) {
         if (!d->queued) {
@@ -294,7 +316,7 @@ void hal_gate_open(void) {
 int hal_bind_process(struct hal_device *d, struct hal_claim *claim, const char *program) {
     int r = 0;
     uint64_t f = spin_lock(&hal_lock);
-    if (d->driver || d->claim || d->gone) {
+    if (d->driver || d->claim || d->gone || d->machine) {
         r = -N_ERR_BUSY;
     } else {
         d->claim = claim;
